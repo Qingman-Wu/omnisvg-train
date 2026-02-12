@@ -10,7 +10,7 @@ set -e
 
 # Model Configuration
 # Options: "4B" (Qwen2.5-VL-3B based) or "8B" (Qwen2.5-VL-7B based)
-MODEL_SIZE="4B"
+MODEL_SIZE="8B"
 
 # Enable Flash Attention 2 for faster training (recommended)
 # Set to "true" or "false"
@@ -18,13 +18,13 @@ USE_FLASH_ATTN="false"
 
 
 # Number of GPUs to use
-NUM_GPUS=8
+NUM_GPUS=2
 
-# Batch size per GPU
-BATCH_SIZE=4
+# Batch size per GPU (reduce further if still OOM)
+BATCH_SIZE=1
 
-# Maximum SVG sequence length
-MAX_SEQ_LENGTH=2048
+# Maximum SVG sequence length (further reduce to save memory)
+MAX_SEQ_LENGTH=256
 
 # Data directory (should contain: train_meta.csv, val_meta.csv, svg/, png/)
 DATA_DIR="./data"
@@ -40,14 +40,22 @@ PROJECT_NAME=""
 #   - "": Start from scratch
 #   - "auto": Download and use official OmniSVG checkpoint
 #   - "/path/to/checkpoint": Resume from specific checkpoint
-RESUME_CHECKPOINT=""
+RESUME_CHECKPOINT="/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
 
 # Use HuggingFace datasets (set to "true" to auto-download)
 USE_HF_DATA="true"
 
 # HuggingFace datasets to use (only if USE_HF_DATA="true")
 # Options: "illustration", "icon", or "illustration icon" (both)
-HF_DATASETS="illustration icon"
+HF_DATASETS="illustration"
+
+# Local parquet directories (avoids re-downloading if you have local files)
+# Leave empty to download from HuggingFace
+LOCAL_ILLUSTRATION_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
+LOCAL_ICON_DIR=""
+
+# Text-only mode (text-to-SVG only, no image task)
+TEXT_ONLY="true"
 
 # ==============================================================================
 # Advanced Configuration
@@ -57,8 +65,8 @@ HF_DATASETS="illustration icon"
 CONFIG_DIR="./configs"
 
 # Accelerate config file (for DeepSpeed, FSDP, etc.)
-# Leave empty for default settings
-ACCELERATE_CONFIG=""
+# Use DeepSpeed ZeRO-3 with CPU offload for maximum memory saving
+ACCELERATE_CONFIG="./configs/zero_stage3_offload.yaml"
 
 # Mixed precision training
 MIXED_PRECISION="bf16"
@@ -97,6 +105,19 @@ fi
 # HuggingFace data
 if [ "$USE_HF_DATA" = "true" ]; then
     CMD_ARGS+=" --use_hf_data --datasets ${HF_DATASETS}"
+    
+    # Local parquet directories (if provided)
+    if [ -n "$LOCAL_ILLUSTRATION_DIR" ]; then
+        CMD_ARGS+=" --local_illustration_dir ${LOCAL_ILLUSTRATION_DIR}"
+    fi
+    if [ -n "$LOCAL_ICON_DIR" ]; then
+        CMD_ARGS+=" --local_icon_dir ${LOCAL_ICON_DIR}"
+    fi
+fi
+
+# Text-only mode
+if [ "$TEXT_ONLY" = "true" ]; then
+    CMD_ARGS+=" --text_only"
 fi
 
 # Build accelerate command

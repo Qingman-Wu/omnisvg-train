@@ -46,14 +46,14 @@ models:
   8B:
     base_vocab_size: 152064
     extended_vocab_size: 197000
-    base_model: "Qwen/Qwen2.5-VL-7B-Instruct"
-    checkpoint: "OmniSVG/OmniSVG1.1_8B"
+    base_model: "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
+    checkpoint: "/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
     
     # Special tokens (computed from base_vocab_size)
     special_tokens:
       pad_token_id: 151643
-      bos_token_id: 196999
-      eos_token_id: 196998
+      bos_token_id: 196998
+      eos_token_id: 196999
     
     # SVG token offsets (base_vocab_size + offset)
     svg_tokens:
@@ -63,11 +63,11 @@ models:
       
       # Commands start at base + 2
       commands:
-        move: 152066
-        line: 152067
-        curve: 152068
-        arc: 152069
-        close: 152070
+        move: 152067
+        line: 152068
+        curve: 152069
+        arc: 152070
+        close: 152071
       
       # Coordinate tokens
       coordinates:
@@ -87,4 +87,4 @@ color_tokens:
   max_color_tokens: 4098
 
 # Default model (can be overridden via command line)
-default_model: "4B"
+default_model: "8B"

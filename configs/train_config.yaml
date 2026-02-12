@@ -6,7 +6,7 @@
 model:
   # Model size: "4B" or "8B"
   # This determines the base model and tokenization settings
-  size: "4B"
+  size: "8B"
   
   # Enable Flash Attention 2 for faster training
   use_flash_attn: true
@@ -58,13 +58,14 @@ training:
     num_cycles: 0.5
   
   # Task balance (text-to-SVG vs image-to-SVG)
+  # Set to 1.0 for text-only training (Text-to-SVG only)
   task_balance:
-    initial_text_only_ratio: 0.50
+    initial_text_only_ratio: 1.0
   
   # Loss weights
   loss_weights:
-    text_task: 1.5
-    image_task: 1.0
+    text_task: 1.0
+    image_task: 0.0
 
 # ==============================================================================
 # Logging and Checkpointing

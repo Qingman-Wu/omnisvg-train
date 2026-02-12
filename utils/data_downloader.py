@@ -52,7 +52,7 @@ DATASET_REGISTRY = {
 
 class HuggingFaceDataLoader:
     """
-    Handles downloading and processing datasets from HuggingFace Hub.
+    Handles downloading and processing datasets from HuggingFace Hub or local parquet files.
     """
     
     def __init__(
@@ -67,6 +67,45 @@ class HuggingFaceDataLoader:
         self.processed_dir = Path(processed_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
+    
+    def load_from_local_parquet(
+        self,
+        parquet_dir: str,
+        pattern: str = "*.parquet",
+    ) -> Dataset:
+        """
+        Load dataset from local parquet files.
+        
+        Args:
+            parquet_dir: Directory containing parquet files
+            pattern: Glob pattern for parquet files (e.g., "train-*.parquet")
+        
+        Returns:
+            HuggingFace Dataset object
+        """
+        from datasets import Dataset as HFDataset
+        import glob
+        
+        parquet_dir = Path(parquet_dir)
+        parquet_files = sorted(glob.glob(str(parquet_dir / pattern)))
+        
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {parquet_dir} with pattern {pattern}")
+        
+        print(f"Loading {len(parquet_files)} parquet files from {parquet_dir}...")
+        
+        # Load all parquet files
+        all_dfs = []
+        for pf in tqdm(parquet_files, desc="Loading parquets"):
+            df = pd.read_parquet(pf)
+            all_dfs.append(df)
+        
+        # Concatenate and convert to HF Dataset
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        dataset = HFDataset.from_pandas(combined_df)
+        
+        print(f"Loaded {len(dataset)} samples from local parquet files")
+        return dataset
     
     def download_dataset(
         self,
@@ -279,6 +318,7 @@ def download_omnisvg_data(
     train_ratio: float = 0.95,
     max_token_length: int = 2048,
     cache_dir: str = "./data/cache",
+    local_data_dirs: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, str, str]:
     """
     Main function to download and prepare OmniSVG datasets.
@@ -291,6 +331,9 @@ def download_omnisvg_data(
         train_ratio: Ratio of training data (default 0.95)
         max_token_length: Maximum token length filter
         cache_dir: Directory for HuggingFace cache
+        local_data_dirs: Optional dict mapping dataset keys to local parquet directories.
+                        If provided, loads from local instead of downloading.
+                        Example: {'illustration': '/path/to/local/illustration/parquets'}
     
     Returns:
         Tuple of (train_csv, val_csv, svg_folder, png_folder)
@@ -299,11 +342,11 @@ def download_omnisvg_data(
         # Download all data from both datasets
         train_csv, val_csv, svg_dir, png_dir = download_omnisvg_data()
         
-        # Download specific parquets
+        # Load from local parquet files
         train_csv, val_csv, svg_dir, png_dir = download_omnisvg_data(
-            parquet_config={
-                'illustration': [0, 1, 2],  # First 3 parquets
-                'icon': None,  # All parquets
+            datasets=['illustration'],
+            local_data_dirs={
+                'illustration': '/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process'
             }
         )
     """
@@ -313,17 +356,31 @@ def download_omnisvg_data(
     if datasets is None:
         datasets = ['illustration', 'icon']
     
-    # Build config
-    if parquet_config is None:
-        parquet_config = {ds: None for ds in datasets}
-    else:
-        # Ensure all requested datasets are in config
-        for ds in datasets:
-            if ds not in parquet_config:
-                parquet_config[ds] = None
+    # Load datasets (from local or HuggingFace)
+    all_datasets = []
     
-    # Download and combine
-    combined_dataset = loader.download_multiple_datasets(parquet_config)
+    for dataset_key in datasets:
+        if local_data_dirs and dataset_key in local_data_dirs:
+            # Load from local parquet files
+            local_dir = local_data_dirs[dataset_key]
+            print(f"Loading {dataset_key} from local directory: {local_dir}")
+            dataset = loader.load_from_local_parquet(local_dir, pattern="*.parquet")
+            all_datasets.append(dataset)
+        else:
+            # Download from HuggingFace
+            if parquet_config is None:
+                parquet_indices = None
+            else:
+                parquet_indices = parquet_config.get(dataset_key, None)
+            
+            dataset = loader.download_dataset(dataset_key, parquet_indices=parquet_indices)
+            all_datasets.append(dataset)
+    
+    # Combine datasets
+    if len(all_datasets) == 1:
+        combined_dataset = all_datasets[0]
+    else:
+        combined_dataset = concatenate_datasets(all_datasets)
     
     # Process and save
     train_csv, val_csv = loader.process_and_save(

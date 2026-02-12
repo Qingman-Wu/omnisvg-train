@@ -77,8 +77,8 @@ MODEL_DEFAULTS = {
         "checkpoint": "OmniSVG/OmniSVG1.1_4B",
     },
     "8B": {
-        "base_model": "Qwen/Qwen2.5-VL-7B-Instruct",
-        "checkpoint": "OmniSVG/OmniSVG1.1_8B",
+        "base_model": "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct",
+        "checkpoint": "/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B",
     },
 }
 
@@ -248,6 +248,7 @@ def load_model(
     use_flash_attn: bool = True,
     checkpoint_path: Optional[str] = None,
     device_map: str = "auto",
+    token_config: Optional[Any] = None,
 ) -> nn.Module:
     """
     Load OmniSVG model with appropriate settings.
@@ -280,11 +281,21 @@ def load_model(
     print(f"Max SVG tokens: {pix_len}")
     print(f"Max text length: {text_len}")
     
+    # Get token IDs from config (yaml is the single source of truth)
+    vocab_size = token_config.extended_vocab_size if token_config else 197000
+    bos_token_id = token_config.bos_token_id if token_config else 196998
+    eos_token_id = token_config.eos_token_id if token_config else 196999
+    pad_token_id = token_config.pad_token_id if token_config else 151643
+    
     # Initialize model from base
     model = SketchDecoder(
         pix_len=pix_len,
         text_len=text_len,
         model_path=base_model,
+        vocab_size=vocab_size,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
         attn_implementation=attn_implementation,
     )
     
@@ -395,17 +406,24 @@ def create_collate_fn(
         task_assignments = []
         for _ in range(len(text_oris)):
             task_counter["total"] += 1
-            target_text_count = task_counter["total"] // 2
             
-            if task_counter["text"] < target_text_count:
+            if text_only_ratio >= 1.0:
+                # Pure text-to-SVG mode
                 task_assignments.append("text")
                 task_counter["text"] += 1
             else:
-                task_assignments.append("image")
+                target_text_count = int(task_counter["total"] * text_only_ratio + 0.5)
+                
+                if task_counter["text"] < target_text_count:
+                    task_assignments.append("text")
+                    task_counter["text"] += 1
+                else:
+                    task_assignments.append("image")
         
-        indices = list(range(len(task_assignments)))
-        np.random.shuffle(indices)
-        task_assignments = [task_assignments[i] for i in indices]
+        if text_only_ratio < 1.0:
+            indices = list(range(len(task_assignments)))
+            np.random.shuffle(indices)
+            task_assignments = [task_assignments[i] for i in indices]
         
         for text_ori, pil_image, task_type in zip(text_oris, pil_images, task_assignments):
             if task_type == 'text':
@@ -660,12 +678,26 @@ def train(args, config: OmniSVGConfig):
     
     # Load or download data
     if args.use_hf_data:
-        accelerator.print("Downloading datasets from HuggingFace...")
+        # Build local_data_dirs dict if local paths provided
+        local_data_dirs = {}
+        if args.local_illustration_dir:
+            local_data_dirs['illustration'] = args.local_illustration_dir
+            accelerator.print(f"Using local illustration data: {args.local_illustration_dir}")
+        if args.local_icon_dir:
+            local_data_dirs['icon'] = args.local_icon_dir
+            accelerator.print(f"Using local icon data: {args.local_icon_dir}")
+        
+        if local_data_dirs:
+            accelerator.print("Loading from local parquet files (no download)...")
+        else:
+            accelerator.print("Downloading datasets from HuggingFace...")
+        
         train_csv, val_csv, svg_folder, png_folder = download_omnisvg_data(
             output_dir=args.data_dir,
             datasets=args.datasets,
             train_ratio=0.95,
             max_token_length=config.training.max_seq_length,
+            local_data_dirs=local_data_dirs if local_data_dirs else None,
         )
     else:
         # Use local data
@@ -713,7 +745,7 @@ def train(args, config: OmniSVGConfig):
     val_collate = create_collate_fn(
         processor,
         text_len=config.training.text_max_length,
-        text_only_ratio=0.5,
+        text_only_ratio=config.training.text_only_ratio,
     )
     
     # Create dataloaders
@@ -740,6 +772,7 @@ def train(args, config: OmniSVGConfig):
         text_len=config.training.text_max_length,
         use_flash_attn=config.training.use_flash_attn,
         checkpoint_path=args.resume_from_checkpoint if args.resume_from_checkpoint else None,
+        token_config=config.tokenization,
     )
     
     # Optimizer
@@ -1113,6 +1146,10 @@ Examples:
                            default=["illustration", "icon"],
                            choices=["illustration", "icon"],
                            help="HuggingFace datasets to use (when --use_hf_data)")
+    data_group.add_argument("--local_illustration_dir", type=str, default=None,
+                           help="Local directory containing illustration parquet files (avoids re-downloading)")
+    data_group.add_argument("--local_icon_dir", type=str, default=None,
+                           help="Local directory containing icon parquet files (avoids re-downloading)")
     
     # Training configuration
     train_group = parser.add_argument_group("Training Configuration")
@@ -1128,6 +1165,10 @@ Examples:
                             help="Maximum SVG sequence length")
     train_group.add_argument("--resume_from_checkpoint", type=str, default=None,
                             help="Path to checkpoint, HuggingFace repo ID (e.g., OmniSVG/OmniSVG1.1_4B), or 'auto'")
+    
+    # Task mode
+    train_group.add_argument("--text_only", action="store_true",
+                            help="Text-to-SVG only mode (no image task)")
     
     # Utility options
     parser.add_argument("--list_datasets", action="store_true",
@@ -1169,6 +1210,12 @@ Examples:
         config.training.use_flash_attn = False
     elif args.use_flash_attn:
         config.training.use_flash_attn = True
+    
+    # Handle text-only mode
+    if args.text_only:
+        config.training.text_only_ratio = 1.0
+        config.training.text_loss_weight = 1.0
+        config.training.image_loss_weight = 0.0
     
     print(f"\n{'='*60}")
     print(f"OmniSVG Training Configuration")

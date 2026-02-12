@@ -15,19 +15,24 @@ class SketchDecoder(nn.Module):
     def __init__(self,
                  pix_len,
                  text_len,
-                 model_path="Qwen/Qwen2.5-VL-3B-Instruct", 
+                 model_path="Qwen/Qwen2.5-VL-3B-Instruct",
+                 vocab_size=197000,
+                 bos_token_id=196998,
+                 eos_token_id=196999,
+                 pad_token_id=151643,
                  **kwargs):
         super().__init__()
         
         self.pix_len = pix_len
         self.text_len = text_len
         
-        self.vocab_size = 197000
-        self.bos_token_id = 196998
-        self.eos_token_id = 196999
-        self.pad_token_id = 151643
+        self.vocab_size = vocab_size
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
         
         print(f"Loading model from {model_path}...")
+        print(f"  vocab_size={self.vocab_size}, bos={self.bos_token_id}, eos={self.eos_token_id}")
         
         # 加载配置
         config = AutoConfig.from_pretrained(
@@ -49,6 +54,11 @@ class SketchDecoder(nn.Module):
         )
 
         self.transformer.resize_token_embeddings(self.vocab_size)
+        
+        # Enable gradient checkpointing to save memory
+        if hasattr(self.transformer, 'gradient_checkpointing_enable'):
+            self.transformer.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled")
         
         self.train()
 
@@ -104,4 +114,3 @@ class SketchDecoder(nn.Module):
                 attentions=outputs.attentions,
                 rope_deltas=getattr(outputs, 'rope_deltas', None)
             )
-        

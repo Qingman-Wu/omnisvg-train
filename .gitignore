@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data & Models
+data/
+checkpoints/
+output/
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+
+# Logs
+logs/
+*.log
+tensorboard/
+wandb/
+runs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.tmp
+
+deepsvg/__pycache__/
