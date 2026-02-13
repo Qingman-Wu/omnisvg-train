@@ -18,13 +18,15 @@ USE_FLASH_ATTN="false"
 
 
 # Number of GPUs to use
-NUM_GPUS=2
+NUM_GPUS=8
 
 # Batch size per GPU (reduce further if still OOM)
 BATCH_SIZE=1
 
 # Maximum SVG sequence length (further reduce to save memory)
-MAX_SEQ_LENGTH=256
+# Note: Too small values will filter out all training data!
+# Default is 2048. Reduce to 1024/512 if OOM, but not too low.
+MAX_SEQ_LENGTH=2048
 
 # Data directory (should contain: train_meta.csv, val_meta.csv, svg/, png/)
 DATA_DIR="./data"
@@ -40,7 +42,7 @@ PROJECT_NAME=""
 #   - "": Start from scratch
 #   - "auto": Download and use official OmniSVG checkpoint
 #   - "/path/to/checkpoint": Resume from specific checkpoint
-RESUME_CHECKPOINT="/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
+RESUME_CHECKPOINT="/mnt/data/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
 
 # Use HuggingFace datasets (set to "true" to auto-download)
 USE_HF_DATA="true"
@@ -51,7 +53,7 @@ HF_DATASETS="illustration"
 
 # Local parquet directories (avoids re-downloading if you have local files)
 # Leave empty to download from HuggingFace
-LOCAL_ILLUSTRATION_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
+LOCAL_ILLUSTRATION_DIR="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
 LOCAL_ICON_DIR=""
 
 # Text-only mode (text-to-SVG only, no image task)
@@ -66,7 +68,7 @@ CONFIG_DIR="./configs"
 
 # Accelerate config file (for DeepSpeed, FSDP, etc.)
 # Use DeepSpeed ZeRO-3 with CPU offload for maximum memory saving
-ACCELERATE_CONFIG="./configs/zero_stage3_offload.yaml"
+ACCELERATE_CONFIG="./configs/zero_stage2.yaml"
 
 # Mixed precision training
 MIXED_PRECISION="bf16"
@@ -120,8 +122,8 @@ if [ "$TEXT_ONLY" = "true" ]; then
     CMD_ARGS+=" --text_only"
 fi
 
-# Build accelerate command
-ACCELERATE_CMD="accelerate launch"
+# Build accelerate command - MODIFIED to use python -m
+ACCELERATE_CMD="python -m accelerate.commands.launch"
 ACCELERATE_CMD+=" --num_processes ${NUM_GPUS}"
 ACCELERATE_CMD+=" --mixed_precision ${MIXED_PRECISION}"
 

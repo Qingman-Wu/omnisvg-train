@@ -59,6 +59,27 @@ from utils import (
 )
 from decoder import SketchDecoder
 
+# ============================================================================
+# Monkey-patch: Fix PyTorch _get_grad_fn_or_grad_acc crash with DeepSpeed ZeRO
+# ============================================================================
+# DeepSpeed ZeRO Stage 2 replaces parameter data with empty tensors during init
+# (param.data = torch.empty(1)), which can cause t.view_as(t).grad_fn to be None.
+# PyTorch's _get_grad_fn_or_grad_acc crashes on .next_functions when grad_fn is None.
+# DeepSpeed's caller already handles None returns, so we just need to not crash.
+import torch.autograd.graph as _torch_ag_graph
+
+_original_get_grad_fn_or_grad_acc = getattr(_torch_ag_graph, '_get_grad_fn_or_grad_acc', None)
+if _original_get_grad_fn_or_grad_acc is not None:
+    def _safe_get_grad_fn_or_grad_acc(t):
+        if t.requires_grad and t.grad_fn is None:
+            view = t.view_as(t)
+            if view.grad_fn is None:
+                return None
+            return view.grad_fn.next_functions[0][0]
+        else:
+            return t.grad_fn
+    _torch_ag_graph._get_grad_fn_or_grad_acc = _safe_get_grad_fn_or_grad_acc
+
 # For Qwen2.5-VL
 try:
     from qwen_vl_utils import process_vision_info
@@ -78,7 +99,7 @@ MODEL_DEFAULTS = {
     },
     "8B": {
         "base_model": "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct",
-        "checkpoint": "/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B",
+        "checkpoint": "/mnt/data/wuqingman/models/OmniSVG/OmniSVG1.1_8B",
     },
 }
 
@@ -267,8 +288,9 @@ def load_model(
     if model_size not in MODEL_DEFAULTS:
         raise ValueError(f"Invalid model_size: {model_size}. Must be one of {list(MODEL_DEFAULTS.keys())}")
     
-    base_model = MODEL_DEFAULTS[model_size]["base_model"]
-    default_checkpoint = MODEL_DEFAULTS[model_size]["checkpoint"]
+    # Use token_config (from yaml) if available, otherwise fall back to MODEL_DEFAULTS
+    base_model = token_config.base_model if token_config and hasattr(token_config, 'base_model') else MODEL_DEFAULTS[model_size]["base_model"]
+    default_checkpoint = token_config.checkpoint if token_config and hasattr(token_config, 'checkpoint') else MODEL_DEFAULTS[model_size]["checkpoint"]
     
     # Set attention implementation
     attn_implementation = "flash_attention_2" if use_flash_attn else "eager"
@@ -662,8 +684,8 @@ def train(args, config: OmniSVGConfig):
     # Set seed
     set_seed(config.training.seed)
     
-    # Get base model path
-    base_model_path = MODEL_DEFAULTS[config.model_size]["base_model"]
+    # Get base model path from tokenization config (yaml is the single source of truth)
+    base_model_path = config.tokenization.base_model
     accelerator.print(f"Using base model: {base_model_path}")
     accelerator.print(f"Model size: {config.model_size}")
     
@@ -775,10 +797,30 @@ def train(args, config: OmniSVGConfig):
         token_config=config.tokenization,
     )
     
-    # Optimizer
+    # Freeze visual encoder in text-only mode to avoid DeepSpeed ZeRO Stage 2 error.
+    # When pixel_values is always None, the visual encoder never participates in forward pass,
+    # but DeepSpeed requires all requires_grad=True parameters to be in the computation graph.
+    # Freezing these parameters prevents the 'NoneType' grad_fn error.
+    if config.training.text_only_ratio >= 1.0:
+        visual_frozen_count = 0
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'visual'):
+            for param in model.transformer.visual.parameters():
+                param.requires_grad = False
+                visual_frozen_count += 1
+            accelerator.print(f"Text-only mode: froze {visual_frozen_count} visual encoder parameters")
+        else:
+            accelerator.print("Warning: Could not find visual encoder to freeze")
+    
+    # Optimizer - only pass trainable parameters.
+    # Frozen params (e.g. visual encoder in text-only mode) must NOT be passed
+    # to the optimizer, otherwise DeepSpeed ZeRO registers them and crashes
+    # during backward with 'NoneType' grad_fn error.
     lr = config.training.learning_rate * accelerator.num_processes
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    accelerator.print(f"Trainable parameters: {len(trainable_params)}, "
+                      f"Total parameters: {sum(1 for _ in model.parameters())}")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=lr,
         weight_decay=config.training.weight_decay,
         betas=(0.9, 0.95),
@@ -887,7 +929,14 @@ def train(args, config: OmniSVGConfig):
                     optimizer.zero_grad()
                     
                     global_step += 1
+                    
+                    # Update progress bar with metrics
                     progress_bar.update(1)
+                    progress_bar.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'text_loss': f'{text_loss.item():.4f}',
+                        'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
+                    })
                     
                     # Logging
                     if global_step % config.training.log_every == 0:
@@ -1030,12 +1079,22 @@ def log_metrics(
     avg_image = np.mean(image_losses) if image_losses else 0
     avg_total = np.mean(text_losses + image_losses) if (text_losses + image_losses) else 0
     avg_grad = np.mean(grad_norms) if grad_norms else 0
+    lr = lr_scheduler.get_last_lr()[0]
     
+    # Write to TensorBoard
     writer.add_scalar("loss/total", avg_total, step)
     writer.add_scalar("loss/text_task", avg_text, step)
     writer.add_scalar("loss/image_task", avg_image, step)
-    writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], step)
+    writer.add_scalar("lr", lr, step)
     writer.add_scalar("grad_norm", avg_grad, step)
+    
+    # Print to console
+    accelerator.print(
+        f"Step {step:5d} | "
+        f"Loss: {avg_total:.4f} (text: {avg_text:.4f}, img: {avg_image:.4f}) | "
+        f"Grad: {avg_grad:.4f} | "
+        f"LR: {lr:.2e}"
+    )
 
 
 def save_checkpoint(
@@ -1221,8 +1280,8 @@ Examples:
     print(f"OmniSVG Training Configuration")
     print(f"{'='*60}")
     print(f"Model Size:        {config.model_size}")
-    print(f"Base Model:        {MODEL_DEFAULTS[config.model_size]['base_model']}")
-    print(f"Default Checkpoint:{MODEL_DEFAULTS[config.model_size]['checkpoint']}")
+    print(f"Base Model:        {config.tokenization.base_model}")
+    print(f"Default Checkpoint:{config.tokenization.checkpoint}")
     print(f"Flash Attention:   {config.training.use_flash_attn}")
     print(f"Data Directory:    {config.training.data_dir}")
     print(f"Max Seq Length:    {config.training.max_seq_length}")

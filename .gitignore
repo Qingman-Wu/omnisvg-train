@@ -43,4 +43,4 @@ Thumbs.db
 *.bak
 *.tmp
 
-deepsvg/__pycache__/
+deepsvg/__pycache__/**/__pycache__/
