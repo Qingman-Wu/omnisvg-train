@@ -866,18 +866,6 @@ def train(args, config: OmniSVGConfig):
     image_losses = []
     grad_norms = []
     
-    # ============ DEBUG: Save training samples for tokenizer verification ============
-    save_train_samples = os.environ.get('SAVE_TRAIN_SAMPLES', 'false').lower() == 'true'
-    samples_saved = 0  # Tracked by ALL ranks to keep sync
-    max_samples_to_save = int(os.environ.get('MAX_TRAIN_SAMPLES', '10'))
-    samples_output_dir = os.environ.get('TRAIN_SAMPLES_DIR', './train_samples_debug')
-    
-    if save_train_samples and accelerator.is_main_process:
-        os.makedirs(samples_output_dir, exist_ok=True)
-    if save_train_samples:
-        accelerator.print(f"[DEBUG] Will save {max_samples_to_save} training samples to {samples_output_dir}")
-    # ==================================================================================
-    
     for epoch in range(starting_epoch, config.training.epochs):
         model.train()
         progress_bar = tqdm(
@@ -893,58 +881,6 @@ def train(args, config: OmniSVGConfig):
                     process_mixed_batch(
                         batch_messages, pix_seq_lists, batch_task_types, processor, config
                     )
-                
-                # ============ DEBUG: Save training samples ============
-                if save_train_samples and samples_saved < max_samples_to_save:
-                    # Only main process writes files, but ALL ranks track count
-                    if accelerator.is_main_process:
-                        batch_size = input_ids.shape[0]
-                        for i in range(batch_size):
-                            if samples_saved + i >= max_samples_to_save:
-                                break
-                            
-                            sample_id = f"sample_{samples_saved + i:04d}"
-                            
-                            # Extract prompt text
-                            prompt_text = ""
-                            for msg in batch_messages[i]:
-                                if msg['role'] == 'user':
-                                    for content in msg['content']:
-                                        if content['type'] == 'text':
-                                            prompt_text = content['text']
-                                            break
-                            
-                            # Save sample data
-                            sample_data = {
-                                'sample_id': sample_id,
-                                'task_type': batch_task_types[i],
-                                'prompt_text': prompt_text,
-                                'input_ids': input_ids[i].cpu().tolist(),
-                                'labels': labels[i].cpu().tolist(),
-                                'attention_mask': attention_mask[i].cpu().tolist(),
-                                'pix_seq': pix_seq_lists[i],
-                                'original_svg': original_svgs[i],
-                                'epoch': epoch,
-                                'global_step': global_step,
-                            }
-                            
-                            sample_file = os.path.join(samples_output_dir, f"{sample_id}.json")
-                            with open(sample_file, 'w', encoding='utf-8') as f:
-                                json.dump(sample_data, f, indent=2, ensure_ascii=False)
-                            
-                            accelerator.print(f"[DEBUG] Saved {sample_id}: task={batch_task_types[i]}, "
-                                            f"input_len={len(sample_data['input_ids'])}, "
-                                            f"pix_seq_len={len(pix_seq_lists[i])}")
-                    
-                    # ALL ranks update count consistently (use main process batch_size)
-                    samples_saved += input_ids.shape[0]
-                    
-                    if samples_saved >= max_samples_to_save:
-                        accelerator.print(f"[DEBUG] Finished saving {min(samples_saved, max_samples_to_save)} samples to {samples_output_dir}")
-                        save_train_samples = False
-                        # ALL ranks call wait_for_everyone to re-sync
-                        accelerator.wait_for_everyone()
-                # ======================================================
                 
                 # Move to device
                 input_ids = input_ids.to(accelerator.device)

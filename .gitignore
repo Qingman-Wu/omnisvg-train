@@ -44,5 +44,3 @@ Thumbs.db
 *.tmp
 
 deepsvg/__pycache__/**/__pycache__/
-
-train_samples_debug/
