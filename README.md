@@ -24,14 +24,10 @@
 | 文件 | 说明 |
 |------|------|
 | `verify_train_samples.py` | 验证脚本，decode 训练样本并保存 SVG |
+| `verify_train_samples.sh` | 一键验证脚本 |
 | `analyze_tokenizer_diff.py` | 分析 token 序列，识别特殊 token、命令等 |
 | `verification_output/` | 验证结果输出目录 |
 
-### 根目录 (`/mnt/data/wuqingman/`)
-
-| 文件 | 说明 |
-|------|------|
-| `verify_train_samples.sh` | 一键验证脚本 |
 
 ## 代码修改
 
@@ -110,18 +106,6 @@ firefox omnisvg-inference/verification_output/sample_0000_gt.svg \
 | `sample_XXXX_tokens.py` | Python 格式的 token 列表（可复制到 inference.py 测试） |
 | `sample_XXXX_info.json` | 详细对比信息 |
 
-## 结果判断
-
-### ✅ 正常
-
-- `sample_XXXX_gt.svg` 和 `sample_XXXX_from_input_ids.svg` **显示一致**
-- `info.json` 中 `tokens_match: true`
-
-### ❌ 异常
-
-- 两个 SVG 显示不同 → 训练 tokenizer 有 bug
-- decode 失败 → token ID 配置错误
-- `tokens_match: false` → input_ids 构建逻辑有问题
 
 ## 注意事项
 
