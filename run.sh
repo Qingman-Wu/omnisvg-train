@@ -60,6 +60,17 @@ LOCAL_ICON_DIR=""
 TEXT_ONLY="true"
 
 # ==============================================================================
+# DEBUG: Save training samples for tokenizer verification
+# ==============================================================================
+# Set to "true" to save training samples (for debugging tokenizer)
+# Use environment variable if set, otherwise use default
+SAVE_TRAIN_SAMPLES="${SAVE_TRAIN_SAMPLES:-false}"
+# Number of samples to save
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-10}"
+# Output directory for saved samples
+TRAIN_SAMPLES_DIR="${TRAIN_SAMPLES_DIR:-./train_samples_debug}"
+
+# ==============================================================================
 # Advanced Configuration
 # ==============================================================================
 
@@ -186,6 +197,17 @@ fi
 echo "Starting training..."
 echo "Command: ${ACCELERATE_CMD} train.py ${CMD_ARGS}"
 echo ""
+
+# Export environment variables for debug mode
+export SAVE_TRAIN_SAMPLES="${SAVE_TRAIN_SAMPLES}"
+export MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES}"
+export TRAIN_SAMPLES_DIR="${TRAIN_SAMPLES_DIR}"
+
+echo "Debug settings: SAVE_TRAIN_SAMPLES=${SAVE_TRAIN_SAMPLES}, MAX_TRAIN_SAMPLES=${MAX_TRAIN_SAMPLES}"
+if [ "$SAVE_TRAIN_SAMPLES" = "true" ]; then
+    echo "⚠️  DEBUG MODE ENABLED: Will save ${MAX_TRAIN_SAMPLES} training samples to ${TRAIN_SAMPLES_DIR}"
+    echo ""
+fi
 
 ${ACCELERATE_CMD} train.py ${CMD_ARGS}
 
