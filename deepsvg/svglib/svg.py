@@ -80,9 +80,9 @@ class ColorTokenConfig:
     """
     
     # Base vocabulary configuration (matches tokenization.yaml)
-    BASE_VOCAB_SIZE: int = 151936
-    COLOR_TOKEN_OFFSET: int = 40010
-    
+    BASE_VOCAB_SIZE: int = 152064
+    COLOR_TOKEN_OFFSET: int = 40011
+
     # Derived constants
     COLOR_TOKEN_START: int = COLOR_TOKEN_OFFSET + BASE_VOCAB_SIZE  # 191946
     MAX_COLOR_TOKENS: int = 4098

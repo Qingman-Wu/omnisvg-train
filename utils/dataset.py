@@ -81,6 +81,7 @@ class SVGTokenizer:
         """Convert 2D coordinate to linear index."""
         return int(coord[0] + coord[1] * self.BBOX)
     
+   
     def tokenize_svg_tensors(
         self, 
         svg_tensors: List[torch.Tensor], 
@@ -113,21 +114,21 @@ class SVGTokenizer:
                 if cmd == 0:  # Move
                     path_tokens.append(self.CMD_MOVE)
                     if i == 0:
-                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
-                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
+                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
                     else:
-                        path_tokens.append(self.coord_to_index(start_pos) + self.PIX_PAD)
-                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                        path_tokens.append(self.coord_to_index(start_pos) + self.PIX_PAD + self.config.num_svg_end)
+                        path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
                         
                 elif cmd == 1:  # Line
                     path_tokens.append(self.CMD_LINE)
-                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
                     
                 elif cmd == 2:  # Curve (Cubic Bezier)
                     path_tokens.append(self.CMD_CURVE)
-                    path_tokens.append(self.coord_to_index(control1) + self.PIX_PAD)
-                    path_tokens.append(self.coord_to_index(control2) + self.PIX_PAD)
-                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                    path_tokens.append(self.coord_to_index(control1) + self.PIX_PAD + self.config.num_svg_end)
+                    path_tokens.append(self.coord_to_index(control2) + self.PIX_PAD + self.config.num_svg_end)
+                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
                     
                 elif cmd == 3:  # Arc
                     radius = cmd_arg_tensor[1:3].numpy()
@@ -136,22 +137,21 @@ class SVGTokenizer:
                     sweep_flag = cmd_arg_tensor[5].item()
                     
                     path_tokens.append(self.CMD_ARC)
-                    path_tokens.append(self.coord_to_index(radius) + self.PIX_PAD)
-                    path_tokens.append(int(x_axis_rot) + self.ARC_PARAM_START)
-                    path_tokens.append(int(large_arc_flag) + self.ARC_PARAM_START)
-                    path_tokens.append(int(sweep_flag) + self.ARC_PARAM_START)
-                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                    path_tokens.append(self.coord_to_index(radius) + self.PIX_PAD + self.config.num_svg_end)
+                    path_tokens.append(int(x_axis_rot) + self.ARC_PARAM_START + self.config.num_svg_end)
+                    path_tokens.append(int(large_arc_flag) + self.ARC_PARAM_START + self.config.num_svg_end)
+                    path_tokens.append(int(sweep_flag) + self.ARC_PARAM_START + self.config.num_svg_end)
+                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
                     
                 elif cmd == 6:  # Close
                     path_tokens.append(self.CMD_CLOSE)
-                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD)
+                    path_tokens.append(self.coord_to_index(end_pos) + self.PIX_PAD + self.config.num_svg_end)
             
             # Add color token
             path_tokens.append(color_token)
             all_tokens.extend(path_tokens)
         
         return np.array(all_tokens, dtype=np.int64)
-    
     def add_special_tokens(self, tokens: np.ndarray) -> np.ndarray:
         """Add BOS and EOS tokens to sequence."""
         tokens = np.insert(tokens, 0, self.BOS_TOKEN)
@@ -348,7 +348,7 @@ class OmniSVGDataset(Dataset):
     def __len__(self) -> int:
         return len(self.duplicated_indices)
     
-    def __getitem__(self, index: int) -> Tuple[str, Image.Image, List[int]]:
+    def __getitem__(self, index: int) -> Tuple[str, Image.Image, List[int], str]:
         """Get a single sample."""
         max_retries = 20
         
@@ -367,8 +367,8 @@ class OmniSVGDataset(Dataset):
         
         raise RuntimeError(f"Failed to load sample after {max_retries} retries")
     
-    def _get_hf_sample(self, idx: int) -> Tuple[str, Image.Image, List[int]]:
-        """Get sample from HuggingFace dataset."""
+    def _get_hf_sample(self, idx: int) -> Tuple[str, Image.Image, List[int], str]:
+        """Get sample from HuggingFace dataset. Returns (text, image, tokens, original_svg)."""
         sample = self.hf_dataset[idx]
         
         # Get text
@@ -408,10 +408,11 @@ class OmniSVGDataset(Dataset):
         # Add special tokens
         tokens = self.svg_tokenizer.add_special_tokens(tokens)
         
-        return text, image, tokens.tolist()
+        # Return original SVG code as well
+        return text, image, tokens.tolist(), svg_code
     
-    def _get_local_sample(self, idx: int) -> Tuple[str, Image.Image, List[int]]:
-        """Get sample from local files."""
+    def _get_local_sample(self, idx: int) -> Tuple[str, Image.Image, List[int], str]:
+        """Get sample from local files. Returns (text, image, tokens, original_svg)."""
         row = self.meta_df.iloc[idx]
         uid = row['id']
         
@@ -438,10 +439,18 @@ class OmniSVGDataset(Dataset):
         
         # Load and tokenize SVG
         svg_path = self._find_file(uid, '.svg', self.svg_folder, self.svg_index)
-        if svg_path and os.path.exists(svg_path) and DEEPSVG_AVAILABLE:
-            svg = SVG.load_svg(svg_path)
-            svg_tensors, color_tensors = svg.to_tensor(concat_groups=False, PAD_VAL=0)
-            tokens = self.svg_tokenizer.tokenize_svg_tensors(svg_tensors, color_tensors)
+        svg_code = ""
+        if svg_path and os.path.exists(svg_path):
+            # Read original SVG code
+            with open(svg_path, 'r', encoding='utf-8') as f:
+                svg_code = f.read()
+            
+            if DEEPSVG_AVAILABLE:
+                svg = SVG.load_svg(svg_path)
+                svg_tensors, color_tensors = svg.to_tensor(concat_groups=False, PAD_VAL=0)
+                tokens = self.svg_tokenizer.tokenize_svg_tensors(svg_tensors, color_tensors)
+            else:
+                tokens = np.array([], dtype=np.int64)
         else:
             # Return empty tokens as fallback
             tokens = np.array([], dtype=np.int64)
@@ -450,7 +459,7 @@ class OmniSVGDataset(Dataset):
         tokens = self._apply_masking(tokens)
         tokens = self.svg_tokenizer.add_special_tokens(tokens)
         
-        return text, image, tokens.tolist()
+        return text, image, tokens.tolist(), svg_code
     
     def _process_image(self, image: Image.Image) -> Image.Image:
         """Process image to target format."""
