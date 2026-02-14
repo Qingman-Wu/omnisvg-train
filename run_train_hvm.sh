@@ -7,7 +7,7 @@
 #   bash run_train_hvm.sh                    # 默认 8 卡训练
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
 #   bash run_train_hvm.sh --num_gpus 8       # 4 卡训练
-#   bash run_train_hvm.sh --resume /path/to/hvm_step_1000.pt  # 恢复训练
+#   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_epoch_5.pt  # 恢复训练
 #
 # =============================================================================
 
@@ -60,7 +60,8 @@ SWANLAB_MODE="local"                # cloud / local / disabled
 SWANLAB_RUN_NAME=""                 # 留空自动生成
 
 # -- 恢复训练 --
-HVM_CHECKPOINT=""                   # HVM checkpoint 路径
+RESUME_FROM=""                      # 完整训练 checkpoint 目录 (含 optimizer/scheduler/step)
+HVM_CHECKPOINT=""                   # HVM-only 权重 .pt (仅加载模型权重, 不恢复训练状态)
 
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
@@ -71,7 +72,8 @@ while [[ $# -gt 0 ]]; do
         --epochs)         EPOCHS="$2";              shift 2 ;;
         --lr)             LEARNING_RATE="$2";       shift 2 ;;
         --warmup)         WARMUP_STEPS="$2";        shift 2 ;;
-        --resume)         HVM_CHECKPOINT="$2";      shift 2 ;;
+        --resume)         RESUME_FROM="$2";         shift 2 ;;
+        --hvm_ckpt)       HVM_CHECKPOINT="$2";      shift 2 ;;
         --output_dir)     OUTPUT_DIR="$2";          shift 2 ;;
         --data_dir)       DATA_DIR="$2";            shift 2 ;;
         --hvm_dir)        HVM_DIR="$2";             shift 2 ;;
@@ -147,8 +149,10 @@ if [ -n "$OMNISVG_CHECKPOINT" ]; then
     TRAIN_ARGS+=(--omnisvg_checkpoint "$OMNISVG_CHECKPOINT")
 fi
 
-# HVM resume checkpoint
-if [ -n "$HVM_CHECKPOINT" ]; then
+# Resume: 完整训练恢复 (--resume_from) 和 HVM 权重初始化 (--hvm_checkpoint) 互斥
+if [ -n "$RESUME_FROM" ]; then
+    TRAIN_ARGS+=(--resume_from "$RESUME_FROM")
+elif [ -n "$HVM_CHECKPOINT" ]; then
     TRAIN_ARGS+=(--hvm_checkpoint "$HVM_CHECKPOINT")
 fi
 

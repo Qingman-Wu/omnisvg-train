@@ -10,11 +10,14 @@ Usage:
     # 单 GPU 测试
     python train_hvm.py --batch_size 1
 
-    # 多 GPU 分布式训练
-    accelerate launch --num_processes 8 train_hvm.py --batch_size 2
+    # 多 GPU 分布式训练 (DeepSpeed ZeRO-2)
+    accelerate launch --config_file configs/ds_zero2_hvm.yaml train_hvm.py --batch_size 2
 
-    # 从 HVM checkpoint 恢复
-    accelerate launch train_hvm.py --hvm_checkpoint ./outputs_hvm/hvm_step_10000.pt
+    # 从完整 checkpoint 恢复训练 (optimizer/scheduler/step 全部恢复)
+    accelerate launch ... train_hvm.py --resume_from ./outputs_hvm/checkpoint-epoch-5
+
+    # 从 HVM 权重初始化 (仅加载模型权重, 不恢复训练状态)
+    accelerate launch ... train_hvm.py --hvm_checkpoint ./outputs_hvm/hvm_epoch_5.pt
 """
 
 import os
@@ -276,6 +279,45 @@ def train(args):
     # 如果再 prepare scheduler，AcceleratedScheduler 会内部再除以 num_processes，
     # 导致 lr schedule 被压缩 8 倍，几个 epoch 就衰减到 0。
 
+    # ---- Resume from full training checkpoint ----
+    start_epoch = 0
+    global_step = 0
+    resume_step_in_epoch = 0  # 当前 epoch 中已完成的 optimizer steps
+
+    if args.resume_from and os.path.exists(args.resume_from):
+        accelerator.print(f"Resuming full training state from {args.resume_from}")
+        # 所有 rank 参与: 恢复 model (DeepSpeed engine) + optimizer states
+        accelerator.load_state(args.resume_from)
+
+        # 读取训练元信息 (所有 rank 都需要)
+        metadata_path = os.path.join(args.resume_from, "training_metadata.json")
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        global_step = metadata["global_step"]
+        start_epoch = metadata["epoch"]
+
+        # 恢复 lr_scheduler state (不经过 accelerator.prepare, 手动保存/加载)
+        scheduler_path = os.path.join(args.resume_from, "lr_scheduler.pt")
+        if os.path.exists(scheduler_path):
+            lr_scheduler.load_state_dict(
+                torch.load(scheduler_path, map_location="cpu")
+            )
+
+        # 计算当前 epoch 中需要跳过的 batches
+        resume_step_in_epoch = global_step - start_epoch * num_update_steps_per_epoch
+
+        accelerator.print(
+            f"  Resumed: epoch={start_epoch + 1}/{args.epochs}, "
+            f"global_step={global_step}/{total_training_steps}, "
+            f"lr={lr_scheduler.get_last_lr()[0]:.2e}"
+        )
+        if resume_step_in_epoch > 0:
+            accelerator.print(
+                f"  Will skip {resume_step_in_epoch} steps "
+                f"({resume_step_in_epoch * args.gradient_accumulation_steps} batches) "
+                f"in epoch {start_epoch + 1}"
+            )
+
     # ---- Output dir & SwanLab ----
     output_dir = Path(args.output_dir)
     if accelerator.is_main_process:
@@ -314,20 +356,31 @@ def train(args):
     accelerator.print(f"  Total steps: {total_training_steps}")
     accelerator.print(f"  Warmup steps: {warmup_steps}")
     accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
+    if args.resume_from:
+        accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     accelerator.print("=" * 60)
 
-    global_step = 0
     running_losses = []
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
+
+        # 恢复时跳过当前 epoch 已完成的 batches
+        if epoch == start_epoch and resume_step_in_epoch > 0:
+            batches_to_skip = resume_step_in_epoch * args.gradient_accumulation_steps
+            active_dataloader = accelerator.skip_first_batches(dataloader, batches_to_skip)
+            steps_this_epoch = num_update_steps_per_epoch - resume_step_in_epoch
+        else:
+            active_dataloader = dataloader
+            steps_this_epoch = num_update_steps_per_epoch
+
         progress_bar = tqdm(
-            total=num_update_steps_per_epoch,
+            total=steps_this_epoch,
             disable=not accelerator.is_local_main_process,
             desc=f"Epoch {epoch + 1}/{args.epochs}",
         )
 
-        for batch in dataloader:
+        for batch in active_dataloader:
             with accelerator.accumulate(model):
                 # Move to device
                 input_ids = batch["input_ids"]
@@ -400,10 +453,21 @@ def train(args):
 
                     # ---- Save checkpoint ----
                     if global_step % args.save_every == 0:
+                        # 保存完整训练状态 (所有 rank 参与)
+                        ckpt_dir = str(output_dir / f"checkpoint-step-{global_step}")
+                        accelerator.save_state(ckpt_dir)
                         if accelerator.is_main_process:
+                            # 训练元信息 (global_step, epoch)
+                            with open(os.path.join(ckpt_dir, "training_metadata.json"), "w") as f:
+                                json.dump({"global_step": global_step, "epoch": epoch}, f, indent=2)
+                            # LR scheduler state (未经 accelerator.prepare, 需手动保存)
+                            torch.save(lr_scheduler.state_dict(),
+                                       os.path.join(ckpt_dir, "lr_scheduler.pt"))
+                            # 轻量 HVM-only checkpoint (用于推理/部署)
                             unwrapped = accelerator.unwrap_model(model)
-                            save_path = str(output_dir / f"hvm_step_{global_step}.pt")
-                            unwrapped.save_hvm_checkpoint(save_path)
+                            unwrapped.save_hvm_checkpoint(
+                                str(output_dir / f"hvm_step_{global_step}.pt"))
+                        accelerator.wait_for_everyone()
 
                     # ---- Print gate status ----
                     if global_step % (args.log_every * 10) == 0:
@@ -417,16 +481,25 @@ def train(args):
 
         progress_bar.close()
 
-        # End of epoch save
+        # End of epoch: 保存完整训练状态 (所有 rank 参与)
         accelerator.wait_for_everyone()
+        ckpt_dir = str(output_dir / f"checkpoint-epoch-{epoch + 1}")
+        accelerator.save_state(ckpt_dir)
         if accelerator.is_main_process:
+            # epoch + 1 表示下次应从第 epoch+1 个 epoch 开始（当前 epoch 已完成）
+            with open(os.path.join(ckpt_dir, "training_metadata.json"), "w") as f:
+                json.dump({"global_step": global_step, "epoch": epoch + 1}, f, indent=2)
+            torch.save(lr_scheduler.state_dict(),
+                       os.path.join(ckpt_dir, "lr_scheduler.pt"))
+            # 轻量 HVM-only checkpoint
             unwrapped = accelerator.unwrap_model(model)
-            save_path = str(output_dir / f"hvm_epoch_{epoch + 1}.pt")
-            unwrapped.save_hvm_checkpoint(save_path)
+            unwrapped.save_hvm_checkpoint(
+                str(output_dir / f"hvm_epoch_{epoch + 1}.pt"))
 
             # Log epoch-level metrics
             epoch_avg_loss = np.mean(running_losses) if running_losses else 0
             swanlab.log({"train/epoch_loss": epoch_avg_loss}, step=global_step)
+        accelerator.wait_for_everyone()
 
         torch.cuda.empty_cache()
 
@@ -486,10 +559,22 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
 
     # Resume
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Full training checkpoint directory to resume from "
+                             "(includes optimizer/scheduler/step state)")
     parser.add_argument("--hvm_checkpoint", type=str, default=None,
-                        help="HVM checkpoint to resume from")
+                        help="HVM-only weights (.pt) for fine-tuning "
+                             "(does NOT restore optimizer/scheduler/step)")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # 互斥检查: --resume_from 恢复完整训练状态，--hvm_checkpoint 只加载权重
+    if args.resume_from and args.hvm_checkpoint:
+        parser.error("--resume_from and --hvm_checkpoint are mutually exclusive. "
+                     "Use --resume_from for full training resume, "
+                     "--hvm_checkpoint for HVM weight initialization only.")
+
+    return args
 
 
 if __name__ == "__main__":
