@@ -319,7 +319,7 @@ class HVMSketchDecoder(nn.Module):
 
     def load_hvm_checkpoint(self, load_path: str):
         """加载 HVM 模块的 checkpoint"""
-        state_dict = torch.load(load_path, map_location="cpu")
+        state_dict = torch.load(load_path, map_location="cpu", weights_only=True)
         gme_dict = {k.replace("gme.", ""): v for k, v in state_dict.items() if k.startswith("gme.")}
         pme_dict = {k.replace("pme.", ""): v for k, v in state_dict.items() if k.startswith("pme.")}
         pims_dict = {k.replace("pims.", ""): v for k, v in state_dict.items() if k.startswith("pims.")}

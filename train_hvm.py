@@ -300,7 +300,7 @@ def train(args):
         scheduler_path = os.path.join(args.resume_from, "lr_scheduler.pt")
         if os.path.exists(scheduler_path):
             lr_scheduler.load_state_dict(
-                torch.load(scheduler_path, map_location="cpu")
+                torch.load(scheduler_path, map_location="cpu", weights_only=True)
             )
 
         # 计算当前 epoch 中需要跳过的 batches
@@ -343,7 +343,13 @@ def train(args):
         with open(output_dir / "hvm_config.json", "w") as f:
             json.dump(vars(args), f, indent=2)
         with open(output_dir / "hvm_model_config.json", "w") as f:
-            json.dump(hvm_config.__dict__, f, indent=2, default=str)
+            # __dict__ 不包含 @property，需手动补充
+            config_dict = {
+                **hvm_config.__dict__,
+                "pim_layer_indices": hvm_config.pim_layer_indices,
+                "num_pims": hvm_config.num_pims,
+            }
+            json.dump(config_dict, f, indent=2, default=str)
 
     # ---- Training Loop ----
     accelerator.print("=" * 60)
@@ -411,9 +417,9 @@ def train(args):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    # Gradient clipping
+                    # Gradient clipping (只遍历可训练参数，跳过冻结的 8.6B base model)
                     accelerator.clip_grad_norm_(
-                        model.parameters(),
+                        [p for p in model.parameters() if p.requires_grad],
                         max_norm=args.max_grad_norm,
                     )
 
@@ -481,25 +487,11 @@ def train(args):
 
         progress_bar.close()
 
-        # End of epoch: 保存完整训练状态 (所有 rank 参与)
+        # End of epoch: 只记录 loss，不保存 checkpoint（由 save_every 控制）
         accelerator.wait_for_everyone()
-        ckpt_dir = str(output_dir / f"checkpoint-epoch-{epoch + 1}")
-        accelerator.save_state(ckpt_dir)
         if accelerator.is_main_process:
-            # epoch + 1 表示下次应从第 epoch+1 个 epoch 开始（当前 epoch 已完成）
-            with open(os.path.join(ckpt_dir, "training_metadata.json"), "w") as f:
-                json.dump({"global_step": global_step, "epoch": epoch + 1}, f, indent=2)
-            torch.save(lr_scheduler.state_dict(),
-                       os.path.join(ckpt_dir, "lr_scheduler.pt"))
-            # 轻量 HVM-only checkpoint
-            unwrapped = accelerator.unwrap_model(model)
-            unwrapped.save_hvm_checkpoint(
-                str(output_dir / f"hvm_epoch_{epoch + 1}.pt"))
-
-            # Log epoch-level metrics
             epoch_avg_loss = np.mean(running_losses) if running_losses else 0
             swanlab.log({"train/epoch_loss": epoch_avg_loss}, step=global_step)
-        accelerator.wait_for_everyone()
 
         torch.cuda.empty_cache()
 

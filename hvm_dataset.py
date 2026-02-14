@@ -141,7 +141,7 @@ class HVMDataset(Dataset):
         feat_path = os.path.join(
             self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
         )
-        return torch.load(feat_path, map_location="cpu")  # [16, 16, 4, 1280]
+        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [16, 16, 4, 1280]
 
     def _tokenize_svg(self, svg_code: str) -> np.ndarray:
         """将 SVG 字符串 tokenize 为 token 序列"""
