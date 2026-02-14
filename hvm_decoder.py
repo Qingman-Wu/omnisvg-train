@@ -75,6 +75,10 @@ class HVMSketchDecoder(nn.Module):
         ])
 
         # ---- 统一 dtype: HVM 模块与 base model 一致 (bfloat16) ----
+        # HVM 参数保持 bf16 以节省显存（428M params × 2 bytes vs × 4 bytes = 省 ~3.4GB/GPU）
+        # 训练精度由 DeepSpeed ZeRO-2 保证：DS 内部自动维护 float32 optimizer states
+        # （master weights + momentum + variance），即使模型参数是 bf16，
+        # optimizer 更新也在 float32 上进行，避免小梯度 round to zero
         base_dtype = next(self.base_model.parameters()).dtype
         self.gme = self.gme.to(dtype=base_dtype)
         self.pme = self.pme.to(dtype=base_dtype)
@@ -239,7 +243,7 @@ class HVMSketchDecoder(nn.Module):
         # 1. 计算 HVM 视觉记忆 (只算一次，全程缓存给 hooks 使用)
         # ================================================================
         if ref_features is not None:
-            # 确定 HVM 模块的 dtype
+            # 确定 HVM 模块的 dtype（与 base model 一致，通常为 bfloat16）
             hvm_dtype = next(self.gme.parameters()).dtype
 
             # GME: 3 张参考图 → 32 个 gist tokens

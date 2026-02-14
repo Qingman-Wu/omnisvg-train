@@ -46,6 +46,8 @@ WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
 WARMUP_STEPS=""  # 为空时自动使用 10% of total steps
 SEED=42
+MIXED_PRECISION="bf16"              # 混合精度: bf16 / fp16 / no
+ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 optimizer states)
 
 # -- DataLoader --
 NUM_WORKERS=4
@@ -102,6 +104,7 @@ echo "  Gradient accum:    ${GRAD_ACCUM}"
 echo "  Effective BS:      ${EFFECTIVE_BS}"
 echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
+echo "  Mixed precision:   ${MIXED_PRECISION}"
 echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "  SwanLab mode:      ${SWANLAB_MODE}"
@@ -150,12 +153,20 @@ if [ -n "$HVM_CHECKPOINT" ]; then
 fi
 
 # ===================== 启动训练 =====================
+# 使用 DeepSpeed ZeRO-2 训练:
+#   - 模型参数保持 bf16 (省显存)
+#   - DeepSpeed 自动维护 float32 optimizer states (训练精度)
+#   - Optimizer states 分片到多卡 (进一步省显存)
 if [ "$NUM_GPUS" -eq 1 ]; then
-    echo "Starting single-GPU training..."
-    CUDA_VISIBLE_DEVICES=0 $PYTHON train_hvm.py "${TRAIN_ARGS[@]}"
-else
-    echo "Starting ${NUM_GPUS}-GPU distributed training..."
+    echo "Starting single-GPU training (mixed precision: ${MIXED_PRECISION})..."
     $ACCELERATE launch \
+        --num_processes 1 \
+        --mixed_precision "$MIXED_PRECISION" \
+        train_hvm.py "${TRAIN_ARGS[@]}"
+else
+    echo "Starting ${NUM_GPUS}-GPU training (DeepSpeed ZeRO-2, ${MIXED_PRECISION})..."
+    $ACCELERATE launch \
+        --config_file "$ACCELERATE_CONFIG" \
         --num_processes "$NUM_GPUS" \
         train_hvm.py "${TRAIN_ARGS[@]}"
 fi

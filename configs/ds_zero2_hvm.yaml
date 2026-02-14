@@ -1,0 +1,31 @@
+compute_environment: LOCAL_MACHINE
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  # gradient_accumulation_steps 需与 run_train_hvm.sh 中的 GRAD_ACCUM 保持一致
+  gradient_accumulation_steps: 4
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero3_save_16bit_model: false
+  zero_stage: 2
+  # DeepSpeed ZeRO-2 核心优势:
+  #   1. 自动维护 float32 optimizer states (master weights + momentum + variance)
+  #      即使模型参数是 bf16，optimizer 更新也在 float32 上进行
+  #   2. Optimizer states 分片到多卡，每卡只存 1/N
+  #      428M HVM params 的 optimizer: 3.4GB total → 425MB/GPU (8卡)
+  #   3. 梯度 all-reduce 后释放，不额外占用显存
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0
+main_process_ip: 127.0.0.1
+main_process_port: 10087
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
