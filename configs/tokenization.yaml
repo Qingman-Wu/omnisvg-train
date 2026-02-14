@@ -47,7 +47,7 @@ models:
     base_vocab_size: 152064
     extended_vocab_size: 197000
     base_model: "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
-    checkpoint: "/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
+    checkpoint: "/mnt/data/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
     
     # Special tokens (computed from base_vocab_size)
     special_tokens:

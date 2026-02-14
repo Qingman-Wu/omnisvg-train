@@ -243,22 +243,38 @@ def train(args):
         eps=1e-8,
     )
 
-    # ---- Scheduler ----
+    # ---- Prepare with Accelerator ----
+    # 注意: 必须先 prepare dataloader，再计算 steps，
+    # 因为 accelerator.prepare 会给 dataloader 加 DistributedSampler，
+    # 改变 len(dataloader)。
+    model, optimizer, dataloader = accelerator.prepare(
+        model, optimizer, dataloader
+    )
+
+    # ---- Scheduler (在 prepare 之后计算 steps) ----
     num_update_steps_per_epoch = math.ceil(
         len(dataloader) / args.gradient_accumulation_steps
     )
     total_training_steps = num_update_steps_per_epoch * args.epochs
 
+    # Warmup steps: 默认 10% of total, 但至少 10 步
+    if args.warmup_steps is None:
+        warmup_steps = max(10, int(total_training_steps * 0.1))
+    else:
+        warmup_steps = args.warmup_steps
+
+    accelerator.print(f"  Steps per epoch: {num_update_steps_per_epoch} (dataloader batches: {len(dataloader)})")
+    accelerator.print(f"  Total training steps: {total_training_steps}, warmup: {warmup_steps}")
+
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=args.warmup_steps,
+        num_warmup_steps=warmup_steps,
         num_training_steps=total_training_steps,
     )
-
-    # ---- Prepare with Accelerator ----
-    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, dataloader, lr_scheduler
-    )
+    # 注意: 不要 accelerator.prepare(lr_scheduler)!
+    # 因为 steps 已经基于 prepare 后的 dataloader 计算（已是 per-GPU 视角），
+    # 如果再 prepare scheduler，AcceleratedScheduler 会内部再除以 num_processes，
+    # 导致 lr schedule 被压缩 8 倍，几个 epoch 就衰减到 0。
 
     # ---- Output dir & SwanLab ----
     output_dir = Path(args.output_dir)
@@ -296,7 +312,7 @@ def train(args):
     accelerator.print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps * accelerator.num_processes}")
     accelerator.print(f"  Learning rate: {args.learning_rate}")
     accelerator.print(f"  Total steps: {total_training_steps}")
-    accelerator.print(f"  Warmup steps: {args.warmup_steps}")
+    accelerator.print(f"  Warmup steps: {warmup_steps}")
     accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
     accelerator.print("=" * 60)
 
@@ -452,7 +468,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Warmup steps (default: 10%% of total steps)")
     parser.add_argument("--seed", type=int, default=42)
 
     # Logging

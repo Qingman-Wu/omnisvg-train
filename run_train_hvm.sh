@@ -44,7 +44,7 @@ EPOCHS=30
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
-WARMUP_STEPS=500
+WARMUP_STEPS=""  # 为空时自动使用 10% of total steps
 SEED=42
 
 # -- DataLoader --
@@ -125,7 +125,6 @@ TRAIN_ARGS=(
     --learning_rate "$LEARNING_RATE"
     --weight_decay "$WEIGHT_DECAY"
     --max_grad_norm "$MAX_GRAD_NORM"
-    --warmup_steps "$WARMUP_STEPS"
     --seed "$SEED"
     --output_dir "$OUTPUT_DIR"
     --log_every "$LOG_EVERY"
@@ -134,6 +133,11 @@ TRAIN_ARGS=(
     --swanlab_mode "$SWANLAB_MODE"
     --swanlab_run_name "$SWANLAB_RUN_NAME"
 )
+
+# Warmup steps (为空时由 train_hvm.py 自动计算为 10% of total)
+if [ -n "$WARMUP_STEPS" ]; then
+    TRAIN_ARGS+=(--warmup_steps "$WARMUP_STEPS")
+fi
 
 # OmniSVG checkpoint
 if [ -n "$OMNISVG_CHECKPOINT" ]; then
