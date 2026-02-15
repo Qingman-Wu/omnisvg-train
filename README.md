@@ -1,140 +1,306 @@
-# Tokenizer Debug 功能
+# HVM-SVG 训练与实验手册（自用）
 
-本次提交新增了 **训练样本提取和 tokenizer 验证** 功能，用于排查训练时 tokenizer 可能存在的 bug。
+本文档是当前仓库中 HVM-SVG 方案的完整使用说明，目标是：
 
-## 背景
+- 快速复现：从 0 到可训练
+- 减少踩坑：明确每一步输入/输出与常见错误
+- 便于迭代：清楚知道哪些模块在起作用，哪些参数影响收敛
 
-训练代码的 tokenizer 配置可能存在问题（如 `tokenization.yaml` 中的 token ID 配置错误），导致训练时的 token 序列与推理时不一致。为了验证这一点，我们需要：
+---
 
-1. 从训练过程中提取真实的 `input_ids` 和原始 GT SVG
-2. 用推理端的 tokenizer（已验证正确）decode `input_ids`
-3. 对比 decoded SVG 与原始 GT SVG
+## 1. 项目目标与核心思路
 
-## 新增文件
+HVM-SVG 用于缓解 OmniSVG 在复杂样本上的长序列退化（重复 path 命令、循环输出、被 max length 截断）。
 
-### 训练端 (`omnisvg-train/`)
+核心做法：
 
-| 文件 | 说明 |
-|------|------|
-| `run_with_debug.sh` | Debug 模式启动脚本，保存训练样本 |
-| `train_samples_debug/` | 保存的训练样本目录（运行时生成） |
+1. 对每个训练样本离线检索 Top-K 参考样本（RAG）
+2. 参考图像预计算视觉特征（不在训练时跑 vision encoder）
+3. 用两类记忆编码器压缩视觉信息
+   - GME（Gist Memory Encoder）：全局记忆
+   - PME（Part Memory Encoder）：局部零件记忆
+4. 在 OmniSVG decoder 的若干层后插入 PIM
+5. 通过 Adaptive Gate 把视觉修正量注入 hidden states
 
-### 推理端 (`omnisvg-inference/`)
+---
 
-| 文件 | 说明 |
-|------|------|
-| `verify_train_samples.py` | 验证脚本，decode 训练样本并保存 SVG |
-| `analyze_tokenizer_diff.py` | 分析 token 序列，识别特殊 token、命令等 |
-| `verification_output/` | 验证结果输出目录 |
+## 2. 代码结构（HVM 相关）
 
-### 根目录 (`/mnt/data/wuqingman/`)
+核心文件：
 
-| 文件 | 说明 |
-|------|------|
-| `verify_train_samples.sh` | 一键验证脚本 |
+- `build_faiss_index/precompute_hvm_data.py`
+  - 离线预计算：metadata / RAG / feature / path groups
+- `hvm_dataset.py`
+  - 训练数据集与 collate，读取预计算结果
+- `hvm_modules.py`
+  - HVMConfig、QFormer、GME、PME、PIM、AdaptiveGate
+- `hvm_decoder.py`
+  - 在 OmniSVG base decoder 上通过 hook 注入 PIM
+- `train_hvm.py`
+  - 训练主脚本（Accelerate + DeepSpeed）
+- `run_train_hvm.sh`
+  - 一键启动脚本（参数与恢复逻辑）
 
-## 代码修改
+---
 
-### 1. `utils/dataset.py`
+## 3. 架构总览（与当前实现一致）
 
-- `__getitem__` 返回值从 3 个增加到 4 个
-- 新增返回 `original_svg`（数据集中的原始 SVG 字符串）
+### 3.1 输入
 
-```python
-# 修改前
-def __getitem__(self, index) -> Tuple[str, Image.Image, List[int]]:
-    return text, image, tokens.tolist()
+每个 batch 训练侧输入主要包括：
 
-# 修改后
-def __getitem__(self, index) -> Tuple[str, Image.Image, List[int], str]:
-    return text, image, tokens.tolist(), svg_code
-```
+- 文本+SVG 序列：`input_ids`, `attention_mask`, `labels`
+- 参考视觉特征：
+  - `ref_features`: `[B, 3, 16, 16, 4, 1280]`（Top-3 参考）
+  - `ref_best_feature`: `[B, 16, 16, 4, 1280]`（Top-1）
+  - `groups_bbox_feature`: `List[List[(r1, r2, c1, c2)]]`
+- 参考文本：
+  - `ref_text_ids`: `[B, Nt]`
+  - `ref_text_mask`: `[B, Nt]`
 
-### 2. `train.py`
+### 3.2 视觉记忆构建
 
-- `collate_fn` 接收 4 个值，返回 `original_svgs`
-- 训练循环接收 `original_svgs`
-- 新增 debug 模式：当环境变量 `SAVE_TRAIN_SAMPLES=true` 时，保存训练样本
+1. **GME**
+   - 输入：3 张参考图 pre-merge feature map
+   - 输出：`gist_feats [B, 32, 3584]`
+2. **PME**
+   - 输入：Top-1 feature map + 分组 bbox
+   - 每组 4 query，最多 4 组
+   - 输出：
+     - `part_feats [B, 16, 3584]`
+     - `part_mask [B, 16]`
 
-```python
-# 环境变量控制
-SAVE_TRAIN_SAMPLES=true   # 启用保存
-MAX_TRAIN_SAMPLES=10      # 保存数量
-TRAIN_SAMPLES_DIR=./train_samples_debug  # 保存目录
-```
+### 3.3 PIM 注入流程
 
-### 3. `run.sh`
+每个 PIM 执行：
 
-- 新增 debug 配置区块
-- 支持通过环境变量覆盖默认值
+1. Part × Gist cross-attn
+2. Part self-attn
+3. Visual × Text cross-attn（会使用 `text_mask`）
+4. Hidden × Aligned cross-attn 得到 `delta`
+5. AdaptiveGate：`hidden + gate * delta`
 
-## 使用方法
+注意：PIM 是通过 `hvm_decoder.py` 的 decoder layer hook 注入，不改 base model 代码。
 
-### 步骤 1: 保存训练样本
+### 3.4 冻结策略
+
+- OmniSVG base model 全冻结
+- 仅训练：
+  - `gme`
+  - `pme`
+  - `pims`
+
+---
+
+## 4. 离线预计算数据
+
+脚本：`build_faiss_index/precompute_hvm_data.py`
+
+### 4.1 四个 stage
+
+1. `metadata`
+   - 输出：`metadata.jsonl`, `id_to_idx.json`
+2. `rag`
+   - 输出：`rag_results.jsonl`, `text_embeddings.npy`, `faiss_index.bin`
+3. `features`
+   - 输出：`features/{idx//1000}/{idx}.pt`
+4. `groups`
+   - 输出：`groups.jsonl`
+
+### 4.2 推荐执行顺序
 
 ```bash
-cd /mnt/data/wuqingman/omnisvg-train
-
-# 保存 20 个训练样本
-bash run_with_debug.sh 20
-
-# 看到 "[DEBUG] Finished saving 20 samples" 后按 Ctrl+C
+python build_faiss_index/precompute_hvm_data.py --stage metadata
+python build_faiss_index/precompute_hvm_data.py --stage rag
+python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 0
+python build_faiss_index/precompute_hvm_data.py --stage groups
 ```
 
-### 步骤 2: 验证样本
+多卡提特征（示例 8 分片）：
 
 ```bash
-cd /mnt/data/wuqingman
-bash verify_train_samples.sh
+python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 0 --num_shards 8 --shard_id 0
+python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 1 --num_shards 8 --shard_id 1
+...
 ```
 
-### 步骤 3: 查看结果
+### 4.3 预计算目录检查
+
+至少应包含：
+
+- `metadata.jsonl`
+- `rag_results.jsonl`
+- `groups.jsonl`
+- `features/`
+
+并且三份 jsonl 记录数应一致。
+
+---
+
+## 5. 训练启动
+
+主入口：`run_train_hvm.sh`
+
+### 5.1 常用命令
+
+默认 8 卡：
 
 ```bash
-# 查看汇总
-cat omnisvg-inference/verification_output/verification_summary.json
-
-# 对比 SVG（在浏览器中）
-firefox omnisvg-inference/verification_output/sample_0000_gt.svg \
-        omnisvg-inference/verification_output/sample_0000_from_input_ids.svg
+bash run_train_hvm.sh
 ```
 
-## 输出文件说明
+单卡调试：
 
-每个样本生成以下文件：
-
-| 文件 | 说明 |
-|------|------|
-| `sample_XXXX_gt.svg` | 原始 GT SVG（直接从数据集获取） |
-| `sample_XXXX_from_input_ids.svg` | 从 input_ids decode 的 SVG |
-| `sample_XXXX_tokens.py` | Python 格式的 token 列表（可复制到 inference.py 测试） |
-| `sample_XXXX_info.json` | 详细对比信息 |
-
-## 结果判断
-
-### ✅ 正常
-
-- `sample_XXXX_gt.svg` 和 `sample_XXXX_from_input_ids.svg` **显示一致**
-- `info.json` 中 `tokens_match: true`
-
-### ❌ 异常
-
-- 两个 SVG 显示不同 → 训练 tokenizer 有 bug
-- decode 失败 → token ID 配置错误
-- `tokens_match: false` → input_ids 构建逻辑有问题
-
-## 注意事项
-
-1. **Debug 模式会影响训练性能**，仅用于调试
-2. 样本保存后可以**停止训练**（Ctrl+C），无需完成整个训练
-3. 验证脚本使用**推理端的 tokenizer**，确保 decode 逻辑正确
-4. 正常训练时请使用 `bash run.sh`（不保存样本）
-
-## 恢复正常训练
-
-Debug 模式不会修改 `run.sh` 的默认配置。直接运行 `bash run.sh` 即可正常训练。
-
-如果需要清理 debug 样本：
 ```bash
-rm -rf /mnt/data/wuqingman/omnisvg-train/train_samples_debug
+bash run_train_hvm.sh --num_gpus 1 --batch_size 1
 ```
+
+恢复完整训练状态（含 optimizer/scheduler/step）：
+
+```bash
+bash run_train_hvm.sh --resume /path/to/checkpoint-step-XXXX
+```
+
+只加载 HVM 权重初始化：
+
+```bash
+bash run_train_hvm.sh --hvm_ckpt /path/to/hvm_step_XXXX.pt
+```
+
+### 5.2 恢复逻辑说明
+
+- `--resume` 对应 `train_hvm.py --resume_from`
+  - 恢复 model + optimizer + scheduler + global_step
+- `--hvm_ckpt` 对应 `train_hvm.py --hvm_checkpoint`
+  - 只加载 HVM 模块参数，不恢复训练状态
+- 两者互斥，脚本和 `train_hvm.py` 都会检查
+
+---
+
+## 6. 关键训练参数与建议
+
+当前默认（脚本）：
+
+- `batch_size=2`（每卡）
+- `grad_accum=4`
+- `num_gpus=8`
+- 有效 batch size：`2*4*8=64`
+
+### 6.1 重点：warmup 与总步数
+
+`train_hvm.py` 默认 `warmup_steps = total_steps * 10%`。  
+若 `epochs` 设很大（如 30000），warmup 会非常长，前期学习率非常小，看起来像“不收敛”。
+
+建议实验期显式传入 `--warmup`，例如 500~2000。
+
+### 6.2 学习率参考
+
+- 初始试验：`1e-4` 或 `5e-5`
+- 若 loss 抖动明显：优先缩短 warmup、再考虑降 lr
+
+### 6.3 Gate 观察
+
+训练日志会打印：
+
+- `Step xxxx | Gates: [...]`
+
+含义：`tanh(base_alpha)`，初始接近 0 是正常的。  
+如果长期几乎不变，可检查 lr / weight_decay 配置。
+
+---
+
+## 7. 训练输出文件
+
+`output_dir`（默认 `outputs_hvm`）中常见内容：
+
+- `hvm_config.json`：运行参数快照
+- `hvm_model_config.json`：HVM 配置（含 PIM 层索引）
+- `checkpoint-step-XXXX/`
+  - accelerate 完整状态
+  - `training_metadata.json`
+  - `lr_scheduler.pt`
+- `hvm_step_XXXX.pt`
+  - HVM-only 轻量权重
+- `swanlog/`
+  - SwanLab 本地日志
+
+---
+
+## 8. 常见问题排查（高频）
+
+### 8.1 现象：loss 不明显下降 / 看起来不收敛
+
+优先检查：
+
+1. warmup 是否过长（尤其 epochs 很大时）
+2. 当前 lr 是否仍很低（看日志 `lr=...`）
+3. gate 是否长期接近 0
+4. 数据规模是否过小导致波动（小数据下 step loss 抖动正常）
+
+### 8.2 现象：恢复训练后步数不对
+
+检查：
+
+- 是否用的是 `--resume`（不是 `--hvm_ckpt`）
+- `checkpoint-step-XXXX` 目录内是否有 `training_metadata.json`
+
+### 8.3 现象：某些 batch 报数据错误
+
+检查预计算完整性：
+
+- `metadata/rag/groups` 条数一致
+- 对应 `features/{idx}.pt` 是否存在
+
+### 8.4 现象：日志出现 `^[[A` 等字符
+
+这是终端控制字符（tqdm/光标移动）导致，不影响训练本身。
+
+---
+
+## 9. 张量维度速查表
+
+- `ref_features`: `[B, 3, 16, 16, 4, 1280]`
+- `ref_best_feature`: `[B, 16, 16, 4, 1280]`
+- `gist_feats`: `[B, 32, 3584]`
+- `part_feats`: `[B, 16, 3584]`
+- `part_mask`: `[B, 16]`（bool）
+- `ref_text_ids`: `[B, Nt]`
+- `ref_text_mask`: `[B, Nt]`
+- `text_feats`: `[B, Nt, 3584]`
+- `hidden_state`: `[B, L, 3584]`
+- `delta`: `[B, L, 3584]`
+
+---
+
+## 10. 最小可复现流程（建议）
+
+1. 预计算完成后，先单卡 smoke test：
+
+```bash
+bash run_train_hvm.sh --num_gpus 1 --batch_size 1 --epochs 2 --warmup 10 --save_every 50
+```
+
+2. 看是否正常产生：
+
+- loss 日志
+- gate 日志
+- checkpoint 文件
+
+3. 再上多卡正式训练。
+
+---
+
+## 11. 当前实现的已知改进方向（备忘）
+
+- optimizer 分组：给 gate / bias / norm 减小或去掉 weight decay
+- 更稳健的 epoch loss 统计（避免滑窗混用）
+- `hvm_dataset.py` 中临时文件异常清理（避免极端情况下 `/tmp` 堆积）
+- path complexity 进一步细化（命令类型 + 几何长度）
+
+---
+
+## 12. 一句话总结
+
+当前 HVM-SVG 代码已经具备完整训练闭环（预计算 → 数据集 → 注入训练 → checkpoint 恢复），  
+后续提升效果的关键在于：**收敛配置（warmup/lr/optimizer 分组）与记忆模块强度（gate 学习动态）**。
+
