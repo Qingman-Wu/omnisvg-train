@@ -12,8 +12,13 @@
 #
 
 PYTHON="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/python"
-SCRIPT="/mnt/data/wuqingman/omnisvg-train/precompute_hvm_data.py"
+SCRIPT="/mnt/data/wuqingman/omnisvg-train/build_faiss_index/precompute_hvm_data.py"
 export CUDA_HOME="/mnt/data/wuqingman/miniconda3/envs/omnisvg"
+
+# 日志目录（在当前脚本所在目录）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "${LOG_DIR}"
 
 NUM_GPUS=8
 BATCH_SIZE=16
@@ -49,12 +54,12 @@ run_features() {
             --batch_size $BATCH_SIZE \
             --num_shards $NUM_GPUS \
             --shard_id $shard_id \
-            > /tmp/hvm_features_shard_${shard_id}.log 2>&1 &
+            > "${LOG_DIR}/features_shard_${shard_id}.log" 2>&1 &
         pids+=($!)
     done
 
     echo "All ${NUM_GPUS} shards started. PIDs: ${pids[*]}"
-    echo "Logs: /tmp/hvm_features_shard_*.log"
+    echo "Logs: ${LOG_DIR}/features_shard_*.log"
     echo ""
     echo "Waiting for all shards to complete..."
 
@@ -65,7 +70,7 @@ run_features() {
         exit_code=$?
         if [ $exit_code -ne 0 ]; then
             echo "ERROR: Shard $i (PID ${pids[$i]}) failed with exit code $exit_code"
-            echo "Check log: /tmp/hvm_features_shard_${i}.log"
+            echo "Check log: ${LOG_DIR}/features_shard_${i}.log"
             all_ok=false
         else
             echo "Shard $i (PID ${pids[$i]}) completed successfully"
@@ -75,7 +80,7 @@ run_features() {
     if $all_ok; then
         echo "All feature extraction shards completed successfully!"
     else
-        echo "Some shards failed. Check logs above."
+        echo "Some shards failed. Check logs in ${LOG_DIR}/"
         return 1
     fi
 }

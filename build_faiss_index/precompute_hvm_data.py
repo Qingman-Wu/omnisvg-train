@@ -56,10 +56,12 @@ IMAGE_SIZE = 448        # 图像尺寸
 VISION_HIDDEN_DIM = 1280  # Vision encoder hidden dim (pre-merge)
 LLM_HIDDEN_DIM = 3584    # LLM hidden dim (post-merge)
 SPATIAL_MERGE_SIZE = 2
-FEATURE_GRID_H = 16      # 448 / 14 / 2 = 16 (post-merge grid)
-FEATURE_GRID_W = 16
+FEATURE_GRID_H = 32      # 448 / 14 = 32 (pre-merge patch grid, 比 post-merge 分辨率翻倍)
+FEATURE_GRID_W = 32
 PATCH_GRID_H = 32        # 448 / 14 = 32 (pre-merge grid)
 PATCH_GRID_W = 32
+MERGE_GRID_H = 16        # 448 / 14 / 2 = 16 (post-merge merger unit grid)
+MERGE_GRID_W = 16
 PATCHES_PER_UNIT = SPATIAL_MERGE_SIZE ** 2  # 4
 
 RAG_TOP_K = 3             # 检索 Top-K 参考
@@ -140,7 +142,6 @@ def stage_metadata(data_dir: str, output_dir: str):
 def stage_rag(output_dir: str, clip_model_path: str):
     """
     用 CLIP text encoder 编码 descriptions，构建 FAISS 索引，检索 Top-3 相似样本。
-    CLIP 经过文本-图像对比学习，语义检索质量远优于 Qwen 的 raw embed_tokens。
     输出: rag_results.jsonl, text_embeddings.npy, faiss_index.bin
     """
     import faiss
@@ -210,7 +211,7 @@ def stage_rag(output_dir: str, clip_model_path: str):
 
     # 保存 embeddings
     np.save(embeddings_path, all_embeddings)
-    print(f"Saved embeddings to: {embeddings_path} (shape: {all_embeddings.shape})")
+    print(f"Saved embeddings to: {embeddings_path} (shape: {all_embeddings.shape})")#保存下来text_embeddings.npy (shape: (n, 768))
 
     # 4. 构建 FAISS 索引
     print("Building FAISS index (IndexFlatIP)...")
@@ -272,8 +273,8 @@ def stage_rag(output_dir: str, clip_model_path: str):
 
     # 保存 FAISS 索引
     faiss.write_index(index, index_path)
-    print(f"Saved FAISS index to: {index_path}")
-    print(f"Saved RAG results to: {rag_path}")
+    print(f"Saved FAISS index to: {index_path}") #faiss_index.bin
+    print(f"Saved RAG results to: {rag_path}") #rag_results.jsonl
 
 
 # ============================================================================
@@ -359,14 +360,127 @@ def stage_features(
         img = Image.open(io.BytesIO(img_data["bytes"])).convert("RGB")
         return img
 
+    # def extract_pre_merge_batch(images: List[Image.Image]) -> List[torch.Tensor]:
+    #     """
+    #     批量提取 pre-merge features。
+    #     返回: List of [16, 16, 4, 1280] tensors (float16, CPU)
+    #     """
+    #     from qwen_vl_utils import process_vision_info
+
+    #     # 构造 processor 输入
+    #     all_pixel_values = []
+    #     all_grid_thws = []
+
+    #     for img in images:
+    #         messages = [{"role": "user", "content": [
+    #             {"type": "image", "image": img},
+    #             {"type": "text", "text": "x"},#Qwen2.5-VL 的 processor 需要按聊天格式传入，所以造了个假消息。文本 "x" 无所谓写啥
+    #         ]}]
+    #         text_input = processor.apply_chat_template(
+    #             messages, tokenize=False, add_generation_prompt=True
+    #         )
+    #         image_inputs, _ = process_vision_info(messages)
+    #         inputs = processor(
+    #             text=[text_input], images=image_inputs,
+    #             return_tensors="pt"
+    #         )
+    #         all_pixel_values.append(inputs["pixel_values"])
+    #         all_grid_thws.append(inputs["image_grid_thw"])
+
+    #     # 每张图的 pixel_values shape: [1024, 1176]
+    #     # 每张图的 grid_thw: [1, 3] = [[1, 32, 32]]
+    #     # 为了批处理，需要 concat 并正确处理 grid_thw
+
+    #     pixel_values = torch.cat(all_pixel_values, dim=0).to(device, dtype=torch.float16)
+    #     grid_thw = torch.cat(all_grid_thws, dim=0).to(device)
+    #     # pixel_values: [B*1024, 1176], grid_thw: [B, 3]
+
+    #     # Hook 捕获 pre-merge features
+    #     pre_merge_data = {}
+
+    #     def pre_hook(module, args):
+    #         pre_merge_data["x"] = args[0].detach().clone()
+
+    #     handle = visual.merger.register_forward_pre_hook(pre_hook)
+
+    #     with torch.no_grad():
+    #         visual(pixel_values, grid_thw=grid_thw)
+
+    #     handle.remove()
+
+    #     pre_merge = pre_merge_data["x"]  # [B*1024, 1280]
+
+    #     # 获取 window_index 和 reverse_indices
+    #     window_index, _ = visual.get_window_index(grid_thw)
+    #     reverse_indices = torch.argsort(window_index)
+
+    #     # 按图像拆分
+    #     B = len(images)
+    #     tokens_per_image = PATCH_GRID_H * PATCH_GRID_W  # 1024
+    #     units_per_image = FEATURE_GRID_H * FEATURE_GRID_W  # 256
+
+    #     results = []
+    #     for b in range(B):
+    #         # 提取当前图像的 pre-merge tokens
+    #         img_pre = pre_merge[b * tokens_per_image: (b + 1) * tokens_per_image]  # [1024, 1280]
+
+    #         # 获取当前图像的 reverse_indices
+    #         img_rev = reverse_indices[b * units_per_image: (b + 1) * units_per_image]  # [256]
+    #         img_rev = img_rev - b * units_per_image  # 调整为相对索引
+
+    #         # Reshape 为 merger units
+    #         smu = PATCHES_PER_UNIT  # 4
+    #         img_units = img_pre.reshape(-1, smu, VISION_HIDDEN_DIM)  # [256, 4, 1280]
+
+    #         # 恢复空间顺序
+    #         img_units_spatial = img_units[img_rev, :, :]  # [256, 4, 1280]
+
+    #         # Reshape 为 [16, 16, 4, 1280]
+    #         feature_grid = img_units_spatial.reshape(
+    #             FEATURE_GRID_H, FEATURE_GRID_W, PATCHES_PER_UNIT, VISION_HIDDEN_DIM
+    #         )  # [16, 16, 4, 1280]
+
+    #         results.append(feature_grid.cpu().half())
+
+    #     return results
     def extract_pre_merge_batch(images: List[Image.Image]) -> List[torch.Tensor]:
         """
         批量提取 pre-merge features。
         返回: List of [16, 16, 4, 1280] tensors (float16, CPU)
+        
+        ========== Qwen2.5-VL 图像处理完整流程 ==========
+        
+        原图 [3, 448, 448]  (RGB 图像)
+          │
+          ▼ 切成 14×14 的 patch，得到 32×32 = 1024 个 patch
+        [1024, 1176]  (每个 patch 被展平，1176 = 14*14*6，6 是因为 temporal 维度拼接)
+          │
+          ▼ Patch Embedding 线性层：1176 → 1280
+        [1024, 1280]  (每个 patch 变成 1280 维向量)
+          │
+          ▼ Vision Transformer 多层处理（包含 window attention）
+          │  注意：window attention 会打乱 patch 顺序！
+          │  原本按空间排列的 1024 个 patch 被 shuffle 了
+        [1024, 1280]  (形状不变，但顺序被打乱，特征被充分编码)
+          │
+          ╠══ 🔴 我们的 hook 在这里截取！拿到的就是这个 [1024, 1280] ══╣
+          │
+          ▼ Merger：每 2×2 = 4 个 patch 合并成 1 个 token
+          │  先 reshape: [1024, 1280] → [256, 4, 1280] → concat → [256, 5120]
+          │  再线性投影: [256, 5120] → [256, 3584]
+        [256, 3584]  (16×16 = 256 个 vision token，送入 LLM)
+        
+        我们要的是 hook 截取的 [1024, 1280]，然后手动按 merger unit 分组
+        并恢复空间顺序，最终得到 [16, 16, 4, 1280]。
+        ===================================================
         """
         from qwen_vl_utils import process_vision_info
 
-        # 构造 processor 输入
+        # ==================================================================
+        # 第一步：构造 processor 输入
+        # ==================================================================
+        # Qwen2.5-VL 的 processor 需要聊天格式的输入
+        # 我们只需要图像被正确处理，文本内容 "x" 无所谓
         all_pixel_values = []
         all_grid_thws = []
 
@@ -383,63 +497,185 @@ def stage_features(
                 text=[text_input], images=image_inputs,
                 return_tensors="pt"
             )
-            all_pixel_values.append(inputs["pixel_values"])
-            all_grid_thws.append(inputs["image_grid_thw"])
+            all_pixel_values.append(inputs["pixel_values"])#单张图：pixel_values = [1024, 1176]  (1024个patch，每个1176维)
+            all_grid_thws.append(inputs["image_grid_thw"])#单张图：grid_thw     = [1, 3] = [[1, 32, 32]]  (temporal=1, height=32, width=32)
 
-        # 每张图的 pixel_values shape: [1024, 1176]
-        # 每张图的 grid_thw: [1, 3] = [[1, 32, 32]]
-        # 为了批处理，需要 concat 并正确处理 grid_thw
+        # ==================================================================
+        # 第二步：拼接 batch
+        # ==================================================================
+        # 单张图：pixel_values = [1024, 1176]  (1024个patch，每个1176维)
+        # 单张图：grid_thw     = [1, 3] = [[1, 32, 32]]  (temporal=1, height=32, width=32)
+        #
+        # B 张图 concat 后：
+        #   pixel_values = [B*1024, 1176]  (所有图的 patch 拼在一起)
+        #   grid_thw     = [B, 3]          (每行告诉模型一张图的网格大小)
+        pixel_values = torch.cat(all_pixel_values, dim=0).to(device, dtype=torch.float16)#torch.Size([16384, 1176])，b=16,16*1024=16384
+        grid_thw = torch.cat(all_grid_thws, dim=0).to(device)#torch.Size([16, 3])，每行告诉模型一张图的网格大小
 
-        pixel_values = torch.cat(all_pixel_values, dim=0).to(device, dtype=torch.float16)
-        grid_thw = torch.cat(all_grid_thws, dim=0).to(device)
-        # pixel_values: [B*1024, 1176], grid_thw: [B, 3]
+        B = len(images)
+        print(f"\n{'='*60}")
+        print(f"[Step 2] Batch 拼接完成")
+        print(f"  图像数量 B = {B}")
+        print(f"  pixel_values: {pixel_values.shape}")
+        print(f"    → 含义: [{B}*1024, 1176] = [{B}张图 × 1024个patch/图, 每个patch 1176维]")
+        print(f"  grid_thw: {grid_thw.shape}")
+        print(f"    → 含义: [{B}, 3], 每行 = {grid_thw[0].tolist()} (temporal, height, width)")
 
-        # Hook 捕获 pre-merge features
+        # ==================================================================
+        # 第三步：Hook 截取 pre-merge 特征
+        # ==================================================================
+        # 
+        # visual 模型内部结构：
+        #   visual.patch_embed  → 把 pixel_values 变成 patch embeddings
+        #   visual.blocks[0~31] → 32 层 Transformer（含 window attention，会 shuffle 顺序）
+        #   visual.merger       → 把 2×2 patch 合并成 1 个 token
+        #
+        # 我们在 merger 的输入处放一个 hook：
+        #   register_forward_pre_hook = "在 merger 执行之前，拦截它收到的输入"
+        #
+        # merger 收到的输入就是 Vision Transformer 的输出：
+        #   shape = [B*1024, 1280]
+        #   含义：所有图的 1024 个 patch 特征，每个 1280 维
+        #   ⚠️ 但是顺序被 window attention 打乱了！不是按空间位置排列的
+        #
         pre_merge_data = {}
 
         def pre_hook(module, args):
+            """
+            这个函数会在 visual.merger 执行前被自动调用。
+            args[0] 就是 merger 的输入 tensor。
+            我们把它拷贝一份存起来。
+            """
             pre_merge_data["x"] = args[0].detach().clone()
 
+        # 注册 hook：告诉 PyTorch "在 merger 执行前，先调用 pre_hook"
         handle = visual.merger.register_forward_pre_hook(pre_hook)
 
+        # 运行 visual 模型（前向传播）
+        # 内部执行顺序：patch_embed → transformer blocks → [hook触发] → merger
         with torch.no_grad():
             visual(pixel_values, grid_thw=grid_thw)
 
+        # 移除 hook（用完就拆，避免影响后续调用）
         handle.remove()
 
-        pre_merge = pre_merge_data["x"]  # [B*1024, 1280]
+        # 拿到 hook 截取的 pre-merge 特征
+        pre_merge = pre_merge_data["x"] #torch.Size([16384, 1280]), dtype=torch.float16
 
-        # 获取 window_index 和 reverse_indices
-        window_index, _ = visual.get_window_index(grid_thw)
-        reverse_indices = torch.argsort(window_index)
+        print(f"\n[Step 3] Hook 截取 pre-merge 特征")
+        print(f"  pre_merge: {pre_merge.shape}, dtype={pre_merge.dtype}")
+        print(f"    → 含义: [{B}*1024, 1280] = [所有图的patch总数, Vision隐藏维度]")
+        print(f"    → 这是 Vision Transformer 输出、Merger 输入")
+        print(f"    → ⚠️ 顺序被 window attention 打乱了！")
 
-        # 按图像拆分
-        B = len(images)
-        tokens_per_image = PATCH_GRID_H * PATCH_GRID_W  # 1024
-        units_per_image = FEATURE_GRID_H * FEATURE_GRID_W  # 256
+        # ==================================================================
+        # 第四步：获取 reverse_indices（用于恢复空间顺序）
+        # ==================================================================
+        #
+        # 问题：window attention 把 patch 顺序打乱了
+        #   原始顺序: patch_0(左上), patch_1, patch_2, ..., patch_1023(右下)
+        #   打乱后:   patch_57, patch_3, patch_891, ...（按 window 分组后的顺序）
+        #
+        # window_index 记录了这个打乱的映射关系
+        # reverse_indices = argsort(window_index) 得到逆映射
+        #   作用：reverse_indices[i] = "空间位置 i 的特征，在打乱后的数组中排第几"
+        #   用法：features_sorted[reverse_indices] → 恢复到正确的空间顺序
+        #
+        # 注意：window_index 的单位是 merger unit（不是单个 patch）
+        #   每个 merger unit = 2×2 = 4 个 patch
+        #   所以 window_index 长度 = B * 256（不是 B * 1024）
+        #
+        window_index, _ = visual.get_window_index(grid_thw)#4096，这个4096=[16*256] = [16张图 × 256个merger_unit/图]
+        reverse_indices = torch.argsort(window_index)#4096
+
+        print(f"\n[Step 4] 获取 window attention 的 reverse_indices")
+        print(f"  window_index: {window_index.shape}")
+        print(f"    → 含义: [{B}*256] = [{B}张图 × 256个merger_unit/图]")
+        print(f"  reverse_indices: {reverse_indices.shape}")
+        print(f"    → 含义: 同上，用于把打乱的顺序恢复到空间顺序")
+        print(f"  注意: 单位是 merger unit（每个 = 2×2 = 4 个 patch），不是单个 patch")
+
+        # ==================================================================
+        # 第五步：按图像拆分，恢复空间顺序，reshape 成 32×32 网格
+        # ==================================================================
+        #
+        # 目标: [32, 32, 1280] — 每个位置是一个原始 ViT patch 的特征
+        # 分辨率翻倍 (相比 merger 后的 16×16)，每格覆盖 448/32 = 14 像素
+        # 这样 PME 裁剪时能获得更精细的空间定位
+        #
+        tokens_per_image = PATCH_GRID_H * PATCH_GRID_W   # 32 * 32 = 1024 个 patch/图
+        units_per_image = MERGE_GRID_H * MERGE_GRID_W    # 16 * 16 = 256 个 merger unit/图
 
         results = []
         for b in range(B):
-            # 提取当前图像的 pre-merge tokens
-            img_pre = pre_merge[b * tokens_per_image: (b + 1) * tokens_per_image]  # [1024, 1280]
+            # ----------------------------------------------------------
+            # 5a. 取出第 b 张图的 pre-merge 特征
+            # ----------------------------------------------------------
+            img_pre = pre_merge[b * tokens_per_image: (b + 1) * tokens_per_image]
+            # img_pre: [1024, 1280]  (顺序被 window attention 打乱)
 
-            # 获取当前图像的 reverse_indices
-            img_rev = reverse_indices[b * units_per_image: (b + 1) * units_per_image]  # [256]
-            img_rev = img_rev - b * units_per_image  # 调整为相对索引
+            # ----------------------------------------------------------
+            # 5b. 取出第 b 张图的 reverse_indices
+            # ----------------------------------------------------------
+            img_rev = reverse_indices[b * units_per_image: (b + 1) * units_per_image]
+            img_rev = img_rev - b * units_per_image
+            # img_rev: [256]，merger unit 级别的逆映射
 
-            # Reshape 为 merger units
+            # ----------------------------------------------------------
+            # 5c. 按 merger unit 分组：每 4 个 patch 一组
+            # ----------------------------------------------------------
             smu = PATCHES_PER_UNIT  # 4
-            img_units = img_pre.reshape(-1, smu, VISION_HIDDEN_DIM)  # [256, 4, 1280]
+            img_units = img_pre.reshape(-1, smu, VISION_HIDDEN_DIM)
+            # img_units: [256, 4, 1280]  (顺序被打乱)
 
-            # 恢复空间顺序
-            img_units_spatial = img_units[img_rev, :, :]  # [256, 4, 1280]
+            # ----------------------------------------------------------
+            # 5d. 用 reverse_indices 恢复 merger unit 的空间顺序
+            # ----------------------------------------------------------
+            img_units_spatial = img_units[img_rev, :, :]
+            # img_units_spatial: [256, 4, 1280]  (空间顺序正确)
 
-            # Reshape 为 [16, 16, 4, 1280]
-            feature_grid = img_units_spatial.reshape(
-                FEATURE_GRID_H, FEATURE_GRID_W, PATCHES_PER_UNIT, VISION_HIDDEN_DIM
+            # ----------------------------------------------------------
+            # 5e. 展开为 32×32 的逐 patch 网格
+            # ----------------------------------------------------------
+            # 先 reshape 成 16×16 的 merger unit 网格，每个 unit 含 4 个 patch
+            grid_16x16 = img_units_spatial.reshape(
+                MERGE_GRID_H, MERGE_GRID_W, PATCHES_PER_UNIT, VISION_HIDDEN_DIM
             )  # [16, 16, 4, 1280]
 
+            # 将每个 unit 内的 4 个 patch 展开为 2×2
+            # 4 个 patch 在 ViT 中的排列是 raster scan: (0,0),(0,1),(1,0),(1,1)
+            grid_16x16_2x2 = grid_16x16.reshape(
+                MERGE_GRID_H, MERGE_GRID_W, SPATIAL_MERGE_SIZE, SPATIAL_MERGE_SIZE, VISION_HIDDEN_DIM
+            )  # [16, 16, 2, 2, 1280]
+
+            # 交错拼接: (unit_row, sub_row, unit_col, sub_col, D) → (32, 32, D)
+            feature_grid = grid_16x16_2x2.permute(0, 2, 1, 3, 4).reshape(
+                FEATURE_GRID_H, FEATURE_GRID_W, VISION_HIDDEN_DIM
+            )  # [32, 32, 1280]
+
+            # 空间对应关系（以 448×448 图像为例）：
+            #   feature_grid[r, c] → 图像中第 r 行第 c 列的 14×14 像素区域
+            #   feature_grid[0, 0]  → 左上角 14×14 区域
+            #   feature_grid[31,31] → 右下角 14×14 区域
+            #   每格覆盖 448/32 = 14 像素 ≈ 200/32 ≈ 6.25 SVG 单位
+
             results.append(feature_grid.cpu().half())
+
+            if b == 0:
+                print(f"\n[Step 5] 第 0 张图的维度变化详情:")
+                print(f"  5a. img_pre:           {img_pre.shape}")
+                print(f"      → [1024, 1280] = [该图的1024个patch, 1280维]（顺序被打乱）")
+                print(f"  5b. img_rev:           {img_rev.shape}, 值范围 [{img_rev.min()}, {img_rev.max()}]")
+                print(f"      → [256] = 256个merger_unit的逆映射索引")
+                print(f"  5c. img_units:         {img_units.shape}")
+                print(f"      → [256, 4, 1280] = [256个unit, 每个4个patch, 1280维]（顺序被打乱）")
+                print(f"  5d. img_units_spatial: {img_units_spatial.shape}")
+                print(f"      → [256, 4, 1280] = 同上，但顺序已恢复为空间顺序 ✅")
+                print(f"  5e. feature_grid:      {feature_grid.shape}")
+                print(f"      → [32, 32, 1280] = [32行, 32列, 1280维]")
+                print(f"      → feature_grid[r,c] 对应图像中第r行第c列的 14×14 像素区域")
+                print(f"      → 每格覆盖 ~6.25 SVG 单位 (200/32)")
+                print(f"{'='*60}")
 
         return results
 
@@ -512,7 +748,7 @@ def parse_svg_paths(svg_string: str) -> List[Dict]:
     """
     paths = []
 
-    # 匹配所有 <path ... /> 标签
+    # 匹配所有 <path ... /> 标签，之前统计过omnisvg-illustration，里面只有path标签
     path_pattern = re.compile(r'<path\s+([^>]*)/?>', re.DOTALL)
 
     for match in path_pattern.finditer(svg_string):
@@ -759,10 +995,10 @@ def _make_group(paths: List[Dict], indices: List[int], complexity: float) -> Dic
 
 def bbox_to_feature_coords(bbox: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
     """
-    将 SVG viewbox 坐标的 bbox 映射到 feature map 的网格坐标 (16×16)。
+    将 SVG viewbox 坐标的 bbox 映射到 feature map 的网格坐标 (32×32)。
     返回: (row_start, row_end, col_start, col_end)，用于 feature_map[r1:r2, c1:c2]
     """
-    scale = FEATURE_GRID_H / VIEWBOX_SIZE  # 16 / 200 = 0.08
+    scale = FEATURE_GRID_H / VIEWBOX_SIZE  # 32 / 200 = 0.16
 
     col_start = int(bbox[0] * scale)
     row_start = int(bbox[1] * scale)

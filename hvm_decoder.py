@@ -230,9 +230,9 @@ class HVMSketchDecoder(nn.Module):
             labels:         [B, L]  (-100 for text, token IDs for SVG)
 
         HVM inputs:
-            ref_features:       [B, 3, 16, 16, 4, 1280]  3 张参考图 feature maps
-            ref_best_feature:   [B, 16, 16, 4, 1280]      Top-1 参考图 feature map
-            groups_bbox_feature: List[List[Tuple]]          Top-1 参考图的 path 分组 bbox
+            ref_features:       [B, 3, 32, 32, 1280]  3 张参考图 feature maps (pre-merge patch grid)
+            ref_best_feature:   [B, 32, 32, 1280]      Top-1 参考图 feature map
+            groups_bbox_feature: List[List[Tuple]]       Top-1 参考图的 path 分组 bbox (32×32 坐标)
             ref_text_ids:       [B, N_t]                    参考文本 token IDs
             ref_text_mask:      [B, N_t]                    参考文本 attention mask
 

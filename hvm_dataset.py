@@ -141,7 +141,7 @@ class HVMDataset(Dataset):
         feat_path = os.path.join(
             self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
         )
-        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [16, 16, 4, 1280]
+        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [32, 32, 1280]
 
     def _tokenize_svg(self, svg_code: str) -> np.ndarray:
         """将 SVG 字符串 tokenize 为 token 序列"""
@@ -177,7 +177,7 @@ class HVMDataset(Dataset):
             dict with keys:
                 text: str                              描述文本
                 pix_seq: List[int]                     SVG token 序列 (含 BOS/EOS)
-                ref_features: List[torch.Tensor]       3 × [16,16,4,1280]
+                ref_features: List[torch.Tensor]       3 × [32,32,1280]
                 ref_best_groups: List[Tuple]            Top-1 参考的 bbox_feature 列表
                 ref_text: str                          参考文本 (拼接)
         """
@@ -244,7 +244,7 @@ class HVMDataset(Dataset):
         ]
         if not ref_best_groups:
             # Fallback: 整图作为一个 group
-            ref_best_groups = [(0, 16, 0, 16)]
+            ref_best_groups = [(0, 32, 0, 32)]
 
         # 参考文本 (拼接 3 个参考的描述)
         ref_texts = []
@@ -281,8 +281,8 @@ def create_hvm_collate_fn(
 
     将 Dataset 返回的 raw samples 组装成 batch tensor:
     - input_ids, attention_mask, labels: 文本 + SVG 序列
-    - ref_features: [B, 3, 16, 16, 4, 1280]
-    - ref_best_feature: [B, 16, 16, 4, 1280]
+    - ref_features: [B, 3, 32, 32, 1280]
+    - ref_best_feature: [B, 32, 32, 1280]
     - groups_bbox_feature: List[List[Tuple]]
     - ref_text_ids, ref_text_mask: [B, N_t]
     """
@@ -357,12 +357,12 @@ def create_hvm_collate_fn(
         # ================================================================
         # 2. 组装参考图 features
         # ================================================================
-        # ref_features: [B, 3, 16, 16, 4, 1280]
+        # ref_features: [B, 3, 32, 32, 1280]
         ref_features = torch.stack([
             torch.stack(rf) for rf in ref_features_list
-        ])  # [B, 3, 16, 16, 4, 1280]
+        ])  # [B, 3, 32, 32, 1280]
 
-        # ref_best_feature: [B, 16, 16, 4, 1280] (Top-1)
+        # ref_best_feature: [B, 32, 32, 1280] (Top-1)
         ref_best_feature = ref_features[:, 0]
 
         # ================================================================

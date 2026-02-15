@@ -52,10 +52,9 @@ class HVMConfig:
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
 
-    # === Feature map ===
-    feat_grid_h: int = 16
-    feat_grid_w: int = 16
-    patches_per_unit: int = 4
+    # === Feature map (32×32 pre-merge patch grid) ===
+    feat_grid_h: int = 32
+    feat_grid_w: int = 32
 
     # === RAG ===
     num_references: int = 3
@@ -279,7 +278,7 @@ class GistMemoryEncoder(nn.Module):
     认知对应: Scene Gist — 快速、压缩、持久的整体结构记忆。
 
     将 3 张参考图的 feature maps 压缩成 32 个 gist tokens。
-    输入: 3 张参考图的 pre-merge features, 各 [B, 16, 16, 4, 1280]
+    输入: 3 张参考图的 pre-merge features, 各 [B, 32, 32, 1280]
     输出: gist_feats [B, 32, d_model]
     """
 
@@ -299,15 +298,15 @@ class GistMemoryEncoder(nn.Module):
     def forward(self, ref_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            ref_features: [B, num_refs, 16, 16, 4, d_vision]
+            ref_features: [B, num_refs, 32, 32, d_vision]
                          3 张参考图的 pre-merge feature maps
 
         Returns:
             gist_feats: [B, 32, d_model]
         """
-        B, N_ref, H, W, P, D = ref_features.shape
-        # 展平所有参考图: [B, N_ref * H * W * P, D]
-        flat_feats = ref_features.reshape(B, N_ref * H * W * P, D)
+        B, N_ref, H, W, D = ref_features.shape
+        # 展平所有参考图: [B, N_ref * H * W, D] = [B, 3*1024, 1280] = [B, 3072, 1280]
+        flat_feats = ref_features.reshape(B, N_ref * H * W, D)
         # 过 QFormer
         return self.qformer(flat_feats)  # [B, 32, d_model]
 
@@ -322,7 +321,7 @@ class PartMemoryEncoder(nn.Module):
     认知对应: Object/Part Memory — 容量有限(4±1)、高精度的零件级表征。
 
     对 Top-1 参考图的 feature map 按 path 分组 crop，每组通过 QFormer 得到 4 个 tokens。
-    输入: Top-1 参考图的 feature map [B, 16, 16, 4, 1280] + 分组信息
+    输入: Top-1 参考图的 feature map [B, 32, 32, 1280] + 分组信息 (32×32 坐标)
     输出: part_feats [B, max_tokens, d_model] + part_mask [B, max_tokens]
     """
 
@@ -348,11 +347,11 @@ class PartMemoryEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            ref_feature: [B, 16, 16, 4, d_vision]
-                        Top-1 参考图的 pre-merge feature map
+            ref_feature: [B, 32, 32, d_vision]
+                        Top-1 参考图的 pre-merge feature map (32×32 patch grid)
             groups_bbox_feature: batch of group lists.
                 每个样本是 List[Tuple[row_start, row_end, col_start, col_end]]
-                长度 1~4，对应 1~4 个分组。
+                坐标基于 32×32 网格，长度 1~4，对应 1~4 个分组。
 
         Returns:
             part_feats: [B, max_tokens(16), d_model]  padded
@@ -366,16 +365,16 @@ class PartMemoryEncoder(nn.Module):
         all_masks = []
 
         for b in range(B):
-            feat_map = ref_feature[b]  # [16, 16, 4, D]
+            feat_map = ref_feature[b]  # [32, 32, D]
             groups = groups_bbox_feature[b]
             group_feats = []
 
             for (r1, r2, c1, c2) in groups:
-                # 裁剪 feature map
-                cropped = feat_map[r1:r2, c1:c2, :, :]  # [h, w, 4, D]
+                # 裁剪 feature map (32×32 精度)
+                cropped = feat_map[r1:r2, c1:c2, :]  # [h, w, D]
                 h, w = cropped.shape[0], cropped.shape[1]
-                # 展平为序列: [h*w*4, D]
-                cropped_flat = cropped.reshape(1, h * w * self.config.patches_per_unit, -1)
+                # 展平为序列: [h*w, D]
+                cropped_flat = cropped.reshape(1, h * w, -1)
 
                 # 过 QFormer: [1, 4, d_model]
                 with torch.set_grad_enabled(self.training):
