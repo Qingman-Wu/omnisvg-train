@@ -511,6 +511,7 @@ class PrefrontalInjectionModule(nn.Module):
         part_feats: torch.Tensor,
         text_feats: torch.Tensor,
         part_mask: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -519,6 +520,7 @@ class PrefrontalInjectionModule(nn.Module):
             part_feats:   [B, 16, d_model]  PME 输出 (缓存)
             text_feats:   [B, Nt, d_model]  text embeddings (缓存)
             part_mask:    [B, 16]           bool, True=有效
+            text_mask:    [B, Nt]           bool, True=有效
 
         Returns:
             [B, L, d_model]
@@ -540,8 +542,11 @@ class PrefrontalInjectionModule(nn.Module):
 
         # Step 3: Visual × Text Cross-Attention
         # "视觉信息与文本语义对齐"
+        #修复 PIM 第 3 步（Visual×Text）未使用文本 mask 的问题，避免 padding 文本参与注意力。必须传入 kv_mask=text_mask
+        #不加 kv_mask，attention 会把 pad 位当成有效 key/value，稀释文本语义对齐质量
         step3_out = self.visual_text_cross_attn(
-            q=refined_part, k=text_feats, v=text_feats
+            q=refined_part, k=text_feats, v=text_feats,
+            kv_mask=text_mask,
         )
         aligned_feats = self.norm3(step3_out + refined_part)  # [B, 16, d]
 

@@ -92,6 +92,7 @@ class HVMSketchDecoder(nn.Module):
         self._part_feats = None
         self._text_feats = None
         self._part_mask = None
+        self._text_mask = None
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
@@ -166,6 +167,7 @@ class HVMSketchDecoder(nn.Module):
                 self._part_feats,
                 self._text_feats,
                 self._part_mask,
+                self._text_mask,
             )
 
             # 返回修改后的 output
@@ -256,9 +258,11 @@ class HVMSketchDecoder(nn.Module):
             )  # [B, 16, d_model], [B, 16]
 
             # Text feats: 参考文本 raw embedding
+            #在 HVMSketchDecoder 中缓存并传递 ref_text_mask 到每个 PIM hook。
+            self._text_mask = ref_text_mask.to(device=device, dtype=torch.bool)
             self._text_feats = self._prepare_text_feats(
                 ref_text_ids.to(device),
-                ref_text_mask.to(device),
+                self._text_mask,
             )  # [B, N_t, d_model]
         else:
             # 没有 HVM 输入，退化为普通 OmniSVG
@@ -266,6 +270,7 @@ class HVMSketchDecoder(nn.Module):
             self._part_feats = None
             self._text_feats = None
             self._part_mask = None
+            self._text_mask = None
 
         # ================================================================
         # 2. 运行 base model forward (hooks 自动注入 PIM)

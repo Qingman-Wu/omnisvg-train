@@ -6,8 +6,9 @@
 # 使用方法:
 #   bash run_train_hvm.sh                    # 默认 8 卡训练
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
-#   bash run_train_hvm.sh --num_gpus 8       # 4 卡训练
-#   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_epoch_5.pt  # 恢复训练
+#   bash run_train_hvm.sh --num_gpus 8       # 8 卡训练
+#   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-5000  # 恢复完整训练状态
+#   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 #
 # =============================================================================
 
@@ -40,7 +41,7 @@ PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 # -- 训练超参 --
 BATCH_SIZE=2                        # 每卡 batch size
 GRAD_ACCUM=4                        # 梯度累积步数
-EPOCHS=30
+EPOCHS=30000
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
@@ -87,6 +88,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 参数互斥检查
+if [ -n "$RESUME_FROM" ] && [ -n "$HVM_CHECKPOINT" ]; then
+    echo "Error: --resume and --hvm_ckpt are mutually exclusive."
+    echo "  --resume:   restore full training state (optimizer/scheduler/step)"
+    echo "  --hvm_ckpt: load HVM-only weights for initialization"
+    exit 1
+fi
+
 # ===================== 自动计算 =====================
 EFFECTIVE_BS=$((BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))
 
@@ -111,8 +120,10 @@ echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "  SwanLab mode:      ${SWANLAB_MODE}"
 echo "  Run name:          ${SWANLAB_RUN_NAME}"
-if [ -n "$HVM_CHECKPOINT" ]; then
-    echo "  Resume from:       ${HVM_CHECKPOINT}"
+if [ -n "$RESUME_FROM" ]; then
+    echo "  Resume from:       ${RESUME_FROM}"
+elif [ -n "$HVM_CHECKPOINT" ]; then
+    echo "  Init HVM weights:  ${HVM_CHECKPOINT}"
 fi
 echo "============================================================"
 
