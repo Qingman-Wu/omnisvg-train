@@ -14,6 +14,10 @@
    - 扫描所有 Parquet 数据文件。
    - 构建全局整数索引（`idx`）与原始样本 ID 的映射。
    - 提取文本描述、关键词等元数据。
+   - 得到/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed/id_to_idx.json
+   - 例如："00965a7e45b453e83afe51edc9208bb7": 0,
+   - /mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed/metadata.jsonl
+   - {"idx": 0, "id": "00965a7e45b453e83afe51edc9208bb7", "description": "A stack of colorful books with a pink top book and a green bottom book.", "keywords": "books, stack, colorful, pink, green, top, bottom", "detail": "The image depicts a neatly arranged stack of books with vibrant colors. The topmost book is pink, followed by a brown book, another pink book, a green book, an orange book, and finally a blue book at the bottom. The books are stacked vertically, creating a visually appealing and organized appearance.", "token_len": 1171, "parquet_file": "train-small-1000.parquet", "parquet_row": 0}
 
 2. **Stage 2: RAG (检索增强)**
    - 使用 **CLIP text encoder** (`clip-vit-large-patch14`) 对样本描述进行语义编码。
@@ -96,10 +100,8 @@ python precompute_hvm_data.py --stage groups
 - **输出**：
   - `rag_results.jsonl`：每行包含 `idx`、`ref_indices`（Top-3 相似样本的 idx）、`ref_scores`。
   - `text_embeddings.npy`：所有样本的文本向量 `[N, 768]`（float32）。
-  - `faiss_index.bin`：保存的 FAISS 索引文件。
+  - `faiss_index.bin`：保存的 FAISS 索引文件。faiss_index.bin 是 FAISS 索引的序列化文件,包含所有样本的 CLIP 文本向量(768 维)和索引结构。它的作用是为未来的推理提供实时检索能力:用户输入新文本 → CLIP 编码 → 在这个索引里搜 Top-3 → 拿到参考样本。
 
-> **为什么用 CLIP 而不是 Qwen 的 embed_tokens？**
-> CLIP 经过大规模文本-图像对比学习，其文本编码器天然适合语义检索任务。相比之下，Qwen 的 embed_tokens 只是 LLM 输入层，没有经过检索目标的训练，mean pooling 后的语义区分度较低。实测中 CLIP 的检索质量显著优于 raw embedding。
 
 ### Stage 3: Features
 
