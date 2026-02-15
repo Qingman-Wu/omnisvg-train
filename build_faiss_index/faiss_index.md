@@ -2,6 +2,10 @@
 
 本目录下的 `precompute_hvm_data.py` 是 HVM-SVG 训练流程中的核心数据处理脚本。它负责将原始的 SVG Parquet 数据集转换为训练所需的多模态预计算数据，包括元数据索引、RAG 检索结果、视觉特征缓存以及 SVG 路径分组信息。
 
+先看一下原始omnisvg数据（/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process)
+<img width="746" height="816" alt="image" src="https://github.com/user-attachments/assets/5ef18874-90c9-4b83-828f-06e0911294fa" />
+
+
 ## 📋 功能概述
 
 该脚本包含四个处理阶段（Stage），支持独立运行或全流程运行：
