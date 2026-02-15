@@ -148,6 +148,7 @@ class HVMDataset(Dataset):
         if not svg_code or not DEEPSVG_AVAILABLE:
             return np.array([], dtype=np.int64)
 
+        temp_path = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".svg", delete=False) as f:
                 f.write(svg_code)
@@ -156,13 +157,16 @@ class HVMDataset(Dataset):
             svg = SVG.load_svg(temp_path)
             svg_tensors, color_tensors = svg.to_tensor(concat_groups=False, PAD_VAL=0)
             tokens = self.svg_tokenizer.tokenize_svg_tensors(svg_tensors, color_tensors)
-
-            os.unlink(temp_path)
             return tokens
 
         except Exception as e:
             # 静默处理错误，训练时会重试
             return np.array([], dtype=np.int64)
+
+        finally:
+            # 无论成功或异常，都清理临时文件
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def __len__(self) -> int:
         return len(self.valid_indices)

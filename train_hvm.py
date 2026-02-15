@@ -366,10 +366,9 @@ def train(args):
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     accelerator.print("=" * 60)
 
-    running_losses = []
-
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        epoch_losses = []  # 每 epoch 重置，用于真实 epoch 平均
 
         # 恢复时跳过当前 epoch 已完成的 batches
         if epoch == start_epoch and resume_step_in_epoch > 0:
@@ -411,7 +410,7 @@ def train(args):
 
                 # Compute loss
                 loss = compute_loss(outputs, labels)
-                running_losses.append(loss.item())
+                epoch_losses.append(loss.item())
 
                 # Backward
                 accelerator.backward(loss)
@@ -430,17 +429,17 @@ def train(args):
                     global_step += 1
 
                     # Update progress bar
-                    avg_loss = np.mean(running_losses[-50:]) if running_losses else 0
+                    recent_avg = np.mean(epoch_losses[-50:]) if epoch_losses else 0
                     progress_bar.update(1)
                     progress_bar.set_postfix({
                         "loss": f"{loss.item():.4f}",
-                        "avg": f"{avg_loss:.4f}",
+                        "avg": f"{recent_avg:.4f}",
                         "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
                     })
 
                     # ---- Logging ----
                     if global_step % args.log_every == 0 and accelerator.is_main_process:
-                        avg = np.mean(running_losses[-args.log_every:])
+                        avg = np.mean(epoch_losses[-args.log_every:])
 
                         log_dict = {
                             "train/loss": avg,
@@ -455,7 +454,6 @@ def train(args):
                             log_dict[f"gate/pim_{pim_idx}_tanh_alpha"] = torch.tanh(torch.tensor(alpha)).item()
 
                         swanlab.log(log_dict, step=global_step)
-                        running_losses = running_losses[-100:]
 
                     # ---- Save checkpoint ----
                     if global_step % args.save_every == 0:
@@ -487,10 +485,10 @@ def train(args):
 
         progress_bar.close()
 
-        # End of epoch: 只记录 loss，不保存 checkpoint（由 save_every 控制）
+        # End of epoch: 记录真实 epoch 平均 loss
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            epoch_avg_loss = np.mean(running_losses) if running_losses else 0
+            epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0
             swanlab.log({"train/epoch_loss": epoch_avg_loss}, step=global_step)
 
         torch.cuda.empty_cache()
