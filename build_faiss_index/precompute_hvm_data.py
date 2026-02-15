@@ -4,7 +4,7 @@ HVM-SVG Data Preprocessing Script
 ==================================
 为 HVM-SVG 训练预计算所需数据：
   Stage 1 (metadata): 加载所有 parquet，提取元数据，分配全局整数索引
-  Stage 2 (rag):      用 embedding + FAISS 做 Top-3 文本检索
+  Stage 2 (rag):      用 CLIP text encoder + FAISS 做 Top-3 语义文本检索
   Stage 3 (features): 提取 Qwen2.5-VL pre-merge vision features [16,16,4,1280]
   Stage 4 (groups):   解析 SVG，计算 path 复杂度和分组信息
 
@@ -39,7 +39,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -49,6 +48,7 @@ from tqdm import tqdm
 
 DEFAULT_DATA_DIR = "/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
 DEFAULT_MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
+DEFAULT_CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
 DEFAULT_OUTPUT_DIR = "/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
 
 VIEWBOX_SIZE = 200      # SVG viewBox 尺寸
@@ -137,16 +137,17 @@ def stage_metadata(data_dir: str, output_dir: str):
 # Stage 2: RAG Retrieval
 # ============================================================================
 
-def stage_rag(output_dir: str, model_path: str):
+def stage_rag(output_dir: str, clip_model_path: str):
     """
-    用 Qwen2.5-VL 的 embedding layer 编码 descriptions，
-    构建 FAISS 索引，检索 Top-3 相似样本。
+    用 CLIP text encoder 编码 descriptions，构建 FAISS 索引，检索 Top-3 相似样本。
+    CLIP 经过文本-图像对比学习，语义检索质量远优于 Qwen 的 raw embed_tokens。
     输出: rag_results.jsonl, text_embeddings.npy, faiss_index.bin
     """
     import faiss
+    from transformers import CLIPModel, CLIPTokenizer
 
     print("=" * 60)
-    print("Stage 2: RAG Retrieval")
+    print("Stage 2: RAG Retrieval (CLIP)")
     print("=" * 60)
 
     metadata_path = os.path.join(output_dir, "metadata.jsonl")
@@ -163,101 +164,57 @@ def stage_rag(output_dir: str, model_path: str):
     N = len(records)
     print(f"Total samples: {N}")
 
-    descriptions = [r["description"] for r in records]
+    # 拼接 description + keywords 提高检索质量
+    texts = []
+    for r in records:
+        desc = r["description"]
+        kw = r.get("keywords", "")
+        texts.append(f"{desc}. {kw}" if kw else desc)
 
-    # 2. 加载 tokenizer 和 embedding 权重
-    print("Loading tokenizer and embeddings...")
-    from transformers import AutoTokenizer, AutoConfig
-    from safetensors.torch import load_file
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-
-    # 只加载 embedding 层权重，不加载整个模型
-    config = AutoConfig.from_pretrained(model_path)
-    embed_dim = config.hidden_size  # 3584
-
-    # 从 safetensors 中只提取 embed_tokens 权重
-    model_dir = Path(model_path)
-    embed_weight = None
-
-    # 查找包含 embed_tokens 的 safetensors 文件
-    import glob
-    safetensor_files = sorted(glob.glob(str(model_dir / "model-*.safetensors")))
-    if not safetensor_files:
-        safetensor_files = sorted(glob.glob(str(model_dir / "model.safetensors")))
-
-    print(f"Searching for embed_tokens in {len(safetensor_files)} safetensor files...")
-    for sf in safetensor_files:
-        from safetensors import safe_open
-        with safe_open(sf, framework="pt") as f:
-            for key in f.keys():
-                if "embed_tokens" in key:
-                    embed_weight = f.get_tensor(key)
-                    print(f"Found embed_tokens in {os.path.basename(sf)}: shape={embed_weight.shape}")
-                    break
-        if embed_weight is not None:
-            break
-
-    if embed_weight is None:
-        raise RuntimeError("Could not find embed_tokens weight in model files")
-
-    embed_weight = embed_weight.float()  # [vocab_size, embed_dim]
-    print(f"Embedding weight: {embed_weight.shape}")
+    # 2. 加载 CLIP text encoder
+    print(f"Loading CLIP text encoder from {clip_model_path}...")
+    clip_model = CLIPModel.from_pretrained(clip_model_path)
+    clip_tokenizer = CLIPTokenizer.from_pretrained(clip_model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    clip_model = clip_model.to(device).eval()
+    embed_dim = clip_model.config.projection_dim  # 768
+    print(f"CLIP text embedding dim: {embed_dim}")
 
     # 3. 编码所有 descriptions
-    print("Encoding descriptions...")
-    BATCH_SIZE = 512
+    print("Encoding descriptions with CLIP...")
+    BATCH_SIZE = 256
     all_embeddings = np.zeros((N, embed_dim), dtype=np.float32)
 
     for start in tqdm(range(0, N, BATCH_SIZE), desc="Encoding"):
         end = min(start + BATCH_SIZE, N)
-        batch_texts = descriptions[start:end]
+        batch_texts = texts[start:end]
 
-        # Tokenize
-        encoded = tokenizer(
+        inputs = clip_tokenizer(
             batch_texts,
             padding=True,
             truncation=True,
-            max_length=128,
+            max_length=77,
             return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"]          # [B, seq_len]
-        attention_mask = encoded["attention_mask"]  # [B, seq_len]
+        ).to(device)
 
-        # Lookup embeddings
         with torch.no_grad():
-            embeds = F.embedding(input_ids, embed_weight)  # [B, seq_len, D]
+            text_features = clip_model.get_text_features(**inputs)
+            # L2 normalize (cosine similarity = inner product after normalization)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # Mean pooling (masked)
-        mask_expanded = attention_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
-        sum_embeds = (embeds * mask_expanded).sum(dim=1)       # [B, D]
-        counts = mask_expanded.sum(dim=1).clamp(min=1)         # [B, 1]
-        mean_embeds = sum_embeds / counts                       # [B, D]
+        all_embeddings[start:end] = text_features.cpu().numpy()
 
-        # L2 normalize
-        mean_embeds = F.normalize(mean_embeds, p=2, dim=1)
-
-        all_embeddings[start:end] = mean_embeds.numpy()
+    # 释放 CLIP 模型
+    del clip_model
+    torch.cuda.empty_cache()
 
     # 保存 embeddings
     np.save(embeddings_path, all_embeddings)
-    print(f"Saved embeddings to: {embeddings_path}")
+    print(f"Saved embeddings to: {embeddings_path} (shape: {all_embeddings.shape})")
 
     # 4. 构建 FAISS 索引
-    print("Building FAISS index...")
-    dim = embed_dim
-
-    # 使用 GPU FAISS 加速（如果可用）
-    # try:
-    #     res = faiss.StandardGpuResources()
-    #     cpu_index = faiss.IndexFlatIP(dim)  # Inner Product (= cosine after L2 norm)
-    #     index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    #     print("Using GPU FAISS")
-    # except Exception:
-    #     index = faiss.IndexFlatIP(dim)
-    #     print("Using CPU FAISS")
-    index = faiss.IndexFlatIP(dim)
-    print("Using CPU FAISS")
+    print("Building FAISS index (IndexFlatIP)...")
+    index = faiss.IndexFlatIP(embed_dim)
     index.add(all_embeddings)
     print(f"FAISS index size: {index.ntotal}")
 
@@ -300,7 +257,6 @@ def stage_rag(output_dir: str, model_path: str):
                         ref_scores.append(float(all_scores[i, j]))
                         break
                 else:
-                    # 用随机索引填充
                     rand_idx = np.random.randint(0, N)
                     while rand_idx == i or rand_idx in ref_indices:
                         rand_idx = np.random.randint(0, N)
@@ -314,13 +270,8 @@ def stage_rag(output_dir: str, model_path: str):
             }
             fout.write(json.dumps(record) + "\n")
 
-    # 保存 FAISS 索引（CPU 版本）
-    if hasattr(index, 'index'):
-        # GPU index -> convert to CPU for saving
-        cpu_index = faiss.index_gpu_to_cpu(index)
-    else:
-        cpu_index = index
-    faiss.write_index(cpu_index, index_path)
+    # 保存 FAISS 索引
+    faiss.write_index(index, index_path)
     print(f"Saved FAISS index to: {index_path}")
     print(f"Saved RAG results to: {rag_path}")
 
@@ -950,6 +901,8 @@ def parse_args():
                         help="Path to parquet data directory")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH,
                         help="Path to Qwen2.5-VL-7B model")
+    parser.add_argument("--clip_model_path", type=str, default=DEFAULT_CLIP_MODEL_PATH,
+                        help="Path to CLIP model for text embedding (RAG retrieval)")
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR,
                         help="Output directory for precomputed data")
     parser.add_argument("--gpu_id", type=int, default=0,
@@ -967,17 +920,18 @@ def main():
     args = parse_args()
 
     print(f"HVM-SVG Data Preprocessing")
-    print(f"  Data dir:   {args.data_dir}")
-    print(f"  Model path: {args.model_path}")
-    print(f"  Output dir: {args.output_dir}")
-    print(f"  Stage:      {args.stage}")
+    print(f"  Data dir:        {args.data_dir}")
+    print(f"  Model path:      {args.model_path}")
+    print(f"  CLIP model path: {args.clip_model_path}")
+    print(f"  Output dir:      {args.output_dir}")
+    print(f"  Stage:           {args.stage}")
     print()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     stages = {
         "metadata": lambda: stage_metadata(args.data_dir, args.output_dir),
-        "rag": lambda: stage_rag(args.output_dir, args.model_path),
+        "rag": lambda: stage_rag(args.output_dir, args.clip_model_path),
         "features": lambda: stage_features(
             args.data_dir, args.output_dir, args.model_path,
             gpu_id=args.gpu_id,
