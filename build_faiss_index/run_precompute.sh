@@ -92,6 +92,50 @@ run_groups() {
     $PYTHON $SCRIPT --stage groups
 }
 
+run_group_features() {
+    echo "=========================================="
+    echo "Running Stage 5: Group Feature Extraction (${NUM_GPUS} GPUs)"
+    echo "=========================================="
+
+    pids=()
+    for shard_id in $(seq 0 $((NUM_GPUS - 1))); do
+        echo "Starting shard ${shard_id} on GPU ${shard_id}..."
+        CUDA_VISIBLE_DEVICES=$shard_id $PYTHON $SCRIPT \
+            --stage group_features \
+            --gpu_id 0 \
+            --batch_size $BATCH_SIZE \
+            --num_shards $NUM_GPUS \
+            --shard_id $shard_id \
+            > "${LOG_DIR}/group_features_shard_${shard_id}.log" 2>&1 &
+        pids+=($!)
+    done
+
+    echo "All ${NUM_GPUS} shards started. PIDs: ${pids[*]}"
+    echo "Logs: ${LOG_DIR}/group_features_shard_*.log"
+    echo ""
+    echo "Waiting for all shards to complete..."
+
+    all_ok=true
+    for i in "${!pids[@]}"; do
+        wait ${pids[$i]}
+        exit_code=$?
+        if [ $exit_code -ne 0 ]; then
+            echo "ERROR: Shard $i (PID ${pids[$i]}) failed with exit code $exit_code"
+            echo "Check log: ${LOG_DIR}/group_features_shard_${i}.log"
+            all_ok=false
+        else
+            echo "Shard $i (PID ${pids[$i]}) completed successfully"
+        fi
+    done
+
+    if $all_ok; then
+        echo "All group feature extraction shards completed successfully!"
+    else
+        echo "Some shards failed. Check logs in ${LOG_DIR}/"
+        return 1
+    fi
+}
+
 # 根据参数决定运行哪些阶段
 case $STAGE in
     all)
@@ -99,6 +143,7 @@ case $STAGE in
         run_rag
         run_features
         run_groups
+        run_group_features
         ;;
     metadata)
         run_metadata
@@ -112,9 +157,12 @@ case $STAGE in
     groups)
         run_groups
         ;;
+    group_features)
+        run_group_features
+        ;;
     *)
         echo "Unknown stage: $STAGE"
-        echo "Usage: bash run_precompute.sh [all|metadata|rag|features|groups]"
+        echo "Usage: bash run_precompute.sh [all|metadata|rag|features|groups|group_features]"
         exit 1
         ;;
 esac

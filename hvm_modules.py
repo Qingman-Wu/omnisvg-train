@@ -29,7 +29,7 @@ class HVMConfig:
 
     # === 维度 ===
     d_model: int = 3584          # LLM hidden dim (Qwen2.5-7B)
-    d_vision: int = 1280         # Vision encoder pre-merge dim
+    d_vision: int = 3584         # Vision encoder post-merge dim (GME & PME 统一使用)
     d_qformer: int = 1024        # QFormer 内部维度
     d_pim_inner: int = 512       # PIM attention bottleneck 维度
 
@@ -51,10 +51,6 @@ class HVMConfig:
     pim_num_heads: int = 8
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
-
-    # === Feature map (32×32 pre-merge patch grid) ===
-    feat_grid_h: int = 32
-    feat_grid_w: int = 32
 
     # === RAG ===
     num_references: int = 3
@@ -277,9 +273,14 @@ class GistMemoryEncoder(nn.Module):
     全局场景记忆编码器。
     认知对应: Scene Gist — 快速、压缩、持久的整体结构记忆。
 
-    将 3 张参考图的 feature maps 压缩成 32 个 gist tokens。
-    输入: 3 张参考图的 pre-merge features, 各 [B, 32, 32, 1280]
+    将 3 张参考图的 post-merge features 压缩成 32 个 gist tokens。
+    输入: 3 张参考图的 post-merge features, 各 [B, 256, 3584]
     输出: gist_feats [B, 32, d_model]
+
+    相比旧版 pre-merge [32,32,1280]：
+      - QFormer 输入从 3×1024=3072 tokens 降到 3×256=768 tokens，快 4 倍
+      - 复用 Qwen 训练好的 merger 投影，特征质量更好
+      - 与 PME 统一 d_vision=3584，架构更简洁
     """
 
     def __init__(self, config: HVMConfig):
@@ -289,7 +290,7 @@ class GistMemoryEncoder(nn.Module):
             num_queries=config.gme_num_queries,      # 32
             num_layers=config.gme_num_layers,         # 6
             d_qformer=config.d_qformer,               # 1024
-            d_vision=config.d_vision,                  # 1280
+            d_vision=config.d_vision,                  # 3584
             d_out=config.d_model,                      # 3584
             n_heads=config.gme_num_heads,              # 8
             ff_mult=config.gme_ff_mult,                # 4
@@ -298,16 +299,16 @@ class GistMemoryEncoder(nn.Module):
     def forward(self, ref_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            ref_features: [B, num_refs, 32, 32, d_vision]
-                         3 张参考图的 pre-merge feature maps
+            ref_features: [B, num_refs, 256, d_vision]
+                         3 张参考图的 post-merge features (已对齐 LLM 空间)
 
         Returns:
             gist_feats: [B, 32, d_model]
         """
-        B, N_ref, H, W, D = ref_features.shape
-        # 展平所有参考图: [B, N_ref * H * W, D] = [B, 3*1024, 1280] = [B, 3072, 1280]
-        flat_feats = ref_features.reshape(B, N_ref * H * W, D)
-        # 过 QFormer
+        B, N_ref, T, D = ref_features.shape
+        # 展平所有参考图: [B, N_ref * T, D] = [B, 3*256, 3584] = [B, 768, 3584]
+        flat_feats = ref_features.reshape(B, N_ref * T, D)
+        # 过 QFormer: 768 tokens → 32 queries
         return self.qformer(flat_feats)  # [B, 32, d_model]
 
 
@@ -320,8 +321,14 @@ class PartMemoryEncoder(nn.Module):
     局部零件记忆编码器。
     认知对应: Object/Part Memory — 容量有限(4±1)、高精度的零件级表征。
 
-    对 Top-1 参考图的 feature map 按 path 分组 crop，每组通过 QFormer 得到 4 个 tokens。
-    输入: Top-1 参考图的 feature map [B, 32, 32, 1280] + 分组信息 (32×32 坐标)
+    接收 Top-1 参考图的逐 group 独立渲染后提取的 vision features，
+    每组通过 QFormer 压缩为 4 个 tokens。
+
+    输入: group_features_list — batch of [List of [256, 3584] tensors]
+          每个 tensor 是一个 group 独立渲染后通过 ViT+Merger 提取的 post-merge 特征。
+          group 图片是：只包含该 group 的 paths，viewbox 设为 group 的 bbox，
+          渲染成 448x448 后过完整 vision pipeline (encoder + merger) 得到的。
+          特征已对齐 LLM 空间 (3584 维)。
     输出: part_feats [B, max_tokens, d_model] + part_mask [B, max_tokens]
     """
 
@@ -334,7 +341,7 @@ class PartMemoryEncoder(nn.Module):
             num_queries=config.pme_queries_per_group,  # 4
             num_layers=config.pme_num_layers,           # 4
             d_qformer=config.d_qformer,                 # 1024
-            d_vision=config.d_vision,                    # 1280
+            d_vision=config.d_vision,                    # 3584 (post-merge, LLM-aligned, 与 GME 统一)
             d_out=config.d_model,                        # 3584
             n_heads=config.pme_num_heads,                # 8
             ff_mult=config.pme_ff_mult,                  # 4
@@ -342,48 +349,51 @@ class PartMemoryEncoder(nn.Module):
 
     def forward(
         self,
-        ref_feature: torch.Tensor,
-        groups_bbox_feature: List[List[Tuple[int, int, int, int]]],
+        group_features_list: List[List[torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            ref_feature: [B, 32, 32, d_vision]
-                        Top-1 参考图的 pre-merge feature map (32×32 patch grid)
-            groups_bbox_feature: batch of group lists.
-                每个样本是 List[Tuple[row_start, row_end, col_start, col_end]]
-                坐标基于 32×32 网格，长度 1~4，对应 1~4 个分组。
+            group_features_list: batch of group feature lists.
+                group_features_list[b] = [feat_g0, feat_g1, ...]
+                每个 feat_gX: [256, 3584] — 该 group 独立渲染后的 post-merge 特征
+                长度 1~4，对应 1~4 个 group。
 
         Returns:
             part_feats: [B, max_tokens(16), d_model]  padded
             part_mask:  [B, max_tokens(16)]  bool, True=有效
         """
-        B = ref_feature.shape[0]
-        device = ref_feature.device
-        dtype = ref_feature.dtype
+        B = len(group_features_list)
+        # 从第一个非空样本获取 device 和 dtype
+        device = None
+        dtype = None
+        for gfl in group_features_list:
+            if gfl:
+                device = gfl[0].device
+                dtype = gfl[0].dtype
+                break
+        if device is None:
+            # 全空，用模块自身参数的 device/dtype
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
 
         all_part_feats = []
         all_masks = []
 
         for b in range(B):
-            feat_map = ref_feature[b]  # [32, 32, D]
-            groups = groups_bbox_feature[b]
-            group_feats = []
+            group_feats_list = group_features_list[b]  # List of [1024, D]
+            group_outs = []
 
-            for (r1, r2, c1, c2) in groups:
-                # 裁剪 feature map (32×32 精度)
-                cropped = feat_map[r1:r2, c1:c2, :]  # [h, w, D]
-                h, w = cropped.shape[0], cropped.shape[1]
-                # 展平为序列: [h*w, D]
-                cropped_flat = cropped.reshape(1, h * w, -1)
-
-                # 过 QFormer: [1, 4, d_model]
+            for group_feat in group_feats_list:
+                # group_feat: [256, 3584] (post-merge, LLM-aligned)
+                # 过 QFormer: [1, 256, 3584] → [1, 4, 3584]
+                group_input = group_feat.unsqueeze(0)  # [1, 256, 3584]
                 with torch.set_grad_enabled(self.training):
-                    group_out = self.qformer(cropped_flat)
-                group_feats.append(group_out.squeeze(0))  # [4, d_model]
+                    group_out = self.qformer(group_input)
+                group_outs.append(group_out.squeeze(0))  # [4, d_model]
 
-            if group_feats:
+            if group_outs:
                 # Concat 所有组: [N_groups * 4, d_model]
-                sample_feats = torch.cat(group_feats, dim=0)
+                sample_feats = torch.cat(group_outs, dim=0)
                 actual_len = sample_feats.shape[0]
             else:
                 sample_feats = torch.zeros(0, self.config.d_model, device=device, dtype=dtype)

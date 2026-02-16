@@ -137,7 +137,7 @@ def test_model_forward(batch, tokenizer, token_config):
     attention_mask = batch["attention_mask"].to(DEVICE)
     labels = batch["labels"].to(DEVICE)
     ref_features = batch["ref_features"].to(DEVICE)
-    ref_best_feature = batch["ref_best_feature"].to(DEVICE)
+    group_features_list = batch["group_features_list"]
     ref_text_ids = batch["ref_text_ids"].to(DEVICE)
     ref_text_mask = batch["ref_text_mask"].to(DEVICE)
 
@@ -146,8 +146,7 @@ def test_model_forward(batch, tokenizer, token_config):
             input_ids=input_ids,
             attention_mask=attention_mask,
             ref_features=ref_features,
-            ref_best_feature=ref_best_feature,
-            groups_bbox_feature=batch["groups_bbox_feature"],
+            group_features_list=group_features_list,
             ref_text_ids=ref_text_ids,
             ref_text_mask=ref_text_mask,
         )

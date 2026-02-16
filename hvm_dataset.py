@@ -6,9 +6,8 @@ HVM-SVG Dataset
 每个样本返回:
   - text: 描述文本
   - pix_seq: SVG token 序列
-  - ref_features: 3 张参考图的 pre-merge feature maps
-  - ref_best_feature: Top-1 参考图的 feature map
-  - ref_best_groups: Top-1 参考图的 path 分组信息
+  - ref_features: 3 张参考图的 post-merge features [256, 3584] (for GME)
+  - ref_best_group_features: Top-1 参考图的逐 group 独立渲染特征 list of [256, 3584] (for PME)
   - ref_text: 3 张参考图的拼接描述
 """
 
@@ -67,6 +66,7 @@ class HVMDataset(Dataset):
         self.token_config = token_config
         self.train_config = train_config or TrainConfig()
         self.features_dir = os.path.join(hvm_dir, "features")
+        self.group_features_dir = os.path.join(hvm_dir, "group_features")
 
         # SVG tokenizer
         self.svg_tokenizer = SVGTokenizer(token_config)
@@ -104,27 +104,41 @@ class HVMDataset(Dataset):
         valid = []
         for meta in self.metadata:
             idx = meta["idx"]
-            # 检查 feature 文件是否存在
+            # 检查 feature 文件是否存在 (整图 features for GME)
             feat_path = os.path.join(
                 self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
             )
-            if (
+            if not (
                 idx in self.idx_to_rag
                 and idx in self.idx_to_groups
                 and os.path.exists(feat_path)
             ):
-                # 检查参考样本的 features 是否也存在
-                rag = self.idx_to_rag[idx]
-                refs_ok = True
-                for ref_idx in rag["ref_indices"]:
-                    ref_feat_path = os.path.join(
-                        self.features_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt"
-                    )
-                    if not os.path.exists(ref_feat_path):
-                        refs_ok = False
-                        break
-                if refs_ok:
-                    valid.append(idx)
+                continue
+
+            # 检查参考样本的 features 和 group_features 是否也存在
+            rag = self.idx_to_rag[idx]
+            refs_ok = True
+            for ref_idx in rag["ref_indices"]:
+                ref_feat_path = os.path.join(
+                    self.features_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt"
+                )
+                if not os.path.exists(ref_feat_path):
+                    refs_ok = False
+                    break
+
+            # 检查 Top-1 参考的 group_features 是否存在
+            if refs_ok:
+                best_ref_idx = rag["ref_indices"][0]
+                gf_path = os.path.join(
+                    self.group_features_dir,
+                    f"{best_ref_idx // 1000:03d}",
+                    f"{best_ref_idx:06d}.pt",
+                )
+                if not os.path.exists(gf_path):
+                    refs_ok = False
+
+            if refs_ok:
+                valid.append(idx)
 
         return valid
 
@@ -137,11 +151,18 @@ class HVMDataset(Dataset):
         return self._parquet_tables[parquet_file]
 
     def _load_feature(self, idx: int) -> torch.Tensor:
-        """加载单个样本的 feature map"""
+        """加载单个样本的整图 post-merge feature (for GME)"""
         feat_path = os.path.join(
             self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
         )
-        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [32, 32, 1280]
+        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [256, 3584]
+
+    def _load_group_features(self, idx: int) -> List[torch.Tensor]:
+        """加载单个样本的逐 group 渲染特征 (for PME)"""
+        gf_path = os.path.join(
+            self.group_features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
+        )
+        return torch.load(gf_path, map_location="cpu", weights_only=True)  # list of [256, 3584]
 
     def _tokenize_svg(self, svg_code: str) -> np.ndarray:
         """将 SVG 字符串 tokenize 为 token 序列"""
@@ -177,8 +198,8 @@ class HVMDataset(Dataset):
             dict with keys:
                 text: str                              描述文本
                 pix_seq: List[int]                     SVG token 序列 (含 BOS/EOS)
-                ref_features: List[torch.Tensor]       3 × [32,32,1280]
-                ref_best_groups: List[Tuple]            Top-1 参考的 bbox_feature 列表
+                ref_features: List[torch.Tensor]       3 × [256, 3584] (for GME, post-merge)
+                ref_best_group_features: List[Tensor]  Top-1 参考的逐 group 渲染特征, list of [256, 3584] (for PME)
                 ref_text: str                          参考文本 (拼接)
         """
         max_retries = 10
@@ -232,19 +253,13 @@ class HVMDataset(Dataset):
         # ---- 加载参考数据 ----
         ref_indices = rag["ref_indices"]  # [3]
 
-        # 3 张参考图的 features
+        # 3 张参考图的整图 features (for GME)
         ref_features = [self._load_feature(ri) for ri in ref_indices]
 
-        # Top-1 参考的分组信息
+        # Top-1 参考的逐 group 渲染特征 (for PME)
         best_ref_idx = ref_indices[0]
-        best_ref_groups = self.idx_to_groups.get(best_ref_idx, {})
-        groups_list = best_ref_groups.get("groups", [])
-        ref_best_groups = [
-            tuple(g["bbox_feature"]) for g in groups_list
-        ]
-        if not ref_best_groups:
-            # Fallback: 整图作为一个 group
-            ref_best_groups = [(0, 32, 0, 32)]
+        ref_best_group_features = self._load_group_features(best_ref_idx)
+        # ref_best_group_features: list of [256, 3584] tensors, 1~4 个 group
 
         # 参考文本 (拼接 3 个参考的描述)
         ref_texts = []
@@ -258,8 +273,8 @@ class HVMDataset(Dataset):
         return {
             "text": text,
             "pix_seq": pix_seq,
-            "ref_features": ref_features,      # List of 3 tensors
-            "ref_best_groups": ref_best_groups,  # List of tuples
+            "ref_features": ref_features,                    # List of 3 × [256, 3584]
+            "ref_best_group_features": ref_best_group_features,  # List of [256, 3584]
             "ref_text": ref_text,
         }
 
@@ -281,9 +296,8 @@ def create_hvm_collate_fn(
 
     将 Dataset 返回的 raw samples 组装成 batch tensor:
     - input_ids, attention_mask, labels: 文本 + SVG 序列
-    - ref_features: [B, 3, 32, 32, 1280]
-    - ref_best_feature: [B, 32, 32, 1280]
-    - groups_bbox_feature: List[List[Tuple]]
+    - ref_features: [B, 3, 256, 3584]  (for GME, post-merge)
+    - group_features_list: List[List[Tensor]]  (for PME, 每个样本 1~4 个 [256, 3584])
     - ref_text_ids, ref_text_mask: [B, N_t]
     """
     system_prompt = "You are an expert SVG code generator."
@@ -294,7 +308,7 @@ def create_hvm_collate_fn(
         texts = [s["text"] for s in batch]
         pix_seqs = [s["pix_seq"] for s in batch]
         ref_features_list = [s["ref_features"] for s in batch]
-        ref_best_groups_list = [s["ref_best_groups"] for s in batch]
+        group_features_list = [s["ref_best_group_features"] for s in batch]
         ref_texts = [s["ref_text"] for s in batch]
 
         # ================================================================
@@ -355,20 +369,18 @@ def create_hvm_collate_fn(
         labels = torch.stack(batch_labels)                  # [B, L]
 
         # ================================================================
-        # 2. 组装参考图 features
+        # 2. 组装参考图 features (for GME)
         # ================================================================
-        # ref_features: [B, 3, 32, 32, 1280]
+        # ref_features: [B, 3, 256, 3584]  (post-merge, LLM-aligned)
         ref_features = torch.stack([
             torch.stack(rf) for rf in ref_features_list
-        ])  # [B, 3, 32, 32, 1280]
-
-        # ref_best_feature: [B, 32, 32, 1280] (Top-1)
-        ref_best_feature = ref_features[:, 0]
+        ])  # [B, 3, 256, 3584]
 
         # ================================================================
-        # 3. 参考分组信息 (保持 List 格式，PME 内部逐样本处理)
+        # 3. Group features (for PME) — 保持 List 格式，PME 内部逐样本处理
         # ================================================================
-        groups_bbox_feature = ref_best_groups_list
+        # group_features_list: List[List[Tensor]]
+        # group_features_list[b] = [tensor_g0, tensor_g1, ...], 每个 [256, 3584]
 
         # ================================================================
         # 4. 参考文本 tokenization
@@ -388,8 +400,7 @@ def create_hvm_collate_fn(
             "attention_mask": attention_mask,
             "labels": labels,
             "ref_features": ref_features,
-            "ref_best_feature": ref_best_feature,
-            "groups_bbox_feature": groups_bbox_feature,
+            "group_features_list": group_features_list,
             "ref_text_ids": ref_text_ids,
             "ref_text_mask": ref_text_mask,
         }

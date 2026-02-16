@@ -164,7 +164,7 @@ def train(args):
     token_config = config.tokenization
     hvm_config = HVMConfig(
         d_model=3584,
-        d_vision=1280,
+        d_vision=3584,       # post-merge dim (GME & PME 统一)
         d_qformer=args.d_qformer,
         d_pim_inner=args.d_pim_inner,
         pim_layer_interval=args.pim_layer_interval,
@@ -392,8 +392,7 @@ def train(args):
                 attention_mask = batch["attention_mask"]
                 labels = batch["labels"]
                 ref_features = batch["ref_features"]
-                ref_best_feature = batch["ref_best_feature"]
-                groups_bbox_feature = batch["groups_bbox_feature"]
+                group_features_list = batch["group_features_list"]
                 ref_text_ids = batch["ref_text_ids"]
                 ref_text_mask = batch["ref_text_mask"]
 
@@ -402,8 +401,7 @@ def train(args):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     ref_features=ref_features,
-                    ref_best_feature=ref_best_feature,
-                    groups_bbox_feature=groups_bbox_feature,
+                    group_features_list=group_features_list,
                     ref_text_ids=ref_text_ids,
                     ref_text_mask=ref_text_mask,
                 )

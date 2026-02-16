@@ -212,8 +212,7 @@ class HVMSketchDecoder(nn.Module):
         labels: Optional[torch.Tensor] = None,
         # HVM-specific inputs
         ref_features: Optional[torch.Tensor] = None,
-        ref_best_feature: Optional[torch.Tensor] = None,
-        groups_bbox_feature: Optional[List[List[Tuple[int, int, int, int]]]] = None,
+        group_features_list: Optional[List[List[torch.Tensor]]] = None,
         ref_text_ids: Optional[torch.Tensor] = None,
         ref_text_mask: Optional[torch.Tensor] = None,
         # Original model inputs (for compatibility)
@@ -230,11 +229,12 @@ class HVMSketchDecoder(nn.Module):
             labels:         [B, L]  (-100 for text, token IDs for SVG)
 
         HVM inputs:
-            ref_features:       [B, 3, 32, 32, 1280]  3 张参考图 feature maps (pre-merge patch grid)
-            ref_best_feature:   [B, 32, 32, 1280]      Top-1 参考图 feature map
-            groups_bbox_feature: List[List[Tuple]]       Top-1 参考图的 path 分组 bbox (32×32 坐标)
-            ref_text_ids:       [B, N_t]                    参考文本 token IDs
-            ref_text_mask:      [B, N_t]                    参考文本 attention mask
+            ref_features:        [B, 3, 256, 3584]       3 张参考图 post-merge features (for GME)
+            group_features_list: List[List[Tensor]]       Top-1 参考的逐 group 渲染特征 (for PME)
+                                 group_features_list[b] = [feat_g0, feat_g1, ...],
+                                 每个 feat_gX: [256, 3584] (post-merge, LLM-aligned)
+            ref_text_ids:        [B, N_t]                 参考文本 token IDs
+            ref_text_mask:       [B, N_t]                 参考文本 attention mask
 
         Returns:
             Same as SketchDecoder.forward (loss, logits, etc.)
@@ -251,10 +251,14 @@ class HVMSketchDecoder(nn.Module):
             # GME: 3 张参考图 → 32 个 gist tokens
             self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
 
-            # PME: Top-1 参考图 crop → ≤16 个 part tokens
+            # PME: 逐 group 独立渲染的 features → ≤16 个 part tokens
+            # 将 group features 移到正确的 device 和 dtype
+            gfl_on_device = [
+                [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
+                for sample_gfs in group_features_list
+            ]
             self._part_feats, self._part_mask = self.pme(
-                ref_best_feature.to(device=device, dtype=hvm_dtype),
-                groups_bbox_feature,
+                gfl_on_device,
             )  # [B, 16, d_model], [B, 16]
 
             # Text feats: 参考文本 raw embedding
