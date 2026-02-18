@@ -12,7 +12,7 @@
 #
 
 PYTHON="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/python"
-SCRIPT="/mnt/data/wuqingman/omnisvg-train/build_faiss_index/precompute_hvm_data.py"
+SCRIPT="/mnt/data2/wuqingman/omnisvg-train/build_faiss_index/precompute_hvm_data.py"
 export CUDA_HOME="/mnt/data/wuqingman/miniconda3/envs/omnisvg"
 
 # 日志目录（在当前脚本所在目录）

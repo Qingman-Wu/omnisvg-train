@@ -46,33 +46,9 @@
      - 已对齐 LLM 空间（3584 维），复用了 Qwen 训练好的 merger
    - 支持多 GPU / 多节点并行分片处理，支持断点续传。
 
-## ⚙️ 环境依赖
-
-请确保已安装以下 Python 库：
-
-```bash
-pip install torch numpy pandas pyarrow pillow tqdm transformers faiss-cpu qwen_vl_utils cairosvg
-```
-
-
-
 ## 🚀 使用指南
 
-### 基本用法
-
-```bash
-# 运行全部阶段
-python precompute_hvm_data.py --stage all
-
-# 只运行某个阶段
-python precompute_hvm_data.py --stage metadata
-python precompute_hvm_data.py --stage rag
-python precompute_hvm_data.py --stage features --gpu_id 0
-python precompute_hvm_data.py --stage groups
-python precompute_hvm_data.py --stage group_features --gpu_id 0
-```
-
-### 使用 `run_precompute.sh` 一键执行（推荐）
+### 使用 `run_precompute.sh` 一键执行
 
 ```bash
 # 全部阶段
@@ -85,17 +61,17 @@ bash run_precompute.sh group_features
 
 ### 参数说明
 
-| 参数 | 类型 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `--stage` | str | `all` | 运行阶段：`metadata`, `rag`, `features`, `groups`, `group_features`, 或 `all` |
-| `--data_dir` | str | (见源码) | 原始 Parquet 数据目录路径 |
-| `--model_path` | str | (见源码) | Qwen2.5-VL 模型权重目录路径 |
-| `--clip_model_path` | str | (见源码) | CLIP 模型路径（用于 RAG 文本编码） |
-| `--output_dir` | str | (见源码) | 预计算结果输出目录 |
-| `--gpu_id` | int | `0` | 指定使用的 GPU ID（用于 Features 和 Group Features 阶段） |
-| `--batch_size` | int | `16` | 视觉特征提取的 Batch Size |
-| `--num_shards` | int | `1` | 并行处理的总分片数 |
-| `--shard_id` | int | `0` | 当前进程处理的分片 ID（0 ~ num_shards-1） |
+| 参数                | 类型 | 默认值   | 说明                                                         |
+| :------------------ | :--- | :------- | :----------------------------------------------------------- |
+| `--stage`           | str  | `all`    | 运行阶段：`metadata`, `rag`, `features`, `groups`, `group_features`, 或 `all` |
+| `--data_dir`        | str  | (见源码) | 原始 Parquet 数据目录路径                                    |
+| `--model_path`      | str  | (见源码) | Qwen2.5-VL 模型权重目录路径                                  |
+| `--clip_model_path` | str  | (见源码) | CLIP 模型路径（用于 RAG 文本编码）                           |
+| `--output_dir`      | str  | (见源码) | 预计算结果输出目录                                           |
+| `--gpu_id`          | int  | `0`      | 指定使用的 GPU ID（用于 Features 和 Group Features 阶段）    |
+| `--batch_size`      | int  | `16`     | 视觉特征提取的 Batch Size                                    |
+| `--num_shards`      | int  | `1`      | 并行处理的总分片数                                           |
+| `--shard_id`        | int  | `0`      | 当前进程处理的分片 ID（0 ~ num_shards-1）                    |
 
 ---
 
@@ -137,14 +113,6 @@ bash run_precompute.sh group_features
   - 目录结构：按 `idx // 1000` 分子文件夹存储，避免单目录文件过多。
   - Tensor Shape：`[256, 3584]`（float16, ~1.8MB/个）。
 
-> **为何使用 post-merge 特征？**  
-> 旧版使用 pre-merge `[32,32,1280]` 特征需要 hook 截取、reverse_indices 恢复空间顺序、手动 reshape 等复杂操作。
-> 新版直接取 `visual()` 输出的 post-merge 特征 `[256, 3584]`，优势：
-> - **代码简化**：无需 hook / reverse_indices / 空间 reshape
-> - **QFormer 更快**：GME 输入从 3×1024=3072 tokens 降到 3×256=768 tokens（快 4 倍）
-> - **存储更省**：每图从 2.6MB 降到 1.8MB（省 30%）
-> - **GME 和 PME 统一 d_vision=3584**，config 更简洁
-
 #### ⚡️ 并行提取特征示例（推荐）
 
 特征提取较慢，建议在多张 GPU 上并行运行：
@@ -172,17 +140,16 @@ python precompute_hvm_data.py --stage features --gpu_id 1 --num_shards 8 --shard
   - `groups.jsonl`：每行包含 `num_paths`、`total_complexity`、`num_groups`，以及 `groups` 列表。每个 Group 包含：
     - `path_indices`：该组包含的 Path 索引
     - `bbox`：SVG viewBox 坐标包围盒（含 10% padding）
-    - `bbox_feature`：（legacy）映射到 32×32 pre-merge 网格的坐标，训练时不再使用
     - `complexity`：组复杂度分数
 
 #### 分组策略
 
 | 总复杂度 | Path 数 | 分组数 |
-| :--- | :--- | :--- |
-| < 30 | ≤ 2 | 1 |
-| < 80 | ≤ 5 | 2 |
-| < 150 | — | 3 |
-| ≥ 150 | — | 4 |
+| :------- | :------ | :----- |
+| < 30     | ≤ 2     | 1      |
+| < 80     | ≤ 5     | 2      |
+| < 150    | —       | 3      |
+| ≥ 150    | —       | 4      |
 
 ### Stage 5: Group Features (逐 group 独立渲染特征)
 
@@ -208,7 +175,6 @@ bash run_precompute.sh group_features
 
 # 或手动分片
 python precompute_hvm_data.py --stage group_features --gpu_id 0 --num_shards 8 --shard_id 0
-...
 ```
 
 ---
@@ -243,28 +209,21 @@ hvm_precomputed/
 
 ---
 
-## 🛠️ 常见问题 (FAQ)
+## 🛠️ 常见问题 
 
-### Q: 为什么 Features 和 Group Features 都用 post-merge 特征？
+### Q: 为什么 Features 和 Group Features 改为 post-merge 特征？
 
-统一使用 Qwen2.5-VL merger 输出的 post-merge `[256, 3584]` 特征有多个好处：
-1. **复用 Qwen 训练好的 merger**，特征质量有保障
-2. **GME 和 PME 统一 d_vision=3584**，架构简洁
-3. **GME QFormer 输入从 3072 tokens 降到 768 tokens**，训练快 4 倍
-4. **不需要 hook / reverse_indices**，代码简洁可靠
-5. **存储省 30%**：1.8MB vs 旧版 2.6MB per image
+之前的方案为了节省存储空间
+
+是只存global img的特征，对于local img特征，我们只需要从global img的 featuer map上面crop，所以只需要记录crop的bbox，但是实际按照目前分组方案，很多svg是最后一笔描一圈黑边，那这样的话，就会不同组的bbox几乎是重叠的，如下图所示，我们已经分好组group_0, group_1, group_2,  这里的group_0和group_3就是重叠的，那crop的local feature就是重叠的
+
+![e4dd4eaff98e9a721ad7009b9dc3f811](/Users/wuqingman/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_fed8ds0tr8io22_1f09/temp/RWTemp/2026-02/9e20f478899dc29eb19741386f9343c8/e4dd4eaff98e9a721ad7009b9dc3f811.png)
+
+统一使用 Qwen2.5-VL merger 输出的 post-merge `[256, 3584]` 特征，缺点就是占用空间比较大，可能大约2t
 
 ### Q: 为什么 RAG 检索用 CLIP 而不是 Qwen 的 embed_tokens？
 
 CLIP 经过大规模文本-图像对比学习（contrastive learning），其文本编码器的 embedding 空间天然具有语义聚类特性，适合做最近邻检索。而 Qwen 的 `embed_tokens` 只是 LLM 的输入嵌入层，其设计目标是为下游 Transformer 层提供初始表征，没有经过检索目标（如对比学习）的训练。对其做 mean pooling 后进行余弦相似度检索，语义区分度远不如 CLIP。
-
-### Q: 为什么 RAG 检索要排除自身？
-
-在训练时，RAG 的目的是提供"参考示例"（reference examples）。如果检索结果包含自身，模型学会的是"复制粘贴"而不是"模仿风格"，这会导致过拟合和信息泄露。
-
-### Q: Features 和 Group Features 阶段支持断点续传吗？
-
-**支持。** 如果检测到目标 `.pt` 文件已存在，脚本会自动跳过。可以安全地中断后重新运行。其他阶段（Metadata, RAG, Groups）通常运行较快，默认会覆盖重写。
 
 ### Q: Group Features 渲染失败怎么办？
 

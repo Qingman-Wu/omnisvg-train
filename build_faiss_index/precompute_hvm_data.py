@@ -47,10 +47,10 @@ from tqdm import tqdm
 # Configuration
 # ============================================================================
 
-DEFAULT_DATA_DIR = "/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
+DEFAULT_DATA_DIR = "/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
 DEFAULT_MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
-DEFAULT_OUTPUT_DIR = "/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
+DEFAULT_OUTPUT_DIR = "/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
 
 VIEWBOX_SIZE = 200      # SVG viewBox 尺寸
 IMAGE_SIZE = 448        # 图像尺寸
@@ -399,7 +399,7 @@ def stage_features(
 
         with torch.no_grad():
             post_merge = visual(pixel_values, grid_thw=grid_thw)
-        # post_merge: [B*256, 3584]
+        # post_merge: [B*256, 3584],这里的这个维度已经和text】对齐了
 
         results = []
         for b in range(B):
@@ -623,6 +623,7 @@ def compute_path_complexity(commands: List[Dict], bbox: Tuple[float, float, floa
 def decide_num_groups(total_complexity: float, num_paths: int) -> int:
     """
     根据总复杂度和 path 数量决定分组数。
+    1111111111具体分组界限待定
     """
     if total_complexity < 30 or num_paths <= 2:
         return 1
@@ -723,30 +724,6 @@ def _make_group(paths: List[Dict], indices: List[int], complexity: float) -> Dic
     }
 
 
-def bbox_to_feature_coords(bbox: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
-    """
-    将 SVG viewbox 坐标的 bbox 映射到 feature map 的网格坐标 (32×32)。
-    返回: (row_start, row_end, col_start, col_end)
-
-    注意：此函数仅用于 groups.jsonl 写入元数据，训练时 PME 不再使用该坐标，
-    而是使用逐 group 独立渲染后的 post-merge 特征。保留此函数用于分析和可视化。
-    """
-    FEAT_GRID = 32  # legacy: 32×32 pre-merge patch grid
-    scale = FEAT_GRID / VIEWBOX_SIZE  # 32 / 200 = 0.16
-
-    col_start = int(bbox[0] * scale)
-    row_start = int(bbox[1] * scale)
-    col_end = max(int(math.ceil(bbox[2] * scale)), col_start + 1)
-    row_end = max(int(math.ceil(bbox[3] * scale)), row_start + 1)
-
-    col_start = max(0, min(col_start, FEAT_GRID - 1))
-    row_start = max(0, min(row_start, FEAT_GRID - 1))
-    col_end = max(1, min(col_end, FEAT_GRID))
-    row_end = max(1, min(row_end, FEAT_GRID))
-
-    return (row_start, row_end, col_start, col_end)
-
-
 def stage_groups(data_dir: str, output_dir: str):
     """
     解析所有样本的 SVG，计算 path 分组信息。
@@ -791,7 +768,6 @@ def stage_groups(data_dir: str, output_dir: str):
                 paths = parse_svg_paths(svg_str)
 
                 if not paths:
-                    # 无法解析的 SVG，创建默认单组
                     group_record = {
                         "idx": idx,
                         "num_paths": 0,
@@ -800,7 +776,6 @@ def stage_groups(data_dir: str, output_dir: str):
                         "groups": [{
                             "path_indices": [],
                             "bbox": (0, 0, VIEWBOX_SIZE, VIEWBOX_SIZE),
-                            "bbox_feature": (0, 32, 0, 32),
                             "complexity": 0,
                         }],
                     }
@@ -809,14 +784,11 @@ def stage_groups(data_dir: str, output_dir: str):
                     num_groups = decide_num_groups(total_complexity, len(paths))
                     groups = group_paths_sequential(paths, num_groups)
 
-                    # 添加 feature map 坐标
                     group_dicts = []
                     for g in groups:
-                        feat_coords = bbox_to_feature_coords(g["bbox"])
                         group_dicts.append({
                             "path_indices": g["path_indices"],
                             "bbox": list(g["bbox"]),
-                            "bbox_feature": list(feat_coords),
                             "complexity": round(g["complexity"], 2),
                         })
 
@@ -845,7 +817,6 @@ def stage_groups(data_dir: str, output_dir: str):
                     "groups": [{
                         "path_indices": [],
                         "bbox": [0, 0, VIEWBOX_SIZE, VIEWBOX_SIZE],
-                        "bbox_feature": [0, 32, 0, 32],
                         "complexity": 0,
                     }],
                 }
