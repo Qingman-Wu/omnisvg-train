@@ -217,7 +217,8 @@ hvm_precomputed/
 
 是只存global img的特征，对于local img特征，我们只需要从global img的 featuer map上面crop，所以只需要记录crop的bbox，但是实际按照目前分组方案，很多svg是最后一笔描一圈黑边，那这样的话，就会不同组的bbox几乎是重叠的，如下图所示，我们已经分好组group_0, group_1, group_2,  这里的group_0和group_3就是重叠的，那crop的local feature就是重叠的
 
-![e4dd4eaff98e9a721ad7009b9dc3f811](/Users/wuqingman/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_fed8ds0tr8io22_1f09/temp/RWTemp/2026-02/9e20f478899dc29eb19741386f9343c8/e4dd4eaff98e9a721ad7009b9dc3f811.png)
+<img width="1786" height="1378" alt="e4dd4eaff98e9a721ad7009b9dc3f811" src="https://github.com/user-attachments/assets/882ff3b3-465b-496b-bcc7-485571730180" />
+
 
 统一使用 Qwen2.5-VL merger 输出的 post-merge `[256, 3584]` 特征，缺点就是占用空间比较大，可能大约2t
 
