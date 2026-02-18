@@ -75,7 +75,7 @@ if _original is not None:
 MODEL_DEFAULTS = {
     "8B": {
         "base_model": "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct",
-        "checkpoint": "/mnt/data/wuqingman/models/OmniSVG/OmniSVG1.1_8B",
+        "checkpoint": "/mnt/data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B",
     },
 }
 

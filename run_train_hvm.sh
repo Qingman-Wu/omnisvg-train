@@ -4,9 +4,9 @@
 # =============================================================================
 #
 # 使用方法:
-#   bash run_train_hvm.sh                    # 默认 8 卡训练
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
-#   bash run_train_hvm.sh --num_gpus 8       # 8 卡训练
+#   bash run_train_hvm.sh --num_gpus 6       # 8 卡训练
+#   CUDA_VISIBLE_DEVICES=7 bash run_train_hvm.sh --num_gpus 1
 #   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-5000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 #
@@ -26,8 +26,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=8                          # GPU 数量
 
 # -- 数据 --
-DATA_DIR="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
-HVM_DIR="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
+HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -54,10 +54,10 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 opt
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data/wuqingman/omnisvg-train/outputs_hvm"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm"
 LOG_EVERY=10
 SAVE_EVERY=1000
-SWANLAB_MODE="local"                # cloud / local / disabled
+SWANLAB_MODE="cloud"                # cloud / local / disabled
 SWANLAB_RUN_NAME=""                 # 留空自动生成
 
 # -- 恢复训练 --
