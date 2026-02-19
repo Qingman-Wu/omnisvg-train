@@ -71,7 +71,7 @@ if _original is not None:
 # Model Loading
 # ============================================================================
 
-# Checkpoint paths (same as train.py)
+# Checkpoint paths (same as train.py) 只有在config/tokenization.yaml文件中没有指定checkpoint时使用
 MODEL_DEFAULTS = {
     "8B": {
         "base_model": "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct",
@@ -165,9 +165,9 @@ def train(args):
     hvm_config = HVMConfig(
         d_model=3584,
         d_vision=3584,       # post-merge dim (GME & PME 统一)
-        d_qformer=args.d_qformer,
-        d_pim_inner=args.d_pim_inner,
-        pim_layer_interval=args.pim_layer_interval,
+        d_qformer=args.d_qformer, #1024，QFormer 内部维度
+        d_pim_inner=args.d_pim_inner, #512，PIM attention bottleneck 维度
+        pim_layer_interval=args.pim_layer_interval, #4，每隔 N 层插入 PIM
         num_decoder_layers=28,
     )
 

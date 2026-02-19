@@ -1,12 +1,5 @@
-# HVM-SVG 训练与实验手册（自用）
+# HVM-SVG 训练与实验手册
 
-本文档是当前仓库中 HVM-SVG 方案的完整使用说明，目标是：
-
-- 快速复现：从 0 到可训练
-- 减少踩坑：明确每一步输入/输出与常见错误
-- 便于迭代：清楚知道哪些模块在起作用，哪些参数影响收敛
-
----
 
 ## 1. 项目目标与核心思路
 
@@ -14,7 +7,7 @@ HVM-SVG 用于缓解 OmniSVG 在复杂样本上的长序列退化（重复 path 
 
 核心做法：
 
-1. 对每个训练样本离线检索 Top-K 参考样本（RAG）
+1. 对每个训练样本离线检索 Top-3 参考样本（RAG）
 2. 参考图像预计算视觉特征（不在训练时跑 vision encoder）
 3. 用两类记忆编码器压缩视觉信息
    - GME（Gist Memory Encoder）：全局记忆，输入 3 张参考图的整图 post-merge 特征
@@ -151,23 +144,7 @@ cd build_faiss_index
 bash run_precompute.sh
 ```
 
-或手动分步运行：
 
-```bash
-python build_faiss_index/precompute_hvm_data.py --stage metadata
-python build_faiss_index/precompute_hvm_data.py --stage rag
-python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 0
-python build_faiss_index/precompute_hvm_data.py --stage groups
-python build_faiss_index/precompute_hvm_data.py --stage group_features --gpu_id 0
-```
-
-多卡提特征（示例 8 分片）：
-
-```bash
-python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 0 --num_shards 8 --shard_id 0
-python build_faiss_index/precompute_hvm_data.py --stage features --gpu_id 1 --num_shards 8 --shard_id 1
-...
-```
 
 ### 4.3 预计算目录检查
 
@@ -239,12 +216,8 @@ bash run_train_hvm.sh --hvm_ckpt /path/to/hvm_step_XXXX.pt
 
 建议实验期显式传入 `--warmup`，例如 500~2000。
 
-### 6.2 学习率参考
 
-- 初始试验：`1e-4` 或 `5e-5`
-- 若 loss 抖动明显：优先缩短 warmup、再考虑降 lr
-
-### 6.3 Gate 观察
+### 6.2 Gate 观察
 
 训练日志会打印：
 
@@ -272,37 +245,6 @@ bash run_train_hvm.sh --hvm_ckpt /path/to/hvm_step_XXXX.pt
 
 ---
 
-## 8. 常见问题排查（高频）
-
-### 8.1 现象：loss 不明显下降 / 看起来不收敛
-
-优先检查：
-
-1. warmup 是否过长（尤其 epochs 很大时）
-2. 当前 lr 是否仍很低（看日志 `lr=...`）
-3. gate 是否长期接近 0
-4. 数据规模是否过小导致波动（小数据下 step loss 抖动正常）
-
-### 8.2 现象：恢复训练后步数不对
-
-检查：
-
-- 是否用的是 `--resume`（不是 `--hvm_ckpt`）
-- `checkpoint-step-XXXX` 目录内是否有 `training_metadata.json`
-
-### 8.3 现象：某些 batch 报数据错误
-
-检查预计算完整性：
-
-- `metadata/rag/groups` 条数一致
-- 对应 `features/{idx}.pt` 是否存在
-- 对应 `group_features/{idx}.pt` 是否存在（至少 Top-1 参考需要有）
-
-### 8.4 现象：日志出现 `^[[A` 等字符
-
-这是终端控制字符（tqdm/光标移动）导致，不影响训练本身。
-
----
 
 ## 9. 张量维度速查表
 
@@ -340,35 +282,3 @@ bash run_train_hvm.sh --hvm_ckpt /path/to/hvm_step_XXXX.pt
 | `pim_layer_interval` | 4 | 每隔 N 层插入 PIM |
 
 ---
-
-## 10. 最小可复现流程（建议）
-
-1. 预计算完成后，先单卡 smoke test：
-
-```bash
-bash run_train_hvm.sh --num_gpus 1 --batch_size 1 --epochs 2 --warmup 10 --save_every 50
-```
-
-2. 看是否正常产生：
-
-- loss 日志
-- gate 日志
-- checkpoint 文件
-
-3. 再上多卡正式训练。
-
----
-
-## 11. 当前实现的已知改进方向（备忘）
-
-- optimizer 分组：给 gate / bias / norm 减小或去掉 weight decay
-- 更稳健的 epoch loss 统计（避免滑窗混用）
-- `hvm_dataset.py` 中临时文件异常清理（避免极端情况下 `/tmp` 堆积）
-- path complexity 进一步细化（命令类型 + 几何长度）
-
----
-
-## 12. 一句话总结
-
-当前 HVM-SVG 代码已经具备完整训练闭环（预计算 → 数据集 → 注入训练 → checkpoint 恢复），  
-后续提升效果的关键在于：**收敛配置（warmup/lr/optimizer 分组）与记忆模块强度（gate 学习动态）**。

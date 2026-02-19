@@ -212,7 +212,7 @@ class QFormer(nn.Module):
     ):
         super().__init__()
         self.num_queries = num_queries
-        self.d_qformer = d_qformer
+        self.d_qformer = d_qformer #1024
 
         # 可学习 queries
         self.queries = nn.Parameter(torch.randn(1, num_queries, d_qformer) * 0.02)
@@ -254,14 +254,14 @@ class QFormer(nn.Module):
         kv = self.input_norm(self.input_proj(image_feats))  # [B, N_img, d_qformer]
 
         # 扩展 queries 到 batch
-        queries = self.queries.expand(B, -1, -1)  # [B, N_query, d_qformer]
+        queries = self.queries.expand(B, -1, -1)  # [B, N_query, d_qformer] b,32,1024
 
         # 过 QFormer layers
         for layer in self.layers:
             queries = layer(queries, kv, kv_mask=feat_mask)
 
         # 输出投影
-        return self.output_norm(self.output_proj(queries))  # [B, N_query, d_out]
+        return self.output_norm(self.output_proj(queries))  # [B, N_query, d_out] b,32,3584
 
 
 # ============================================================================
@@ -277,10 +277,6 @@ class GistMemoryEncoder(nn.Module):
     输入: 3 张参考图的 post-merge features, 各 [B, 256, 3584]
     输出: gist_feats [B, 32, d_model]
 
-    相比旧版 pre-merge [32,32,1280]：
-      - QFormer 输入从 3×1024=3072 tokens 降到 3×256=768 tokens，快 4 倍
-      - 复用 Qwen 训练好的 merger 投影，特征质量更好
-      - 与 PME 统一 d_vision=3584，架构更简洁
     """
 
     def __init__(self, config: HVMConfig):
@@ -380,7 +376,7 @@ class PartMemoryEncoder(nn.Module):
         all_masks = []
 
         for b in range(B):
-            group_feats_list = group_features_list[b]  # List of [1024, D]
+            group_feats_list = group_features_list[b]  # List of [256, D] 256，3584
             group_outs = []
 
             for group_feat in group_feats_list:
@@ -400,8 +396,9 @@ class PartMemoryEncoder(nn.Module):
                 actual_len = 0
 
             # Pad 到 max_tokens
-            pad_len = self.max_tokens - actual_len
-            if pad_len > 0:
+            #1111111111这部分设计的是q=16，一个svg最多分为4group，每个group占4q，所以需要pad，但是后续更想改为引入top3的svg的局部信息，q超出16，再proj回来
+            pad_len = self.max_tokens - actual_len #max16
+            if pad_len > 0: 
                 padding = torch.zeros(pad_len, self.config.d_model, device=device, dtype=dtype)
                 sample_feats = torch.cat([sample_feats, padding], dim=0)
             else:
@@ -496,7 +493,7 @@ class PrefrontalInjectionModule(nn.Module):
         d = config.d_model
 
         # Step 1: Part × Gist Cross-Attention
-        self.part_gist_cross_attn = MultiHeadAttention(d, config.pim_num_heads, d_inner=config.d_pim_inner)
+        self.part_gist_cross_attn = MultiHeadAttention(d, config.pim_num_heads, d_inner=config.d_pim_inner)#512
         self.norm1 = nn.LayerNorm(d)
 
         # Step 2: Part Self-Attention

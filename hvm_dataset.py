@@ -56,8 +56,8 @@ class HVMDataset(Dataset):
         Args:
             data_dir: 原始 parquet 文件目录
             hvm_dir: HVM 预计算数据目录
-            token_config: SVG tokenization 配置
-            train_config: 训练配置
+            token_config: SVG tokenization 配置，/Users/wuqingman/Projects/omnisvg-train/configs/tokenization.yaml
+            train_config: 训练配置，/Users/wuqingman/Projects/omnisvg-train/configs/train_config.yaml
             max_len: 最大 SVG token 序列长度
         """
         self.data_dir = data_dir
@@ -289,7 +289,7 @@ def create_hvm_collate_fn(
     token_config: TokenizationConfig,
     text_len: int = 800,
     max_seq_length: int = 2048,
-    ref_text_max_length: int = 128,
+    ref_text_max_length: int = 128,#1111111111具体参数待定
 ):
     """
     创建 HVM 训练的 collate function。
@@ -350,7 +350,7 @@ def create_hvm_collate_fn(
             current_labels = [-100] * instruction_len + pix_seq
 
             # Padding (左侧)
-            pad_len = max_len - len(current_input_ids)
+            pad_len = max_len - len(current_input_ids) # 这部分参考omnisvg的train.py的_process_sample函数
             if pad_len > 0:
                 input_ids = [pad_token_id] * pad_len + current_input_ids
                 attention_mask = [0] * pad_len + current_attention_mask

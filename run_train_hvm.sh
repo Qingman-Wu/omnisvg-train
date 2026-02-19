@@ -6,7 +6,7 @@
 # 使用方法:
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
 #   bash run_train_hvm.sh --num_gpus 6       # 8 卡训练
-#   CUDA_VISIBLE_DEVICES=7 bash run_train_hvm.sh --num_gpus 1
+#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6
 #   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-5000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 #
