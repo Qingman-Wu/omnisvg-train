@@ -6,7 +6,7 @@
 # 使用方法:
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
 #   bash run_train_hvm.sh --num_gpus 6       # 8 卡训练
-#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6
+#   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7
 #   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-5000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 #
@@ -26,7 +26,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=8                          # GPU 数量
 
 # -- 数据 --
-DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
 HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
 
 # -- 模型 --
@@ -39,7 +39,7 @@ D_PIM_INNER=512                     # PIM attention bottleneck 维度
 PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 
 # -- 训练超参 --
-BATCH_SIZE=2                        # 每卡 batch size
+BATCH_SIZE=4                        # 每卡 batch size
 GRAD_ACCUM=4                        # 梯度累积步数
 EPOCHS=30000
 LEARNING_RATE=1e-4

@@ -47,7 +47,7 @@ from tqdm import tqdm
 # Configuration
 # ============================================================================
 
-DEFAULT_DATA_DIR = "/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
+DEFAULT_DATA_DIR = "/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
 DEFAULT_MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
 DEFAULT_OUTPUT_DIR = "/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
