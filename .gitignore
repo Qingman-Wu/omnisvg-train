@@ -45,3 +45,5 @@ Thumbs.db
 
 deepsvg/__pycache__/**/__pycache__/
 outputs_hvm/
+inference/
+outputs*

@@ -160,14 +160,23 @@ class HVMSketchDecoder(nn.Module):
             else:
                 hidden_states = output
 
+            # generate() with num_return_sequences>1 会扩展 batch，
+            # 需要将缓存的 HVM 特征扩展到匹配的 batch size
+            B = hidden_states.shape[0]
+            gist_feats = self._gist_feats.expand(B, -1, -1)
+            part_feats = self._part_feats.expand(B, -1, -1)
+            text_feats = self._text_feats.expand(B, -1, -1)
+            part_mask = self._part_mask.expand(B, -1)
+            text_mask = self._text_mask.expand(B, -1) if self._text_mask is not None else None
+
             # 应用 PIM
             hidden_states = self.pims[pim_idx](
                 hidden_states,
-                self._gist_feats,
-                self._part_feats,
-                self._text_feats,
-                self._part_mask,
-                self._text_mask,
+                gist_feats,
+                part_feats,
+                text_feats,
+                part_mask,
+                text_mask,
             )
 
             # 返回修改后的 output

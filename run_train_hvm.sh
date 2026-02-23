@@ -7,7 +7,8 @@
 #   bash run_train_hvm.sh --num_gpus 1       # 单卡调试
 #   bash run_train_hvm.sh --num_gpus 6       # 8 卡训练
 #   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7
-#   bash run_train_hvm.sh --resume /mnt/data/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-5000  # 恢复完整训练状态
+#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --warmup 200
+#   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7 --resume /mnt/data2/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-4000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 #
 # =============================================================================
@@ -23,7 +24,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=8                          # GPU 数量
+NUM_GPUS=6
 
 # -- 数据 --
 DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
@@ -42,10 +43,10 @@ PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 BATCH_SIZE=4                        # 每卡 batch size
 GRAD_ACCUM=4                        # 梯度累积步数
 EPOCHS=30000
-LEARNING_RATE=1e-4
+LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
-WARMUP_STEPS=""  # 为空时自动使用 10% of total steps
+WARMUP_STEPS=100
 SEED=42
 MIXED_PRECISION="bf16"              # 混合精度: bf16 / fp16 / no
 ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 optimizer states)
@@ -54,15 +55,15 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 opt
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18"
 LOG_EVERY=10
 SAVE_EVERY=1000
 SWANLAB_MODE="cloud"                # cloud / local / disabled
 SWANLAB_RUN_NAME=""                 # 留空自动生成
 
 # -- 恢复训练 --
-RESUME_FROM=""                      # 完整训练 checkpoint 目录 (含 optimizer/scheduler/step)
-HVM_CHECKPOINT=""                   # HVM-only 权重 .pt (仅加载模型权重, 不恢复训练状态)
+RESUME_FROM=""
+HVM_CHECKPOINT="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18/hvm_step_5000.pt"
 
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
