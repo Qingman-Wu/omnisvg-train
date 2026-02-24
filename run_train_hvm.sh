@@ -57,7 +57,7 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 opt
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_24_22_09"
 LOG_EVERY=10
 SAVE_EVERY=1000
 SWANLAB_MODE="cloud"                # cloud / local / disabled
@@ -65,7 +65,8 @@ SWANLAB_RUN_NAME=""                 # 留空自动生成
 
 # -- 恢复训练 --
 RESUME_FROM=""
-HVM_CHECKPOINT="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18/hvm_step_5000.pt"
+# HVM_CHECKPOINT="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18/hvm_step_5000.pt"
+HVM_CHECKPOINT=""
 
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
@@ -176,25 +177,7 @@ elif [ -n "$HVM_CHECKPOINT" ]; then
 fi
 
 # ===================== 保存启动快照 =====================
-SNAPSHOT_SCRIPT="${OUTPUT_DIR}/run_train_hvm.snapshot.sh"
-SNAPSHOT_LAUNCH="${OUTPUT_DIR}/launch_resolved.snapshot.sh"
-
-cp "$SCRIPT_PATH" "$SNAPSHOT_SCRIPT"
-
-{
-    echo "#!/bin/bash"
-    echo "set -e"
-    echo "export CUDA_HOME=\"$CUDA_HOME\""
-    echo "export TOKENIZERS_PARALLELISM=false"
-    if [ "$NUM_GPUS" -eq 1 ]; then
-        printf '"%s" launch --num_processes 1 --mixed_precision "%s" train_hvm.py' "$ACCELERATE" "$MIXED_PRECISION"
-    else
-        printf '"%s" launch --config_file "%s" --num_processes "%s" train_hvm.py' "$ACCELERATE" "$ACCELERATE_CONFIG" "$NUM_GPUS"
-    fi
-    printf ' %q' "${TRAIN_ARGS[@]}"
-    echo
-} > "$SNAPSHOT_LAUNCH"
-chmod +x "$SNAPSHOT_LAUNCH"
+cp "$SCRIPT_PATH" "${OUTPUT_DIR}/run_train_hvm.snapshot.sh"
 
 # ===================== 启动训练 =====================
 # 使用 DeepSpeed ZeRO-2 训练:
