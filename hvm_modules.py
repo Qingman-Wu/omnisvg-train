@@ -51,6 +51,7 @@ class HVMConfig:
     pim_num_heads: int = 8
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
+    gate_alpha_init: float = 0.05  # 冷启动更平滑: tanh(0.05)≈0.05，避免 PIM 主干梯度过弱
 
     # === RAG ===
     num_references: int = 3
@@ -433,11 +434,11 @@ class AdaptiveGate(nn.Module):
     关键: 初始化确保训练初期 PIM 几乎不影响 decoder。
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, base_alpha_init: float = 0.0):
         super().__init__()
 
         # 层级 gate: tanh(alpha), alpha 初始化为 0 → tanh(0) = 0
-        self.base_alpha = nn.Parameter(torch.tensor(0.0))
+        self.base_alpha = nn.Parameter(torch.tensor(float(base_alpha_init)))
 
         # Token 级 gate: input-dependent
         d_gate = d_model // 4
@@ -450,6 +451,9 @@ class AdaptiveGate(nn.Module):
         # 最后一层 Linear 初始化为 0，确保 sigmoid(0)=0.5
         nn.init.zeros_(self.token_gate[-1].weight)
         nn.init.zeros_(self.token_gate[-1].bias)
+
+        # 最近一次 forward 的诊断统计（用于训练日志）
+        self.last_stats = {}
 
     def forward(self, hidden_state: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         """
@@ -468,7 +472,23 @@ class AdaptiveGate(nn.Module):
         token_gate = torch.sigmoid(self.token_gate(gate_input))  # [B, L, 1]
 
         # 组合注入
-        return hidden_state + layer_gate * token_gate * delta
+        injection = layer_gate * token_gate * delta
+
+        # 记录诊断统计（detach，避免额外反向图）
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_rms = delta.detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "layer_gate": layer_gate.detach().float(),
+                "token_gate_mean": token_gate.detach().float().mean(),
+                "token_gate_std": token_gate.detach().float().std(unbiased=False),
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
 
 
 # ============================================================================
@@ -508,7 +528,7 @@ class PrefrontalInjectionModule(nn.Module):
         self.hidden_aligned_cross_attn = MultiHeadAttention(d, config.pim_num_heads, d_inner=config.d_pim_inner)
 
         # Step 5: Adaptive Gate
-        self.gate = AdaptiveGate(d)
+        self.gate = AdaptiveGate(d, base_alpha_init=config.gate_alpha_init)
 
     def forward(
         self,

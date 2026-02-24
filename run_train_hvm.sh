@@ -14,6 +14,7 @@
 # =============================================================================
 
 set -e
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # ===================== 环境配置 =====================
 export CUDA_HOME="/mnt/data/wuqingman/miniconda3/envs/omnisvg"
@@ -38,6 +39,7 @@ OMNISVG_CHECKPOINT=""               # 留空使用默认路径
 D_QFORMER=1024                      # QFormer 内部维度
 D_PIM_INNER=512                     # PIM attention bottleneck 维度
 PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
+GATE_ALPHA_INIT=0.05                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
 
 # -- 训练超参 --
 BATCH_SIZE=4                        # 每卡 batch size
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --warmup)         WARMUP_STEPS="$2";        shift 2 ;;
         --resume)         RESUME_FROM="$2";         shift 2 ;;
         --hvm_ckpt)       HVM_CHECKPOINT="$2";      shift 2 ;;
+        --gate_alpha_init) GATE_ALPHA_INIT="$2";    shift 2 ;;
         --output_dir)     OUTPUT_DIR="$2";          shift 2 ;;
         --data_dir)       DATA_DIR="$2";            shift 2 ;;
         --hvm_dir)        HVM_DIR="$2";             shift 2 ;;
@@ -107,6 +110,8 @@ if [ -z "$SWANLAB_RUN_NAME" ]; then
 fi
 
 # ===================== 打印配置 =====================
+mkdir -p "${OUTPUT_DIR}"
+
 echo "============================================================"
 echo "HVM-SVG Training Configuration"
 echo "============================================================"
@@ -116,6 +121,7 @@ echo "  Gradient accum:    ${GRAD_ACCUM}"
 echo "  Effective BS:      ${EFFECTIVE_BS}"
 echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
+echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
 echo "  Mixed precision:   ${MIXED_PRECISION}"
 echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
@@ -136,6 +142,7 @@ TRAIN_ARGS=(
     --d_qformer "$D_QFORMER"
     --d_pim_inner "$D_PIM_INNER"
     --pim_layer_interval "$PIM_LAYER_INTERVAL"
+    --gate_alpha_init "$GATE_ALPHA_INIT"
     --batch_size "$BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --epochs "$EPOCHS"
@@ -167,6 +174,27 @@ if [ -n "$RESUME_FROM" ]; then
 elif [ -n "$HVM_CHECKPOINT" ]; then
     TRAIN_ARGS+=(--hvm_checkpoint "$HVM_CHECKPOINT")
 fi
+
+# ===================== 保存启动快照 =====================
+SNAPSHOT_SCRIPT="${OUTPUT_DIR}/run_train_hvm.snapshot.sh"
+SNAPSHOT_LAUNCH="${OUTPUT_DIR}/launch_resolved.snapshot.sh"
+
+cp "$SCRIPT_PATH" "$SNAPSHOT_SCRIPT"
+
+{
+    echo "#!/bin/bash"
+    echo "set -e"
+    echo "export CUDA_HOME=\"$CUDA_HOME\""
+    echo "export TOKENIZERS_PARALLELISM=false"
+    if [ "$NUM_GPUS" -eq 1 ]; then
+        printf '"%s" launch --num_processes 1 --mixed_precision "%s" train_hvm.py' "$ACCELERATE" "$MIXED_PRECISION"
+    else
+        printf '"%s" launch --config_file "%s" --num_processes "%s" train_hvm.py' "$ACCELERATE" "$ACCELERATE_CONFIG" "$NUM_GPUS"
+    fi
+    printf ' %q' "${TRAIN_ARGS[@]}"
+    echo
+} > "$SNAPSHOT_LAUNCH"
+chmod +x "$SNAPSHOT_LAUNCH"
 
 # ===================== 启动训练 =====================
 # 使用 DeepSpeed ZeRO-2 训练:

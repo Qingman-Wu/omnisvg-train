@@ -26,6 +26,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import json
 import math
+import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -149,6 +150,98 @@ def compute_loss(
     return loss
 
 
+def _param_grad_norm(param: Optional[torch.nn.Parameter]) -> Optional[float]:
+    """返回参数梯度 L2 norm（若当前步无梯度则返回 None）。"""
+    if param is None or param.grad is None:
+        return None
+    return float(param.grad.detach().float().norm().item())
+
+
+def _scalar_tensor_to_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().float().item())
+    return float(x)
+
+
+def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
+    """
+    采集 HVM 训练诊断信息：
+      - 代表性梯度范数（用于判断是否只有 gate 在学习）
+      - 每个 PIM 的 gate / token_gate / 注入强度
+    """
+    stats: Dict[str, float] = {}
+
+    # 代表性梯度（避免遍历全部参数，减小开销）
+    grad_targets = {
+        "grad/gme_input_proj": unwrapped_model.gme.qformer.input_proj.weight,
+        "grad/pme_input_proj": unwrapped_model.pme.qformer.input_proj.weight,
+        "grad/pim0_hidden_attn_q": unwrapped_model.pims[0].hidden_aligned_cross_attn.to_q.weight,
+        "grad/pim0_gate_alpha": unwrapped_model.pims[0].gate.base_alpha,
+        "grad/pim_last_gate_alpha": unwrapped_model.pims[-1].gate.base_alpha,
+    }
+    for key, param in grad_targets.items():
+        grad_norm = _param_grad_norm(param)
+        if grad_norm is not None:
+            stats[key] = grad_norm
+
+    # Gate 运行时统计（来自 AdaptiveGate.last_stats）
+    for pim_idx, pim in enumerate(unwrapped_model.pims):
+        gate = pim.gate
+        stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(gate.base_alpha.detach()).item())
+        last_stats = getattr(gate, "last_stats", None) or {}
+        for src_key, dst_key in [
+            ("token_gate_mean", f"gate/pim_{pim_idx}_token_mean"),
+            ("token_gate_std", f"gate/pim_{pim_idx}_token_std"),
+            ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+            ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+            ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+        ]:
+            val = _scalar_tensor_to_float(last_stats.get(src_key))
+            if val is not None:
+                stats[dst_key] = val
+
+    return stats
+
+
+def get_git_metadata(workdir: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    获取当前代码版本信息（用于实验可复现性）。
+    返回字段:
+      - git_commit: 完整 commit hash 或 None
+      - git_commit_short: 短 hash 或 None
+      - git_branch: 分支名或 None
+      - git_dirty: bool / None (非 git 仓库或获取失败时为 None)
+    """
+    cwd = str(workdir) if workdir is not None else None
+
+    def _run_git(args: List[str]) -> Optional[str]:
+        try:
+            out = subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL)
+            return out.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return None
+
+    commit = _run_git(["rev-parse", "HEAD"])
+    commit_short = _run_git(["rev-parse", "--short", "HEAD"])
+    branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    status = _run_git(["status", "--porcelain"])
+
+    git_dirty: Optional[bool]
+    if status is None:
+        git_dirty = None
+    else:
+        git_dirty = len(status.strip()) > 0
+
+    return {
+        "git_commit": commit,
+        "git_commit_short": commit_short,
+        "git_branch": branch,
+        "git_dirty": git_dirty,
+    }
+
+
 # ============================================================================
 # Training
 # ============================================================================
@@ -169,6 +262,7 @@ def train(args):
         d_pim_inner=args.d_pim_inner, #512，PIM attention bottleneck 维度
         pim_layer_interval=args.pim_layer_interval, #4，每隔 N 层插入 PIM
         num_decoder_layers=28,
+        gate_alpha_init=args.gate_alpha_init,
     )
 
     # ---- Accelerator ----
@@ -320,8 +414,15 @@ def train(args):
 
     # ---- Output dir & SwanLab ----
     output_dir = Path(args.output_dir)
+    git_meta = get_git_metadata(Path.cwd())
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        accelerator.print(
+            f"Git: branch={git_meta.get('git_branch')} "
+            f"commit={git_meta.get('git_commit_short')} "
+            f"dirty={git_meta.get('git_dirty')}"
+        )
 
         # 初始化 SwanLab
         swanlab.init(
@@ -334,14 +435,19 @@ def train(args):
                 "num_pims": hvm_config.num_pims,
                 "pim_layers": hvm_config.pim_layer_indices,
                 "trainable_params_M": sum(p.numel() for p in trainable_params) / 1e6,
+                **git_meta,
             },
             logdir=str(output_dir / "swanlog"),
             mode=args.swanlab_mode,
         )
 
         # 保存配置
+        run_config = {
+            **vars(args),
+            **git_meta,
+        }
         with open(output_dir / "hvm_config.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump(run_config, f, indent=2)
         with open(output_dir / "hvm_model_config.json", "w") as f:
             # __dict__ 不包含 @property，需手动补充
             config_dict = {
@@ -414,6 +520,15 @@ def train(args):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
+                    next_step = global_step + 1
+                    should_log = (next_step % args.log_every == 0)
+                    should_print_gates = (next_step % (args.log_every * 10) == 0)
+
+                    diag_stats = None
+                    if should_log or should_print_gates:
+                        unwrapped = accelerator.unwrap_model(model)
+                        diag_stats = collect_hvm_diagnostics(unwrapped)
+
                     # Gradient clipping (只遍历可训练参数，跳过冻结的 8.6B base model)
                     accelerator.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad],
@@ -436,7 +551,7 @@ def train(args):
                     })
 
                     # ---- Logging ----
-                    if global_step % args.log_every == 0 and accelerator.is_main_process:
+                    if should_log and accelerator.is_main_process:
                         avg = np.mean(epoch_losses[-args.log_every:])
 
                         log_dict = {
@@ -445,11 +560,8 @@ def train(args):
                             "train/lr": lr_scheduler.get_last_lr()[0],
                         }
 
-                        # Log gate values
-                        unwrapped = accelerator.unwrap_model(model)
-                        for pim_idx, pim in enumerate(unwrapped.pims):
-                            alpha = pim.gate.base_alpha.item()
-                            log_dict[f"gate/pim_{pim_idx}_tanh_alpha"] = torch.tanh(torch.tensor(alpha)).item()
+                        if diag_stats:
+                            log_dict.update(diag_stats)
 
                         swanlab.log(log_dict, step=global_step)
 
@@ -472,14 +584,39 @@ def train(args):
                         accelerator.wait_for_everyone()
 
                     # ---- Print gate status ----
-                    if global_step % (args.log_every * 10) == 0:
-                        unwrapped = accelerator.unwrap_model(model)
+                    if should_print_gates:
+                        if diag_stats is None:
+                            unwrapped = accelerator.unwrap_model(model)
+                            diag_stats = collect_hvm_diagnostics(unwrapped)
+
                         gate_vals = []
-                        for pim in unwrapped.pims:
-                            gate_vals.append(f"{torch.tanh(pim.gate.base_alpha).item():.4f}")
-                        accelerator.print(
-                            f"  Step {global_step} | Gates: [{', '.join(gate_vals)}]"
+                        inject_ratios = []
+                        for pim_idx in range(hvm_config.num_pims):
+                            gate_key = f"gate/pim_{pim_idx}_tanh_alpha"
+                            ratio_key = f"gate/pim_{pim_idx}_inject_hidden_ratio"
+                            if gate_key in diag_stats:
+                                gate_vals.append(f"{diag_stats[gate_key]:.4f}")
+                            if ratio_key in diag_stats:
+                                inject_ratios.append(f"{diag_stats[ratio_key]:.4e}")
+
+                        grad_summary_keys = [
+                            "grad/gme_input_proj",
+                            "grad/pme_input_proj",
+                            "grad/pim0_hidden_attn_q",
+                            "grad/pim0_gate_alpha",
+                            "grad/pim_last_gate_alpha",
+                        ]
+                        grad_summary = ", ".join(
+                            f"{k.split('/')[-1]}={diag_stats[k]:.2e}"
+                            for k in grad_summary_keys if diag_stats and k in diag_stats
                         )
+
+                        msg = f"  Step {global_step} | Gates: [{', '.join(gate_vals)}]"
+                        if inject_ratios:
+                            msg += f" | InjectRatio: [{', '.join(inject_ratios)}]"
+                        if grad_summary:
+                            msg += f" | Grads: {grad_summary}"
+                        accelerator.print(msg)
 
         progress_bar.close()
 
@@ -514,6 +651,8 @@ def parse_args():
     parser.add_argument("--d_qformer", type=int, default=1024)
     parser.add_argument("--d_pim_inner", type=int, default=512)
     parser.add_argument("--pim_layer_interval", type=int, default=4)
+    parser.add_argument("--gate_alpha_init", type=float, default=0.05,
+                        help="Initial value for AdaptiveGate base_alpha (default: 0.05)")
 
     # Data
     parser.add_argument("--data_dir", type=str,
