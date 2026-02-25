@@ -39,7 +39,7 @@ OMNISVG_CHECKPOINT=""               # 留空使用默认路径
 D_QFORMER=1024                      # QFormer 内部维度
 D_PIM_INNER=512                     # PIM attention bottleneck 维度
 PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
-GATE_ALPHA_INIT=0.05                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
+GATE_ALPHA_INIT=0.0                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
 
 # -- 训练超参 --
 BATCH_SIZE=4                        # 每卡 batch size
