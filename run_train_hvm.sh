@@ -57,7 +57,7 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 opt
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_24_22_09"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_25_11_07"
 LOG_EVERY=10
 SAVE_EVERY=1000
 SWANLAB_MODE="cloud"                # cloud / local / disabled
