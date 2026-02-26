@@ -11,8 +11,13 @@
 #   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7 --resume /mnt/data2/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-4000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
 
+#   # Stage1 (GME-only + last-layer single PIM + fixed scale)
+#   # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 --pim_layer_indices -1 --output_dir ./outputs_s1_fixed003
+#   # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.1  --pim_layer_indices -1 --output_dir ./outputs_s1_fixed010
+
 
 #   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --disable_hvm --epochs 3000 --output_dir ./outputs_baseline --run_name "baseline-no-hvm" --save_every 999999
+# CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 --pim_layer_indices -1 --run_name s1_gme_last1_fixed003 --output_dir /mnt/data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03
 # =============================================================================
 
 set -e
@@ -42,6 +47,10 @@ D_QFORMER=1024                      # QFormer 内部维度
 D_PIM_INNER=512                     # PIM attention bottleneck 维度
 PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 GATE_ALPHA_INIT=0.0                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
+MEMORY_MODE="full"                  # full / gme
+INJECT_MODE="adaptive"              # adaptive / fixed
+INJECT_SCALE=0.1                    # fixed 注入强度
+PIM_LAYER_INDICES=""                # 逗号分隔层索引，支持 -1 表示最后一层
 
 # -- 训练超参 --
 BATCH_SIZE=4                        # 每卡 batch size
@@ -85,6 +94,10 @@ while [[ $# -gt 0 ]]; do
         --resume)         RESUME_FROM="$2";         shift 2 ;;
         --hvm_ckpt)       HVM_CHECKPOINT="$2";      shift 2 ;;
         --gate_alpha_init) GATE_ALPHA_INIT="$2";    shift 2 ;;
+        --memory_mode)    MEMORY_MODE="$2";         shift 2 ;;
+        --inject_mode)    INJECT_MODE="$2";         shift 2 ;;
+        --inject_scale)   INJECT_SCALE="$2";        shift 2 ;;
+        --pim_layer_indices|--pim_layers) PIM_LAYER_INDICES="$2"; shift 2 ;;
         --output_dir)     OUTPUT_DIR="$2";          shift 2 ;;
         --data_dir)       DATA_DIR="$2";            shift 2 ;;
         --hvm_dir)        HVM_DIR="$2";             shift 2 ;;
@@ -129,6 +142,14 @@ echo "  Effective BS:      ${EFFECTIVE_BS}"
 echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
 echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
+echo "  Memory mode:       ${MEMORY_MODE}"
+echo "  Inject mode:       ${INJECT_MODE}"
+echo "  Inject scale:      ${INJECT_SCALE}"
+if [ -n "$PIM_LAYER_INDICES" ]; then
+    echo "  PIM layers:        ${PIM_LAYER_INDICES}"
+else
+    echo "  PIM interval:      every ${PIM_LAYER_INTERVAL} layers"
+fi
 echo "  Mixed precision:   ${MIXED_PRECISION}"
 echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
@@ -152,6 +173,9 @@ TRAIN_ARGS=(
     --d_qformer "$D_QFORMER"
     --d_pim_inner "$D_PIM_INNER"
     --pim_layer_interval "$PIM_LAYER_INTERVAL"
+    --memory_mode "$MEMORY_MODE"
+    --inject_mode "$INJECT_MODE"
+    --inject_scale "$INJECT_SCALE"
     --gate_alpha_init "$GATE_ALPHA_INIT"
     --batch_size "$BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACCUM"
@@ -167,6 +191,10 @@ TRAIN_ARGS=(
     --swanlab_mode "$SWANLAB_MODE"
     --swanlab_run_name "$SWANLAB_RUN_NAME"
 )
+
+if [ -n "$PIM_LAYER_INDICES" ]; then
+    TRAIN_ARGS+=(--pim_layer_indices "$PIM_LAYER_INDICES")
+fi
 
 # Warmup steps (为空时由 train_hvm.py 自动计算为 10% of total)
 if [ -n "$WARMUP_STEPS" ]; then

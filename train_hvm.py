@@ -165,6 +165,42 @@ def _scalar_tensor_to_float(x: Any) -> Optional[float]:
     return float(x)
 
 
+def parse_pim_layer_indices(spec: Optional[str], num_decoder_layers: int) -> Optional[List[int]]:
+    """
+    解析逗号分隔的 PIM 层索引字符串，支持 -1 表示最后一层。
+    例如: "-1" / "3,7,11"
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+
+    indices: List[int] = []
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid pim layer index '{token}', expected integer.") from exc
+
+        if idx == -1:
+            idx = num_decoder_layers - 1
+        if idx < 0 or idx >= num_decoder_layers:
+            raise ValueError(
+                f"PIM layer index {idx} out of range [0, {num_decoder_layers - 1}] "
+                f"(original token: '{token}')."
+            )
+        if idx not in indices:
+            indices.append(idx)
+
+    if not indices:
+        raise ValueError("pim_layer_indices is empty after parsing.")
+    return indices
+
+
 def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
     """
     采集 HVM 训练诊断信息：
@@ -176,31 +212,56 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
     # 代表性梯度（避免遍历全部参数，减小开销）
     grad_targets = {
         "grad/gme_input_proj": unwrapped_model.gme.qformer.input_proj.weight,
-        "grad/pme_input_proj": unwrapped_model.pme.qformer.input_proj.weight,
-        "grad/pim0_hidden_attn_q": unwrapped_model.pims[0].hidden_aligned_cross_attn.to_q.weight,
-        "grad/pim0_gate_alpha": unwrapped_model.pims[0].gate.base_alpha,
-        "grad/pim_last_gate_alpha": unwrapped_model.pims[-1].gate.base_alpha,
     }
+    if getattr(unwrapped_model, "pme", None) is not None:
+        grad_targets["grad/pme_input_proj"] = unwrapped_model.pme.qformer.input_proj.weight
+
+    if len(unwrapped_model.pims) > 0:
+        pim0 = unwrapped_model.pims[0]
+        pim_last = unwrapped_model.pims[-1]
+        if hasattr(pim0, "hidden_aligned_cross_attn"):
+            grad_targets["grad/pim0_hidden_attn_q"] = pim0.hidden_aligned_cross_attn.to_q.weight
+        elif hasattr(pim0, "hidden_gist_cross_attn"):
+            grad_targets["grad/pim0_hidden_gist_attn_q"] = pim0.hidden_gist_cross_attn.to_q.weight
+        if hasattr(pim0, "gate"):
+            grad_targets["grad/pim0_gate_alpha"] = pim0.gate.base_alpha
+        if hasattr(pim_last, "gate"):
+            grad_targets["grad/pim_last_gate_alpha"] = pim_last.gate.base_alpha
+
     for key, param in grad_targets.items():
         grad_norm = _param_grad_norm(param)
         if grad_norm is not None:
             stats[key] = grad_norm
 
-    # Gate 运行时统计（来自 AdaptiveGate.last_stats）
+    # PIM 运行时统计（full 模式来自 gate.last_stats，simple 模式来自 pim.last_stats）
     for pim_idx, pim in enumerate(unwrapped_model.pims):
-        gate = pim.gate
-        stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(gate.base_alpha.detach()).item())
-        last_stats = getattr(gate, "last_stats", None) or {}
-        for src_key, dst_key in [
-            ("token_gate_mean", f"gate/pim_{pim_idx}_token_mean"),
-            ("token_gate_std", f"gate/pim_{pim_idx}_token_std"),
-            ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
-            ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
-            ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
-        ]:
-            val = _scalar_tensor_to_float(last_stats.get(src_key))
-            if val is not None:
-                stats[dst_key] = val
+        if hasattr(pim, "gate"):
+            gate = pim.gate
+            stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(gate.base_alpha.detach()).item())
+            last_stats = getattr(gate, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("token_gate_mean", f"gate/pim_{pim_idx}_token_mean"),
+                ("token_gate_std", f"gate/pim_{pim_idx}_token_std"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
+        else:
+            last_stats = getattr(pim, "last_stats", None) or {}
+            inject_scale = _scalar_tensor_to_float(last_stats.get("inject_scale"))
+            if inject_scale is not None:
+                stats[f"inject/pim_{pim_idx}_scale"] = inject_scale
+            for src_key, dst_key in [
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
 
     return stats
 
@@ -263,6 +324,10 @@ def train(args):
         pim_layer_interval=args.pim_layer_interval, #4，每隔 N 层插入 PIM
         num_decoder_layers=28,
         gate_alpha_init=args.gate_alpha_init,
+        memory_mode=args.memory_mode,
+        inject_mode=args.inject_mode,
+        inject_scale=args.inject_scale,
+        pim_layer_indices_override=args.pim_layer_indices,
     )
 
     # ---- Accelerator ----
@@ -471,6 +536,10 @@ def train(args):
     accelerator.print(f"  Total steps: {total_training_steps}")
     accelerator.print(f"  Warmup steps: {warmup_steps}")
     if not args.disable_hvm:
+        accelerator.print(f"  Memory mode: {hvm_config.memory_mode}")
+        accelerator.print(f"  Inject mode: {hvm_config.inject_mode}")
+        if hvm_config.inject_mode == "fixed":
+            accelerator.print(f"  Inject scale: {hvm_config.inject_scale}")
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
@@ -606,9 +675,12 @@ def train(args):
                         inject_ratios = []
                         for pim_idx in range(hvm_config.num_pims):
                             gate_key = f"gate/pim_{pim_idx}_tanh_alpha"
+                            scale_key = f"inject/pim_{pim_idx}_scale"
                             ratio_key = f"gate/pim_{pim_idx}_inject_hidden_ratio"
                             if gate_key in diag_stats:
                                 gate_vals.append(f"{diag_stats[gate_key]:.4f}")
+                            elif scale_key in diag_stats:
+                                gate_vals.append(f"fixed={diag_stats[scale_key]:.4f}")
                             if ratio_key in diag_stats:
                                 inject_ratios.append(f"{diag_stats[ratio_key]:.4e}")
 
@@ -616,6 +688,7 @@ def train(args):
                             "grad/gme_input_proj",
                             "grad/pme_input_proj",
                             "grad/pim0_hidden_attn_q",
+                            "grad/pim0_hidden_gist_attn_q",
                             "grad/pim0_gate_alpha",
                             "grad/pim_last_gate_alpha",
                         ]
@@ -624,7 +697,8 @@ def train(args):
                             for k in grad_summary_keys if diag_stats and k in diag_stats
                         )
 
-                        msg = f"  Step {global_step} | Gates: [{', '.join(gate_vals)}]"
+                        gate_label = "Scales" if hvm_config.inject_mode == "fixed" else "Gates"
+                        msg = f"  Step {global_step} | {gate_label}: [{', '.join(gate_vals)}]"
                         if inject_ratios:
                             msg += f" | InjectRatio: [{', '.join(inject_ratios)}]"
                         if grad_summary:
@@ -664,6 +738,15 @@ def parse_args():
     parser.add_argument("--d_qformer", type=int, default=1024)
     parser.add_argument("--d_pim_inner", type=int, default=512)
     parser.add_argument("--pim_layer_interval", type=int, default=4)
+    parser.add_argument("--pim_layer_indices", type=str, default=None,
+                        help="Comma-separated decoder layer indices for PIM hooks. "
+                             "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
+    parser.add_argument("--memory_mode", type=str, default="full", choices=["full", "gme"],
+                        help="Memory pipeline: full (GME+PME) or gme (GME-only simple path).")
+    parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
+                        help="Injection mode: adaptive gate (full) or fixed scale (simple).")
+    parser.add_argument("--inject_scale", type=float, default=0.1,
+                        help="Fixed injection scale for inject_mode=fixed.")
     parser.add_argument("--gate_alpha_init", type=float, default=0.05,
                         help="Initial value for AdaptiveGate base_alpha (default: 0.05)")
 
@@ -718,6 +801,19 @@ def parse_args():
         parser.error("--resume_from and --hvm_checkpoint are mutually exclusive. "
                      "Use --resume_from for full training resume, "
                      "--hvm_checkpoint for HVM weight initialization only.")
+
+    try:
+        args.pim_layer_indices = parse_pim_layer_indices(args.pim_layer_indices, num_decoder_layers=28)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.inject_scale <= 0:
+        parser.error("--inject_scale must be > 0.")
+
+    if args.memory_mode == "gme" and args.inject_mode != "fixed":
+        parser.error("memory_mode='gme' currently supports only inject_mode='fixed'.")
+    if args.memory_mode == "full" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
 
     return args
 

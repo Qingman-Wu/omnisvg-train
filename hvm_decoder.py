@@ -22,6 +22,7 @@ from hvm_modules import (
     GistMemoryEncoder,
     PartMemoryEncoder,
     PrefrontalInjectionModule,
+    SimpleGMEInjectionModule,
     count_parameters,
 )
 
@@ -68,11 +69,18 @@ class HVMSketchDecoder(nn.Module):
 
         # ---- HVM Modules (trainable) ----
         self.gme = GistMemoryEncoder(hvm_config)
-        self.pme = PartMemoryEncoder(hvm_config)
-        self.pims = nn.ModuleList([
-            PrefrontalInjectionModule(hvm_config)
-            for _ in range(hvm_config.num_pims)
-        ])
+        if hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "fixed":
+            self.pme = None
+            self.pims = nn.ModuleList([
+                SimpleGMEInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
+        else:
+            self.pme = PartMemoryEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                PrefrontalInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
 
         # ---- 统一 dtype: HVM 模块与 base model 一致 (bfloat16) ----
         # HVM 参数保持 bf16 以节省显存（428M params × 2 bytes vs × 4 bytes = 省 ~3.4GB/GPU）
@@ -81,7 +89,8 @@ class HVMSketchDecoder(nn.Module):
         # optimizer 更新也在 float32 上进行，避免小梯度 round to zero
         base_dtype = next(self.base_model.parameters()).dtype
         self.gme = self.gme.to(dtype=base_dtype)
-        self.pme = self.pme.to(dtype=base_dtype)
+        if self.pme is not None:
+            self.pme = self.pme.to(dtype=base_dtype)
         self.pims = self.pims.to(dtype=base_dtype)
         print(f"[HVM] HVM modules dtype set to {base_dtype}")
 
@@ -164,20 +173,26 @@ class HVMSketchDecoder(nn.Module):
             # 需要将缓存的 HVM 特征扩展到匹配的 batch size
             B = hidden_states.shape[0]
             gist_feats = self._gist_feats.expand(B, -1, -1)
-            part_feats = self._part_feats.expand(B, -1, -1)
-            text_feats = self._text_feats.expand(B, -1, -1)
-            part_mask = self._part_mask.expand(B, -1)
-            text_mask = self._text_mask.expand(B, -1) if self._text_mask is not None else None
+            if self.hvm_config.memory_mode == "gme" and self.hvm_config.inject_mode == "fixed":
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    gist_feats,
+                )
+            else:
+                part_feats = self._part_feats.expand(B, -1, -1)
+                text_feats = self._text_feats.expand(B, -1, -1)
+                part_mask = self._part_mask.expand(B, -1)
+                text_mask = self._text_mask.expand(B, -1) if self._text_mask is not None else None
 
-            # 应用 PIM
-            hidden_states = self.pims[pim_idx](
-                hidden_states,
-                gist_feats,
-                part_feats,
-                text_feats,
-                part_mask,
-                text_mask,
-            )
+                # 应用 PIM
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    gist_feats,
+                    part_feats,
+                    text_feats,
+                    part_mask,
+                    text_mask,
+                )
 
             # 返回修改后的 output
             if isinstance(output, tuple):
@@ -260,23 +275,29 @@ class HVMSketchDecoder(nn.Module):
             # GME: 3 张参考图 → 32 个 gist tokens
             self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
 
-            # PME: 逐 group 独立渲染的 features → ≤16 个 part tokens
-            # 将 group features 移到正确的 device 和 dtype
-            gfl_on_device = [
-                [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
-                for sample_gfs in group_features_list
-            ]
-            self._part_feats, self._part_mask = self.pme(
-                gfl_on_device,
-            )  # [B, 16, d_model], [B, 16]
+            if self.hvm_config.memory_mode == "gme" and self.hvm_config.inject_mode == "fixed":
+                self._part_feats = None
+                self._part_mask = None
+                self._text_feats = None
+                self._text_mask = None
+            else:
+                # PME: 逐 group 独立渲染的 features → ≤16 个 part tokens
+                # 将 group features 移到正确的 device 和 dtype
+                gfl_on_device = [
+                    [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
+                    for sample_gfs in group_features_list
+                ]
+                self._part_feats, self._part_mask = self.pme(
+                    gfl_on_device,
+                )  # [B, 16, d_model], [B, 16]
 
-            # Text feats: 参考文本 raw embedding
-            #在 HVMSketchDecoder 中缓存并传递 ref_text_mask 到每个 PIM hook。
-            self._text_mask = ref_text_mask.to(device=device, dtype=torch.bool)
-            self._text_feats = self._prepare_text_feats(
-                ref_text_ids.to(device),
-                self._text_mask,
-            )  # [B, N_t, d_model]
+                # Text feats: 参考文本 raw embedding
+                #在 HVMSketchDecoder 中缓存并传递 ref_text_mask 到每个 PIM hook。
+                self._text_mask = ref_text_mask.to(device=device, dtype=torch.bool)
+                self._text_feats = self._prepare_text_feats(
+                    ref_text_ids.to(device),
+                    self._text_mask,
+                )  # [B, N_t, d_model]
         else:
             # 没有 HVM 输入，退化为普通 OmniSVG
             self._gist_feats = None
@@ -308,7 +329,8 @@ class HVMSketchDecoder(nn.Module):
         """返回所有可训练参数（只有 HVM 模块）"""
         params = []
         params.extend(self.gme.parameters())
-        params.extend(self.pme.parameters())
+        if self.pme is not None:
+            params.extend(self.pme.parameters())
         params.extend(self.pims.parameters())
         return params
 
@@ -317,8 +339,9 @@ class HVMSketchDecoder(nn.Module):
         named_params = []
         for name, param in self.gme.named_parameters():
             named_params.append((f"gme.{name}", param))
-        for name, param in self.pme.named_parameters():
-            named_params.append((f"pme.{name}", param))
+        if self.pme is not None:
+            for name, param in self.pme.named_parameters():
+                named_params.append((f"pme.{name}", param))
         for name, param in self.pims.named_parameters():
             named_params.append((f"pims.{name}", param))
         return named_params
@@ -328,8 +351,9 @@ class HVMSketchDecoder(nn.Module):
         state_dict = {}
         for name, param in self.gme.named_parameters():
             state_dict[f"gme.{name}"] = param.data
-        for name, param in self.pme.named_parameters():
-            state_dict[f"pme.{name}"] = param.data
+        if self.pme is not None:
+            for name, param in self.pme.named_parameters():
+                state_dict[f"pme.{name}"] = param.data
         for name, param in self.pims.named_parameters():
             state_dict[f"pims.{name}"] = param.data
         torch.save(state_dict, save_path)
@@ -343,7 +367,10 @@ class HVMSketchDecoder(nn.Module):
         pims_dict = {k.replace("pims.", ""): v for k, v in state_dict.items() if k.startswith("pims.")}
 
         self.gme.load_state_dict(gme_dict, strict=True)
-        self.pme.load_state_dict(pme_dict, strict=True)
+        if self.pme is not None:
+            self.pme.load_state_dict(pme_dict, strict=True)
+        elif pme_dict:
+            print("[HVM] Warning: checkpoint contains PME weights, but current mode disables PME. Skipping PME load.")
         self.pims.load_state_dict(pims_dict, strict=True)
         print(f"[HVM] Loaded HVM checkpoint from {load_path}")
 
@@ -357,8 +384,13 @@ class HVMSketchDecoder(nn.Module):
         print(f"  Base model (frozen): {frozen_params / 1e6:.0f}M params")
         print(f"  HVM modules (train): {trainable_params / 1e6:.1f}M params")
         print(f"    GME: {count_parameters(self.gme) / 1e6:.1f}M")
-        print(f"    PME: {count_parameters(self.pme) / 1e6:.1f}M")
+        pme_params = count_parameters(self.pme) / 1e6 if self.pme is not None else 0.0
+        print(f"    PME: {pme_params:.1f}M")
         print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
+        print(f"  Memory mode: {self.hvm_config.memory_mode}")
+        print(f"  Inject mode: {self.hvm_config.inject_mode}")
+        if self.hvm_config.inject_mode == "fixed":
+            print(f"  Inject scale: {self.hvm_config.inject_scale}")
         print(f"  Total: {total_params / 1e6:.0f}M params")
         print(f"  Trainable ratio: {trainable_params / total_params * 100:.1f}%")
         print(f"  PIM insertion layers: {self.hvm_config.pim_layer_indices}\n")

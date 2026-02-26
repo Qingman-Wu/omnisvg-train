@@ -7,6 +7,7 @@ HVM-SVG: Hierarchical Visual Memory Modules
 - GistMemoryEncoder (GME): 全局场景记忆编码器，32 queries
 - PartMemoryEncoder (PME): 局部零件记忆编码器，每组 4 queries
 - AdaptiveGate: 双层门控（层级 + token 级）
+- SimpleGMEInjectionModule: Stage1 简化注入模块（GME-only + fixed scale）
 - PrefrontalInjectionModule (PIM): 前额叶注入模块，4 步融合 + gate
 """
 
@@ -52,6 +53,10 @@ class HVMConfig:
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
     gate_alpha_init: float = 0.05  # 冷启动更平滑: tanh(0.05)≈0.05，避免 PIM 主干梯度过弱
+    memory_mode: str = "full"      # full: GME+PME+full PIM, gme: Stage1 简化路径
+    inject_mode: str = "adaptive"  # adaptive: gate 注入, fixed: 固定缩放注入
+    inject_scale: float = 0.1      # inject_mode=fixed 时生效
+    pim_layer_indices_override: Optional[List[int]] = None
 
     # === RAG ===
     num_references: int = 3
@@ -60,6 +65,8 @@ class HVMConfig:
     @property
     def pim_layer_indices(self) -> List[int]:
         """PIM 插入位置（0-indexed，在该层之后插入）"""
+        if self.pim_layer_indices_override is not None:
+            return list(self.pim_layer_indices_override)
         return list(range(
             self.pim_layer_interval - 1,
             self.num_decoder_layers,
@@ -492,6 +499,57 @@ class AdaptiveGate(nn.Module):
 
 
 # ============================================================================
+# Simple GME Injection Module (Stage1)
+# ============================================================================
+
+class SimpleGMEInjectionModule(nn.Module):
+    """
+    Stage1 最简注入模块：
+      - 仅使用 gist memory（GME 输出）
+      - 单次 hidden × gist cross-attention
+      - 固定缩放 residual 注入（无 gate）
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_gist_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.inject_scale = float(config.inject_scale)
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+        delta = self.hidden_gist_cross_attn(
+            q=query,
+            k=gist_feats,
+            v=gist_feats,
+        )
+        injection = self.inject_scale * delta
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_rms = delta.detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "inject_scale": float(self.inject_scale),
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Prefrontal Injection Module (PIM)
 # ============================================================================
 
@@ -599,21 +657,27 @@ def count_parameters(module: nn.Module) -> int:
 def print_hvm_parameter_summary(config: HVMConfig):
     """打印 HVM 模块参数量概要"""
     gme = GistMemoryEncoder(config)
-    pme = PartMemoryEncoder(config)
-    pim = PrefrontalInjectionModule(config)
-    gate_params = count_parameters(pim.gate)
+    if config.memory_mode == "gme" and config.inject_mode == "fixed":
+        pme_params = 0
+        pim = SimpleGMEInjectionModule(config)
+        gate_params = 0
+    else:
+        pme = PartMemoryEncoder(config)
+        pme_params = count_parameters(pme)
+        pim = PrefrontalInjectionModule(config)
+        gate_params = count_parameters(pim.gate)
     pim_params = count_parameters(pim)
 
     print("=" * 60)
     print("HVM-SVG Parameter Summary")
     print("=" * 60)
     print(f"  GME:                {count_parameters(gme):>12,}")
-    print(f"  PME:                {count_parameters(pme):>12,}")
+    print(f"  PME:                {pme_params:>12,}")
     print(f"  PIM × {config.num_pims}:")
     print(f"    Per PIM:          {pim_params:>12,}")
     print(f"    - Gate per PIM:   {gate_params:>12,}")
     print(f"    Total PIMs:       {pim_params * config.num_pims:>12,}")
-    total = count_parameters(gme) + count_parameters(pme) + pim_params * config.num_pims
+    total = count_parameters(gme) + pme_params + pim_params * config.num_pims
     print(f"  {'─' * 40}")
     print(f"  Total HVM params:   {total:>12,}  ({total / 1e6:.1f}M)")
     print(f"  Base model (7B):    ~7,600,000,000")
