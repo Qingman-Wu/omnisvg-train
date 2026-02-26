@@ -10,14 +10,9 @@
 #   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --warmup 200
 #   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7 --resume /mnt/data2/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-4000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
-#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh \
-    --num_gpus 6 \
-    --disable_hvm \
-    --epochs 3000 \
-    --output_dir ./outputs_baseline \
-    --run_name "baseline-no-hvm" \
-    --save_every 999999
-#
+
+
+#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --disable_hvm --epochs 3000 --output_dir ./outputs_baseline --run_name "baseline-no-hvm" --save_every 999999
 # =============================================================================
 
 set -e
@@ -49,7 +44,7 @@ PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 GATE_ALPHA_INIT=0.0                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
 
 # -- 训练超参 --
-BATCH_SIZE=8                        # 每卡 batch size
+BATCH_SIZE=4                        # 每卡 batch size
 GRAD_ACCUM=4                        # 梯度累积步数
 EPOCHS=30000
 LEARNING_RATE=5e-4
