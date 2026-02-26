@@ -18,7 +18,7 @@ USE_FLASH_ATTN="false"
 
 
 # Number of GPUs to use
-NUM_GPUS=8
+NUM_GPUS=6
 
 # Batch size per GPU (reduce further if still OOM)
 BATCH_SIZE=1
@@ -32,7 +32,7 @@ MAX_SEQ_LENGTH=2048
 DATA_DIR="./data"
 
 # Output directory for checkpoints and logs
-OUTPUT_DIR="./output"
+OUTPUT_DIR="./output_omnisvg_original"
 
 # Project name (leave empty for auto-generated name)
 PROJECT_NAME=""
@@ -53,7 +53,7 @@ HF_DATASETS="illustration"
 
 # Local parquet directories (avoids re-downloading if you have local files)
 # Leave empty to download from HuggingFace
-LOCAL_ILLUSTRATION_DIR="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test2"
+LOCAL_ILLUSTRATION_DIR="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
 LOCAL_ICON_DIR=""
 
 # Text-only mode (text-to-SVG only, no image task)

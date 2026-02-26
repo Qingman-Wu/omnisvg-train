@@ -38,6 +38,7 @@ from PIL import Image
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from torch.utils.tensorboard import SummaryWriter
+import swanlab
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -847,6 +848,14 @@ def train(args, config: OmniSVGConfig):
     
     writer = SummaryWriter(log_dir=str(output_dir / "logs"))
     
+    # Setup SwanLab
+    if accelerator.is_main_process:
+        swanlab.init(
+            project="OmniSVG-Baseline",
+            experiment_name=args.project_name,
+            config=vars(args),
+        )
+    
     # Save config
     if accelerator.is_main_process:
         config.save(str(output_dir / "config.yaml"))
@@ -1087,6 +1096,15 @@ def log_metrics(
     writer.add_scalar("loss/image_task", avg_image, step)
     writer.add_scalar("lr", lr, step)
     writer.add_scalar("grad_norm", avg_grad, step)
+    
+    # Write to SwanLab
+    swanlab.log({
+        "train/loss": avg_total,
+        "train/loss_text": avg_text,
+        "train/loss_image": avg_image,
+        "train/lr": lr,
+        "train/grad_norm": avg_grad,
+    }, step=step)
     
     # Print to console
     accelerator.print(
