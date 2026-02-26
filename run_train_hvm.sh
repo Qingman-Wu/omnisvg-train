@@ -10,6 +10,13 @@
 #   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --warmup 200
 #   CUDA_VISIBLE_DEVICES=0,2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 7 --resume /mnt/data2/wuqingman/omnisvg-train/outputs_hvm/checkpoint-step-4000  # 恢复完整训练状态
 #   bash run_train_hvm.sh --hvm_ckpt /mnt/data/wuqingman/omnisvg-train/outputs_hvm/hvm_step_5000.pt     # 仅加载 HVM 权重初始化
+#   CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh \
+    --num_gpus 6 \
+    --disable_hvm \
+    --epochs 3000 \
+    --output_dir ./outputs_baseline \
+    --run_name "baseline-no-hvm" \
+    --save_every 999999
 #
 # =============================================================================
 
@@ -42,7 +49,7 @@ PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 GATE_ALPHA_INIT=0.0                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
 
 # -- 训练超参 --
-BATCH_SIZE=4                        # 每卡 batch size
+BATCH_SIZE=8                        # 每卡 batch size
 GRAD_ACCUM=4                        # 梯度累积步数
 EPOCHS=30000
 LEARNING_RATE=5e-4
@@ -68,6 +75,9 @@ RESUME_FROM=""
 # HVM_CHECKPOINT="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18/hvm_step_5000.pt"
 HVM_CHECKPOINT=""
 
+# -- Ablation --
+DISABLE_HVM=false                   # true: baseline 模式，不注入 HVM (只跑冻结 OmniSVG)
+
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -86,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --swanlab_mode)   SWANLAB_MODE="$2";        shift 2 ;;
         --run_name)       SWANLAB_RUN_NAME="$2";    shift 2 ;;
         --save_every)     SAVE_EVERY="$2";          shift 2 ;;
+        --disable_hvm)    DISABLE_HVM=true;         shift 1 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -128,6 +139,9 @@ echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "  SwanLab mode:      ${SWANLAB_MODE}"
 echo "  Run name:          ${SWANLAB_RUN_NAME}"
+if [ "$DISABLE_HVM" = true ]; then
+    echo "  *** BASELINE MODE: HVM DISABLED ***"
+fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
 elif [ -n "$HVM_CHECKPOINT" ]; then
@@ -174,6 +188,11 @@ if [ -n "$RESUME_FROM" ]; then
     TRAIN_ARGS+=(--resume_from "$RESUME_FROM")
 elif [ -n "$HVM_CHECKPOINT" ]; then
     TRAIN_ARGS+=(--hvm_checkpoint "$HVM_CHECKPOINT")
+fi
+
+# Ablation: baseline 模式
+if [ "$DISABLE_HVM" = true ]; then
+    TRAIN_ARGS+=(--disable_hvm)
 fi
 
 # ===================== 保存启动快照 =====================

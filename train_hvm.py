@@ -459,7 +459,10 @@ def train(args):
 
     # ---- Training Loop ----
     accelerator.print("=" * 60)
-    accelerator.print("Starting HVM-SVG Training")
+    if args.disable_hvm:
+        accelerator.print("BASELINE MODE: HVM injection DISABLED (frozen OmniSVG only)")
+    else:
+        accelerator.print("Starting HVM-SVG Training")
     accelerator.print(f"  Epochs: {args.epochs}")
     accelerator.print(f"  Batch size: {args.batch_size}")
     accelerator.print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
@@ -467,7 +470,8 @@ def train(args):
     accelerator.print(f"  Learning rate: {args.learning_rate}")
     accelerator.print(f"  Total steps: {total_training_steps}")
     accelerator.print(f"  Warmup steps: {warmup_steps}")
-    accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
+    if not args.disable_hvm:
+        accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     accelerator.print("=" * 60)
@@ -497,24 +501,33 @@ def train(args):
                 input_ids = batch["input_ids"]
                 attention_mask = batch["attention_mask"]
                 labels = batch["labels"]
-                ref_features = batch["ref_features"]
-                group_features_list = batch["group_features_list"]
-                ref_text_ids = batch["ref_text_ids"]
-                ref_text_mask = batch["ref_text_mask"]
 
                 # Forward pass
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    ref_features=ref_features,
-                    group_features_list=group_features_list,
-                    ref_text_ids=ref_text_ids,
-                    ref_text_mask=ref_text_mask,
-                )
+                if args.disable_hvm:
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+                else:
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        ref_features=batch["ref_features"],
+                        group_features_list=batch["group_features_list"],
+                        ref_text_ids=batch["ref_text_ids"],
+                        ref_text_mask=batch["ref_text_mask"],
+                    )
 
                 # Compute loss
                 loss = compute_loss(outputs, labels)
                 epoch_losses.append(loss.item())
+
+                if args.disable_hvm:
+                    # Baseline 模式: loss 来自全冻结模型，无梯度图。
+                    # 加一个零值 dummy 项连接可训练参数，满足 DeepSpeed 的 requires_grad 断言。
+                    # 梯度为 0，不影响任何参数。
+                    dummy_param = next(p for p in model.parameters() if p.requires_grad)
+                    loss = loss + 0.0 * dummy_param.sum()
 
                 # Backward
                 accelerator.backward(loss)
@@ -525,7 +538,7 @@ def train(args):
                     should_print_gates = (next_step % (args.log_every * 10) == 0)
 
                     diag_stats = None
-                    if should_log or should_print_gates:
+                    if (should_log or should_print_gates) and not args.disable_hvm:
                         unwrapped = accelerator.unwrap_model(model)
                         diag_stats = collect_hvm_diagnostics(unwrapped)
 
@@ -566,7 +579,7 @@ def train(args):
                         swanlab.log(log_dict, step=global_step)
 
                     # ---- Save checkpoint ----
-                    if global_step % args.save_every == 0:
+                    if global_step % args.save_every == 0 and not args.disable_hvm:
                         # 保存完整训练状态 (所有 rank 参与)
                         ckpt_dir = str(output_dir / f"checkpoint-step-{global_step}")
                         accelerator.save_state(ckpt_dir)
@@ -584,7 +597,7 @@ def train(args):
                         accelerator.wait_for_everyone()
 
                     # ---- Print gate status ----
-                    if should_print_gates:
+                    if should_print_gates and not args.disable_hvm:
                         if diag_stats is None:
                             unwrapped = accelerator.unwrap_model(model)
                             diag_stats = collect_hvm_diagnostics(unwrapped)
@@ -692,6 +705,11 @@ def parse_args():
     parser.add_argument("--hvm_checkpoint", type=str, default=None,
                         help="HVM-only weights (.pt) for fine-tuning "
                              "(does NOT restore optimizer/scheduler/step)")
+
+    # Ablation / Baseline
+    parser.add_argument("--disable_hvm", action="store_true", default=False,
+                        help="Disable HVM injection (baseline: frozen OmniSVG only). "
+                             "HVM modules are still created but hooks skip injection.")
 
     args = parser.parse_args()
 
