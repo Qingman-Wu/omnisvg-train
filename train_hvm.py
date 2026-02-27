@@ -545,7 +545,7 @@ def train(args):
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     if args.shuffle_rag:
-        accelerator.print(f"  *** SHUFFLE RAG ABLATION: ref_features randomly permuted within batch ***")
+        accelerator.print(f"  *** SHUFFLE RAG ABLATION: ref loaded from random donor sample (global, 100% mismatch) ***")
     accelerator.print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
