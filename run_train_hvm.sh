@@ -20,6 +20,8 @@
 # CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 --pim_layer_indices -1 --run_name s1_gme_last1_fixed003 --output_dir /mnt/data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03
 #  CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 --pim_layer_indices -1 --shuffle_rag --run_name s1_gme_last1_fixed003_shuffle --output_dir ./outputs_s1_fixed0.03_shuffle
 
+#CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 --pim_layer_indices -1 --shuffle_rag --run_name s1_gme_last1_fixed003_allshuffle --output_dir ./outputs_s1_fixed0.03_allshuffle
+
 
 
 
@@ -40,8 +42,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=6
 
 # -- 数据 --
-DATA_DIR="/mnt/a100_1_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
-HVM_DIR="/mnt/a100_1_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
+HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
 
 # -- 模型 --
 MODEL_SIZE="8B"
