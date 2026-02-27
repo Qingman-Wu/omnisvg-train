@@ -51,6 +51,7 @@ class HVMDataset(Dataset):
         token_config: TokenizationConfig,
         train_config: Optional[TrainConfig] = None,
         max_len: int = 2048,
+        shuffle_rag: bool = False,
     ):
         """
         Args:
@@ -59,12 +60,14 @@ class HVMDataset(Dataset):
             token_config: SVG tokenization 配置，/Users/wuqingman/Projects/omnisvg-train/configs/tokenization.yaml
             train_config: 训练配置，/Users/wuqingman/Projects/omnisvg-train/configs/train_config.yaml
             max_len: 最大 SVG token 序列长度
+            shuffle_rag: 是否全局打乱 ref 对应关系 (ablation: 每个样本随机采样别的样本的 ref)
         """
         self.data_dir = data_dir
         self.hvm_dir = hvm_dir
         self.max_len = max_len
         self.token_config = token_config
         self.train_config = train_config or TrainConfig()
+        self.shuffle_rag = shuffle_rag
         self.features_dir = os.path.join(hvm_dir, "features")
         self.group_features_dir = os.path.join(hvm_dir, "group_features")
 
@@ -253,15 +256,22 @@ class HVMDataset(Dataset):
         # ---- 加载参考数据 ----
         ref_indices = rag["ref_indices"]  # [3]
 
+        # Shuffle RAG ablation: 随机采样另一个样本的 ref，保证 100% 错配
+        if self.shuffle_rag:
+            donor_idx = idx
+            while donor_idx == idx:
+                donor_idx = random.choice(self.valid_indices)
+            donor_rag = self.idx_to_rag[donor_idx]
+            ref_indices = donor_rag["ref_indices"]
+
         # 3 张参考图的整图 features (for GME)
         ref_features = [self._load_feature(ri) for ri in ref_indices]
 
         # Top-1 参考的逐 group 渲染特征 (for PME)
         best_ref_idx = ref_indices[0]
         ref_best_group_features = self._load_group_features(best_ref_idx)
-        # ref_best_group_features: list of [256, 3584] tensors, 1~4 个 group
 
-        # 参考文本 (拼接 3 个参考的描述)
+        # 参考文本 (拼接 3 个参考的描述) — 也用 donor 的
         ref_texts = []
         for ri in ref_indices:
             ref_meta = self.idx_to_meta.get(ri, {})

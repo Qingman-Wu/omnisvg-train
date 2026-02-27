@@ -350,6 +350,7 @@ def train(args):
         token_config=token_config,
         train_config=config.training,
         max_len=config.training.max_seq_length,
+        shuffle_rag=args.shuffle_rag,
     )
 
     collate_fn = create_hvm_collate_fn(
@@ -584,18 +585,6 @@ def train(args):
                     group_features_list = batch["group_features_list"]
                     ref_text_ids = batch["ref_text_ids"]
                     ref_text_mask = batch["ref_text_mask"]
-
-                    # Shuffle RAG ablation: 打乱 batch 内的检索结果对应关系
-                    if args.shuffle_rag and ref_features is not None:
-                        B = ref_features.shape[0]
-                        perm = torch.randperm(B)
-                        ref_features = ref_features[perm]
-                        if group_features_list is not None:
-                            group_features_list = [group_features_list[i] for i in perm.tolist()]
-                        if ref_text_ids is not None:
-                            ref_text_ids = ref_text_ids[perm]
-                        if ref_text_mask is not None:
-                            ref_text_mask = ref_text_mask[perm]
 
                     outputs = model(
                         input_ids=input_ids,
