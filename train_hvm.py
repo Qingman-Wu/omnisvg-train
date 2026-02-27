@@ -543,6 +543,8 @@ def train(args):
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
+    if args.shuffle_rag:
+        accelerator.print(f"  *** SHUFFLE RAG ABLATION: ref_features randomly permuted within batch ***")
     accelerator.print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -578,13 +580,30 @@ def train(args):
                         attention_mask=attention_mask,
                     )
                 else:
+                    ref_features = batch["ref_features"]
+                    group_features_list = batch["group_features_list"]
+                    ref_text_ids = batch["ref_text_ids"]
+                    ref_text_mask = batch["ref_text_mask"]
+
+                    # Shuffle RAG ablation: 打乱 batch 内的检索结果对应关系
+                    if args.shuffle_rag and ref_features is not None:
+                        B = ref_features.shape[0]
+                        perm = torch.randperm(B)
+                        ref_features = ref_features[perm]
+                        if group_features_list is not None:
+                            group_features_list = [group_features_list[i] for i in perm.tolist()]
+                        if ref_text_ids is not None:
+                            ref_text_ids = ref_text_ids[perm]
+                        if ref_text_mask is not None:
+                            ref_text_mask = ref_text_mask[perm]
+
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        ref_features=batch["ref_features"],
-                        group_features_list=batch["group_features_list"],
-                        ref_text_ids=batch["ref_text_ids"],
-                        ref_text_mask=batch["ref_text_mask"],
+                        ref_features=ref_features,
+                        group_features_list=group_features_list,
+                        ref_text_ids=ref_text_ids,
+                        ref_text_mask=ref_text_mask,
                     )
 
                 # Compute loss
@@ -793,6 +812,9 @@ def parse_args():
     parser.add_argument("--disable_hvm", action="store_true", default=False,
                         help="Disable HVM injection (baseline: frozen OmniSVG only). "
                              "HVM modules are still created but hooks skip injection.")
+    parser.add_argument("--shuffle_rag", action="store_true", default=False,
+                        help="Shuffle ref_features within batch (ablation: break RAG correspondence). "
+                             "If GME still helps with shuffled refs, the benefit is from extra params, not RAG info.")
 
     args = parser.parse_args()
 

@@ -81,6 +81,7 @@ HVM_CHECKPOINT=""
 
 # -- Ablation --
 DISABLE_HVM=false                   # true: baseline 模式，不注入 HVM (只跑冻结 OmniSVG)
+SHUFFLE_RAG=false                   # true: 打乱 batch 内 ref_features 对应关系 (验证 RAG 信息 vs 参数效应)
 
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
@@ -105,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         --run_name)       SWANLAB_RUN_NAME="$2";    shift 2 ;;
         --save_every)     SAVE_EVERY="$2";          shift 2 ;;
         --disable_hvm)    DISABLE_HVM=true;         shift 1 ;;
+        --shuffle_rag)    SHUFFLE_RAG=true;         shift 1 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -157,6 +159,9 @@ echo "  SwanLab mode:      ${SWANLAB_MODE}"
 echo "  Run name:          ${SWANLAB_RUN_NAME}"
 if [ "$DISABLE_HVM" = true ]; then
     echo "  *** BASELINE MODE: HVM DISABLED ***"
+fi
+if [ "$SHUFFLE_RAG" = true ]; then
+    echo "  *** SHUFFLE RAG ABLATION: ref correspondence broken ***"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -216,6 +221,11 @@ fi
 # Ablation: baseline 模式
 if [ "$DISABLE_HVM" = true ]; then
     TRAIN_ARGS+=(--disable_hvm)
+fi
+
+# Ablation: shuffle RAG
+if [ "$SHUFFLE_RAG" = true ]; then
+    TRAIN_ARGS+=(--shuffle_rag)
 fi
 
 # ===================== 保存启动快照 =====================
