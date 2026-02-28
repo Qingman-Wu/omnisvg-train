@@ -89,7 +89,7 @@ HVM_CHECKPOINT=""
 # -- 验证集 --
 VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
 VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val"
-EVAL_EVERY=20                      # 每 N 个 optimizer step 评估一次 val loss
+EVAL_EVERY=500                      # 每 N 个 optimizer step 评估一次 val loss
 
 # -- Ablation --
 DISABLE_HVM=false                   # true: baseline 模式，不注入 HVM (只跑冻结 OmniSVG)
