@@ -37,11 +37,17 @@ from utils.dataset import SVGTokenizer
 
 class HVMDataset(Dataset):
     """
-    HVM-SVG 训练数据集。
+    HVM-SVG 训练/验证数据集。
 
     同时加载:
     1. 原始 parquet 数据 (SVG 字符串, 描述, 图像)
     2. 预计算的 HVM 数据 (vision features, RAG results, path groups)
+
+    eval 模式 (is_eval=True):
+      val/test 数据的 features 路径格式不同于训练集：
+      - 自身: features/val_{idx//1000:03d}/val_{idx:06d}.pt
+      - ref:  features/ref_{ridx//1000:03d}/ref_{ridx:06d}.pt
+      - group_features: group_features/{ridx//1000:03d}/{ridx:06d}.pt (与训练集相同)
     """
 
     def __init__(
@@ -52,15 +58,17 @@ class HVMDataset(Dataset):
         train_config: Optional[TrainConfig] = None,
         max_len: int = 2048,
         shuffle_rag: bool = False,
+        is_eval: bool = False,
     ):
         """
         Args:
             data_dir: 原始 parquet 文件目录
             hvm_dir: HVM 预计算数据目录
-            token_config: SVG tokenization 配置，/Users/wuqingman/Projects/omnisvg-train/configs/tokenization.yaml
-            train_config: 训练配置，/Users/wuqingman/Projects/omnisvg-train/configs/train_config.yaml
+            token_config: SVG tokenization 配置
+            train_config: 训练配置
             max_len: 最大 SVG token 序列长度
-            shuffle_rag: 是否全局打乱 ref 对应关系 (ablation: 每个样本随机采样别的样本的 ref)
+            shuffle_rag: 是否全局打乱 ref 对应关系 (ablation)
+            is_eval: 是否为 eval 模式 (val/test)，影响 features 路径格式
         """
         self.data_dir = data_dir
         self.hvm_dir = hvm_dir
@@ -68,6 +76,7 @@ class HVMDataset(Dataset):
         self.token_config = token_config
         self.train_config = train_config or TrainConfig()
         self.shuffle_rag = shuffle_rag
+        self.is_eval = is_eval
         self.features_dir = os.path.join(hvm_dir, "features")
         self.group_features_dir = os.path.join(hvm_dir, "group_features")
 
@@ -75,15 +84,31 @@ class HVMDataset(Dataset):
         self.svg_tokenizer = SVGTokenizer(token_config)
 
         # 加载预计算数据
-        print("[HVM Dataset] Loading precomputed data...")
+        mode_str = "eval" if is_eval else "train"
+        print(f"[HVM Dataset] Loading precomputed data ({mode_str})...")
         self.metadata = self._load_jsonl(os.path.join(hvm_dir, "metadata.jsonl"))
-        self.rag_results = self._load_jsonl(os.path.join(hvm_dir, "rag_results.jsonl"))
-        self.groups_data = self._load_jsonl(os.path.join(hvm_dir, "groups.jsonl"))
+        self.rag_results = self._load_jsonl(os.path.join(hvm_dir, "rag_results_train.jsonl"))
+        self.groups_data = self._load_jsonl(os.path.join(hvm_dir, "groups_train_ref.jsonl"))
 
         # 建立 idx → metadata/rag/groups 的快速查找
         self.idx_to_meta = {r["idx"]: r for r in self.metadata}
         self.idx_to_rag = {r["idx"]: r for r in self.rag_results}
         self.idx_to_groups = {r["idx"]: r for r in self.groups_data}
+
+        # eval 模式下，ref 的 metadata 来自全库（用于获取 ref 描述文本）
+        # 在 __init__（主进程）中预加载，fork 后 worker 自动共享，不再重复加载
+        self._ref_meta_cache: Dict[int, Dict] = {}
+        if is_eval:
+            ref_meta_path = os.path.join(
+                os.path.dirname(hvm_dir), "hvm_precomputed_1w", "metadata.jsonl"
+            )
+            if os.path.exists(ref_meta_path):
+                print(f"[HVM Dataset] Pre-loading full ref metadata...")
+                with open(ref_meta_path) as f:
+                    for line in f:
+                        r = json.loads(line)
+                        self._ref_meta_cache[r["idx"]] = r
+                print(f"[HVM Dataset] Loaded {len(self._ref_meta_cache)} ref metadata entries")
 
         # 有效的样本 indices (必须同时有 metadata, rag, groups, features)
         self.valid_indices = self._build_valid_indices()
@@ -102,30 +127,43 @@ class HVMDataset(Dataset):
         print(f"  Loaded {len(records)} records from {os.path.basename(path)}")
         return records
 
+    def _self_feat_path(self, idx: int) -> str:
+        """val/test 自身 features 路径"""
+        if self.is_eval:
+            return os.path.join(
+                self.features_dir, f"val_{idx // 1000:03d}", f"val_{idx:06d}.pt"
+            )
+        return os.path.join(
+            self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
+        )
+
+    def _ref_feat_path(self, ref_idx: int) -> str:
+        """ref features 路径"""
+        if self.is_eval:
+            return os.path.join(
+                self.features_dir, f"ref_{ref_idx // 1000:03d}", f"ref_{ref_idx:06d}.pt"
+            )
+        return os.path.join(
+            self.features_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt"
+        )
+
     def _build_valid_indices(self) -> List[int]:
         """构建有效样本索引：必须同时有所有预计算数据"""
         valid = []
         for meta in self.metadata:
             idx = meta["idx"]
-            # 检查 feature 文件是否存在 (整图 features for GME)
-            feat_path = os.path.join(
-                self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
-            )
-            if not (
-                idx in self.idx_to_rag
-                and idx in self.idx_to_groups
-                and os.path.exists(feat_path)
-            ):
+            if idx not in self.idx_to_rag:
+                continue
+
+            # 检查自身 feature 文件是否存在
+            if not os.path.exists(self._self_feat_path(idx)):
                 continue
 
             # 检查参考样本的 features 和 group_features 是否也存在
             rag = self.idx_to_rag[idx]
             refs_ok = True
             for ref_idx in rag["ref_indices"]:
-                ref_feat_path = os.path.join(
-                    self.features_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt"
-                )
-                if not os.path.exists(ref_feat_path):
+                if not os.path.exists(self._ref_feat_path(ref_idx)):
                     refs_ok = False
                     break
 
@@ -153,12 +191,19 @@ class HVMDataset(Dataset):
             self._parquet_tables[parquet_file] = pq.read_table(full_path)
         return self._parquet_tables[parquet_file]
 
-    def _load_feature(self, idx: int) -> torch.Tensor:
-        """加载单个样本的整图 post-merge feature (for GME)"""
-        feat_path = os.path.join(
-            self.features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt"
-        )
-        return torch.load(feat_path, map_location="cpu", weights_only=True)  # [256, 3584]
+    def _get_ref_meta(self, ref_idx: int) -> Dict:
+        """获取 ref 的 metadata。训练模式查 idx_to_meta，eval 模式查预加载的 _ref_meta_cache。"""
+        if not self.is_eval:
+            return self.idx_to_meta.get(ref_idx, {})
+        return self._ref_meta_cache.get(ref_idx, {})
+
+    def _load_self_feature(self, idx: int) -> torch.Tensor:
+        """加载样本自身的整图 post-merge feature"""
+        return torch.load(self._self_feat_path(idx), map_location="cpu", weights_only=True)
+
+    def _load_ref_feature(self, ref_idx: int) -> torch.Tensor:
+        """加载 ref 的整图 post-merge feature (for GME)"""
+        return torch.load(self._ref_feat_path(ref_idx), map_location="cpu", weights_only=True)
 
     def _load_group_features(self, idx: int) -> List[torch.Tensor]:
         """加载单个样本的逐 group 渲染特征 (for PME)"""
@@ -225,10 +270,10 @@ class HVMDataset(Dataset):
         table = self._get_parquet_table(meta["parquet_file"])
         row = meta["parquet_row"]
 
-        # 描述文本（随机选 detail 或 description）
+        # 描述文本（训练时随机选 detail 或 description，eval 时固定用 description）
         description = table.column("description")[row].as_py()
         detail = table.column("detail")[row].as_py() or ""
-        if detail and random.random() < self.train_config.detail_prob:
+        if not self.is_eval and detail and random.random() < self.train_config.detail_prob:
             text = detail
         else:
             text = description
@@ -265,7 +310,7 @@ class HVMDataset(Dataset):
             ref_indices = donor_rag["ref_indices"]
 
         # 3 张参考图的整图 features (for GME)
-        ref_features = [self._load_feature(ri) for ri in ref_indices]
+        ref_features = [self._load_ref_feature(ri) for ri in ref_indices]
 
         # Top-1 参考的逐 group 渲染特征 (for PME)
         best_ref_idx = ref_indices[0]
@@ -274,7 +319,7 @@ class HVMDataset(Dataset):
         # 参考文本 (拼接 3 个参考的描述) — 也用 donor 的
         ref_texts = []
         for ri in ref_indices:
-            ref_meta = self.idx_to_meta.get(ri, {})
+            ref_meta = self._get_ref_meta(ri)
             ref_desc = ref_meta.get("description", "")
             if ref_desc:
                 ref_texts.append(ref_desc)

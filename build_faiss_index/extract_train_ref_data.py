@@ -31,15 +31,8 @@ echo "Features done!"
 
 
 for i in $(seq 0 7); do
-    CUDA_VISIBLE_DEVICES=$i python -u build_faiss_index/extract_train_ref_data.py \
-        --stage group_features --shard_id $i --num_shards 8 --batch_size 8 &
-done
-wait
-echo "Group features done!"
-
-
-for i in $(seq 0 7); do
-    CUDA_VISIBLE_DEVICES=$i python -u build_faiss_index/extract_train_ref_data.py \
+    CUDA_VISIBLE_DEVICES=$i /mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/python -u \
+        build_faiss_index/extract_train_ref_data.py \
         --stage group_features --shard_id $i --num_shards 8 --batch_size 8 &
 done
 wait
@@ -83,18 +76,26 @@ TOKENS_PER_IMAGE = 256  # 16x16 post-merge
 # ============================================================================
 
 def load_train_ref_indices():
-    """加载训练 1w 样本需要的所有 ref idx。"""
+    """加载训练 1w 样本需要的所有 ref idx + 训练样本自身 idx。
+
+    返回:
+        all_feature_indices: 需要提取 features 的全部 idx（ref + 训练样本自身）
+        top1_refs: Top-1 ref idx（用于 groups / group_features）
+    """
     rag_path = os.path.join(FULL_HVM_DIR, "rag_results_train.jsonl")
     all_refs = set()
     top1_refs = set()
+    train_indices = set()
     with open(rag_path) as f:
         for line in f:
             r = json.loads(line)
+            train_indices.add(r["idx"])
             refs = r["ref_indices"]
             for ref in refs:
                 all_refs.add(ref)
             top1_refs.add(refs[0])
-    return sorted(all_refs), sorted(top1_refs)
+    all_feature_indices = sorted(all_refs | train_indices)
+    return all_feature_indices, sorted(top1_refs)
 
 
 def load_metadata_for_indices(indices_set):
@@ -571,19 +572,19 @@ def main():
     args = parser.parse_args()
 
     print("Loading train ref indices...")
-    all_refs, top1_refs = load_train_ref_indices()
-    print(f"  All refs (Top-3): {len(all_refs)}")
-    print(f"  Top-1 refs:       {len(top1_refs)}")
+    all_feature_indices, top1_refs = load_train_ref_indices()
+    print(f"  All feature indices (refs + train): {len(all_feature_indices)}")
+    print(f"  Top-1 refs:                         {len(top1_refs)}")
     print()
 
     if args.stage == "all":
-        run_groups(all_refs, top1_refs)
-        run_features(all_refs, args.shard_id, args.num_shards, args.batch_size)
+        run_groups(all_feature_indices, top1_refs)
+        run_features(all_feature_indices, args.shard_id, args.num_shards, args.batch_size)
         run_group_features(top1_refs, args.shard_id, args.num_shards, args.batch_size)
     elif args.stage == "groups":
-        run_groups(all_refs, top1_refs)
+        run_groups(all_feature_indices, top1_refs)
     elif args.stage == "features":
-        run_features(all_refs, args.shard_id, args.num_shards, args.batch_size)
+        run_features(all_feature_indices, args.shard_id, args.num_shards, args.batch_size)
     elif args.stage == "group_features":
         run_group_features(top1_refs, args.shard_id, args.num_shards, args.batch_size)
 

@@ -42,8 +42,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=6
 
 # -- 数据 --
-DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
-HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed"
+DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
+HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -75,9 +75,9 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"  # DeepSpeed ZeRO-2 (float32 opt
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_25_11_07"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_28_20_04"
 LOG_EVERY=10
-SAVE_EVERY=1000
+SAVE_EVERY=2000
 SWANLAB_MODE="cloud"                # cloud / local / disabled
 SWANLAB_RUN_NAME=""                 # 留空自动生成
 
@@ -85,6 +85,11 @@ SWANLAB_RUN_NAME=""                 # 留空自动生成
 RESUME_FROM=""
 # HVM_CHECKPOINT="/mnt/data2/wuqingman/omnisvg-train/outputs_hvm_2026_02_23_00_18/hvm_step_5000.pt"
 HVM_CHECKPOINT=""
+
+# -- 验证集 --
+VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
+VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val"
+EVAL_EVERY=20                      # 每 N 个 optimizer step 评估一次 val loss
 
 # -- Ablation --
 DISABLE_HVM=false                   # true: baseline 模式，不注入 HVM (只跑冻结 OmniSVG)
@@ -112,6 +117,10 @@ while [[ $# -gt 0 ]]; do
         --swanlab_mode)   SWANLAB_MODE="$2";        shift 2 ;;
         --run_name)       SWANLAB_RUN_NAME="$2";    shift 2 ;;
         --save_every)     SAVE_EVERY="$2";          shift 2 ;;
+        --val_data_dir)   VAL_DATA_DIR="$2";        shift 2 ;;
+        --val_hvm_dir)    VAL_HVM_DIR="$2";         shift 2 ;;
+        --eval_every)     EVAL_EVERY="$2";          shift 2 ;;
+        --no_val)         VAL_DATA_DIR=""; VAL_HVM_DIR=""; shift 1 ;;
         --disable_hvm)    DISABLE_HVM=true;         shift 1 ;;
         --shuffle_rag)    SHUFFLE_RAG=true;         shift 1 ;;
         *)
@@ -164,6 +173,13 @@ echo "  Warmup steps:      ${WARMUP_STEPS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "  SwanLab mode:      ${SWANLAB_MODE}"
 echo "  Run name:          ${SWANLAB_RUN_NAME}"
+if [ -n "$VAL_DATA_DIR" ] && [ -n "$VAL_HVM_DIR" ]; then
+    echo "  Val data dir:      ${VAL_DATA_DIR}"
+    echo "  Val HVM dir:       ${VAL_HVM_DIR}"
+    echo "  Eval every:        ${EVAL_EVERY} steps"
+else
+    echo "  Validation:        DISABLED"
+fi
 if [ "$DISABLE_HVM" = true ]; then
     echo "  *** BASELINE MODE: HVM DISABLED ***"
 fi
@@ -206,6 +222,11 @@ TRAIN_ARGS=(
 
 if [ -n "$PIM_LAYER_INDICES" ]; then
     TRAIN_ARGS+=(--pim_layer_indices "$PIM_LAYER_INDICES")
+fi
+
+# Val dataset
+if [ -n "$VAL_DATA_DIR" ] && [ -n "$VAL_HVM_DIR" ]; then
+    TRAIN_ARGS+=(--val_data_dir "$VAL_DATA_DIR" --val_hvm_dir "$VAL_HVM_DIR" --eval_every "$EVAL_EVERY")
 fi
 
 # Warmup steps (为空时由 train_hvm.py 自动计算为 10% of total)

@@ -266,6 +266,42 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
     return stats
 
 
+@torch.no_grad()
+def evaluate_val_loss(
+    model: nn.Module,
+    val_dataloader,
+    accelerator: "Accelerator",
+    disable_hvm: bool = False,
+) -> float:
+    """在验证集上计算平均 loss。"""
+    model.eval()
+    all_losses = []
+
+    for batch in val_dataloader:
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+
+        if disable_hvm:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                ref_features=batch["ref_features"],
+                group_features_list=batch["group_features_list"],
+                ref_text_ids=batch["ref_text_ids"],
+                ref_text_mask=batch["ref_text_mask"],
+            )
+
+        loss = compute_loss(outputs, labels)
+        gathered_loss = accelerator.gather(loss.unsqueeze(0))
+        all_losses.extend(gathered_loss.cpu().tolist())
+
+    model.train()
+    return float(np.mean(all_losses)) if all_losses else 0.0
+
+
 def get_git_metadata(workdir: Optional[Path] = None) -> Dict[str, Any]:
     """
     获取当前代码版本信息（用于实验可复现性）。
@@ -374,6 +410,31 @@ def train(args):
         drop_last=True,
     )
 
+    # ---- Validation Dataset (optional) ----
+    val_dataloader = None
+    if args.val_data_dir and args.val_hvm_dir:
+        accelerator.print("Loading validation dataset...")
+        val_dataset = HVMDataset(
+            data_dir=args.val_data_dir,
+            hvm_dir=args.val_hvm_dir,
+            token_config=token_config,
+            train_config=config.training,
+            max_len=config.training.max_seq_length,
+            shuffle_rag=False,
+            is_eval=True,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=(args.num_workers > 0),
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
+        accelerator.print(f"  Val samples: {len(val_dataset)}")
+
     # ---- Model ----
     accelerator.print("Loading OmniSVG base model...")
     base_model = load_omnisvg_base(
@@ -410,9 +471,14 @@ def train(args):
     # 注意: 必须先 prepare dataloader，再计算 steps，
     # 因为 accelerator.prepare 会给 dataloader 加 DistributedSampler，
     # 改变 len(dataloader)。
-    model, optimizer, dataloader = accelerator.prepare(
-        model, optimizer, dataloader
-    )
+    if val_dataloader is not None:
+        model, optimizer, dataloader, val_dataloader = accelerator.prepare(
+            model, optimizer, dataloader, val_dataloader
+        )
+    else:
+        model, optimizer, dataloader = accelerator.prepare(
+            model, optimizer, dataloader
+        )
 
     # ---- Scheduler (在 prepare 之后计算 steps) ----
     num_update_steps_per_epoch = math.ceil(
@@ -544,6 +610,8 @@ def train(args):
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
+    if val_dataloader is not None:
+        accelerator.print(f"  Val eval every: {args.eval_every} steps")
     if args.shuffle_rag:
         accelerator.print(f"  *** SHUFFLE RAG ABLATION: ref loaded from random donor sample (global, 100% mismatch) ***")
     accelerator.print("=" * 60)
@@ -655,6 +723,21 @@ def train(args):
 
                         swanlab.log(log_dict, step=global_step)
 
+                    # ---- Val evaluation ----
+                    # Ensure ALL ranks participate in evaluation to avoid collective timeout
+                    if (val_dataloader is not None
+                            and global_step % args.eval_every == 0):
+                        val_loss = evaluate_val_loss(
+                            model, val_dataloader, accelerator,
+                            disable_hvm=args.disable_hvm,
+                        )
+                        
+                        if accelerator.is_main_process:
+                            swanlab.log({"val/loss": val_loss}, step=global_step)
+                            accelerator.print(
+                                f"  Step {global_step} | Val loss: {val_loss:.4f}"
+                            )
+
                     # ---- Save checkpoint ----
                     if global_step % args.save_every == 0 and not args.disable_hvm:
                         # 保存完整训练状态 (所有 rank 参与)
@@ -715,11 +798,23 @@ def train(args):
 
         progress_bar.close()
 
-        # End of epoch: 记录真实 epoch 平均 loss
+        # End of epoch: 记录真实 epoch 平均 loss + val loss
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0
-            swanlab.log({"train/epoch_loss": epoch_avg_loss}, step=global_step)
+            log_dict = {"train/epoch_loss": epoch_avg_loss}
+
+            if val_dataloader is not None:
+                val_loss = evaluate_val_loss(
+                    model, val_dataloader, accelerator,
+                    disable_hvm=args.disable_hvm,
+                )
+                log_dict["val/epoch_loss"] = val_loss
+                accelerator.print(
+                    f"  Epoch {epoch + 1} | Train loss: {epoch_avg_loss:.4f} | Val loss: {val_loss:.4f}"
+                )
+
+            swanlab.log(log_dict, step=global_step)
 
         torch.cuda.empty_cache()
 
@@ -764,6 +859,12 @@ def parse_args():
                         help="Directory containing parquet files referenced in metadata.jsonl")
     parser.add_argument("--hvm_dir", type=str,
                         default="/mnt/data/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed")
+    parser.add_argument("--val_data_dir", type=str, default=None,
+                        help="Val parquet directory (None=skip val)")
+    parser.add_argument("--val_hvm_dir", type=str, default=None,
+                        help="Val HVM precomputed directory (None=skip val)")
+    parser.add_argument("--eval_every", type=int, default=200,
+                        help="Evaluate val loss every N optimizer steps")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=2)
