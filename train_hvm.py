@@ -799,21 +799,28 @@ def train(args):
         progress_bar.close()
 
         # End of epoch: 记录真实 epoch 平均 loss + val loss
+        # evaluate_val_loss 包含 accelerator.gather()，所有 rank 必须参与
         accelerator.wait_for_everyone()
+        epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+
+        val_loss_epoch = None
+        if val_dataloader is not None:
+            val_loss_epoch = evaluate_val_loss(
+                model, val_dataloader, accelerator,
+                disable_hvm=args.disable_hvm,
+            )
+
         if accelerator.is_main_process:
-            epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0
             log_dict = {"train/epoch_loss": epoch_avg_loss}
-
-            if val_dataloader is not None:
-                val_loss = evaluate_val_loss(
-                    model, val_dataloader, accelerator,
-                    disable_hvm=args.disable_hvm,
-                )
-                log_dict["val/epoch_loss"] = val_loss
+            if val_loss_epoch is not None:
+                log_dict["val/epoch_loss"] = val_loss_epoch
                 accelerator.print(
-                    f"  Epoch {epoch + 1} | Train loss: {epoch_avg_loss:.4f} | Val loss: {val_loss:.4f}"
+                    f"  Epoch {epoch + 1} | Train loss: {epoch_avg_loss:.4f} | Val loss: {val_loss_epoch:.4f}"
                 )
-
+            else:
+                accelerator.print(
+                    f"  Epoch {epoch + 1} | Train loss: {epoch_avg_loss:.4f}"
+                )
             swanlab.log(log_dict, step=global_step)
 
         torch.cuda.empty_cache()
