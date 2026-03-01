@@ -11,12 +11,12 @@ HVM-SVG Inference Script  (Multi-GPU Data Parallel Version)
   - 无 AdaptiveGate: 固定缩放注入
 
 用法:
-CUDA_VISIBLE_DEVICES=0,1,2,3,6 python inference/inference_hvm_s1.py \
+CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1.py \
     --base_model /mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct \
     --omnisvg_checkpoint /mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B \
     --hvm_checkpoint outputs_s1_fixed0.03/hvm_step_8000.pt \
     --sample_indices $(seq 0 999) \
-    --output_dir inference/output_s1_fixed0.03_8000step \
+    --output_dir inference/output_s1_fixed0.03_8000step222 \
     --save_png --save_gt --save_refs \
     --with_baseline --resume
 
@@ -98,6 +98,64 @@ def split_indices(indices: List[int], num_parts: int) -> List[List[int]]:
 # Model loading
 # ============================================================================
 
+def _remap_omnisvg_keys_for_qwen25vl(state_dict: dict) -> dict:
+    """Remap OmniSVG checkpoint keys (old transformers layout) to new transformers layout.
+
+    Old transformers (<=~4.48):          New transformers (>=~4.49):
+      transformer.visual.*         →  transformer.model.visual.*
+      transformer.model.layers.*   →  transformer.model.language_model.layers.*
+      transformer.model.embed_*    →  transformer.model.language_model.embed_*
+      transformer.model.norm.*     →  transformer.model.language_model.norm.*
+      transformer.lm_head.*        →  transformer.lm_head.*  (unchanged)
+    """
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if new_k.startswith("transformer.visual."):
+            new_k = "transformer.model.visual." + new_k[len("transformer.visual."):]
+        elif (
+            new_k.startswith("transformer.model.")
+            and not new_k.startswith("transformer.model.visual.")
+            and not new_k.startswith("transformer.model.language_model.")
+        ):
+            new_k = "transformer.model.language_model." + new_k[len("transformer.model."):]
+        remapped[new_k] = v
+    return remapped
+
+
+def _load_omnisvg_checkpoint(base_model, ckpt_path, device):
+    """Load OmniSVG checkpoint with automatic key remapping for transformers version compat."""
+    if os.path.isdir(ckpt_path):
+        ckpt_file = find_checkpoint_file(ckpt_path)
+        state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
+    else:
+        state_dict = load_checkpoint_state_dict(ckpt_path)
+
+    if not state_dict:
+        raise RuntimeError(f"[{device}] Empty OmniSVG state dict from {ckpt_path}")
+
+    total_keys = len(state_dict)
+    missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+    loaded_count = total_keys - len(unexpected)
+
+    if loaded_count < total_keys * 0.5:
+        remapped = _remap_omnisvg_keys_for_qwen25vl(state_dict)
+        missing2, unexpected2 = base_model.load_state_dict(remapped, strict=False)
+        loaded2 = total_keys - len(unexpected2)
+        if loaded2 > loaded_count:
+            missing, unexpected, loaded_count = missing2, unexpected2, loaded2
+            print(f"  [{device}] Applied OmniSVG key remap (old→new transformers layout)")
+
+    print(
+        f"  [{device}] OmniSVG loaded: {loaded_count}/{total_keys}, "
+        f"missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+    if loaded_count < total_keys * 0.5:
+        raise RuntimeError(
+            f"[{device}] OmniSVG checkpoint load failed: only {loaded_count}/{total_keys} keys matched"
+        )
+
+
 def load_base_model_only(
     model_size: str,
     config_dir: str = None,
@@ -136,14 +194,7 @@ def load_base_model_only(
     ckpt_path = omnisvg_checkpoint or token_config.checkpoint or defaults["checkpoint"]
     if ckpt_path and os.path.exists(ckpt_path):
         print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
-        if os.path.isdir(ckpt_path):
-            ckpt_file = find_checkpoint_file(ckpt_path)
-            state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
-        else:
-            state_dict = load_checkpoint_state_dict(ckpt_path)
-        if state_dict:
-            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-            print(f"  [{device}] Loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+        _load_omnisvg_checkpoint(base_model, ckpt_path, device)
 
     base_model = base_model.to(device).eval()
     if hasattr(base_model.transformer, "gradient_checkpointing_disable"):
@@ -199,14 +250,7 @@ def load_hvm_model(
     ckpt_path = omnisvg_checkpoint or token_config.checkpoint or defaults["checkpoint"]
     if ckpt_path and os.path.exists(ckpt_path):
         print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
-        if os.path.isdir(ckpt_path):
-            ckpt_file = find_checkpoint_file(ckpt_path)
-            state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
-        else:
-            state_dict = load_checkpoint_state_dict(ckpt_path)
-        if state_dict:
-            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-            print(f"  [{device}] Loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+        _load_omnisvg_checkpoint(base_model, ckpt_path, device)
 
     print(f"[{device}][3/4] Building HVM model ...")
     model = HVMSketchDecoder(

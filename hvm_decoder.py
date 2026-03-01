@@ -23,6 +23,7 @@ from hvm_modules import (
     PartMemoryEncoder,
     PrefrontalInjectionModule,
     SimpleGMEInjectionModule,
+    LayerGatedGMEInjectionModule,
     count_parameters,
 )
 
@@ -73,6 +74,12 @@ class HVMSketchDecoder(nn.Module):
             self.pme = None
             self.pims = nn.ModuleList([
                 SimpleGMEInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
+        elif hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "adaptive":
+            self.pme = None
+            self.pims = nn.ModuleList([
+                LayerGatedGMEInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         else:
@@ -189,7 +196,7 @@ class HVMSketchDecoder(nn.Module):
             # 需要将缓存的 HVM 特征扩展到匹配的 batch size
             B = hidden_states.shape[0]
             gist_feats = self._gist_feats.expand(B, -1, -1)
-            if self.hvm_config.memory_mode == "gme" and self.hvm_config.inject_mode == "fixed":
+            if self.hvm_config.memory_mode == "gme":
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
                     gist_feats,
@@ -291,7 +298,7 @@ class HVMSketchDecoder(nn.Module):
             # GME: 3 张参考图 → 32 个 gist tokens
             self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
 
-            if self.hvm_config.memory_mode == "gme" and self.hvm_config.inject_mode == "fixed":
+            if self.hvm_config.memory_mode == "gme":
                 self._part_feats = None
                 self._part_mask = None
                 self._text_feats = None

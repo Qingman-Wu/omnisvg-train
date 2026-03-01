@@ -233,7 +233,10 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
         if grad_norm is not None:
             stats[key] = grad_norm
 
-    # PIM 运行时统计（full 模式来自 gate.last_stats，simple 模式来自 pim.last_stats）
+    # PIM 运行时统计
+    # - PrefrontalInjectionModule (full mode): gate.base_alpha + gate.last_stats
+    # - LayerGatedGMEInjectionModule (gme+adaptive): pim.base_alpha + pim.last_stats
+    # - SimpleGMEInjectionModule (gme+fixed): pim.last_stats with inject_scale
     for pim_idx, pim in enumerate(unwrapped_model.pims):
         if hasattr(pim, "gate"):
             gate = pim.gate
@@ -242,6 +245,17 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
             for src_key, dst_key in [
                 ("token_gate_mean", f"gate/pim_{pim_idx}_token_mean"),
                 ("token_gate_std", f"gate/pim_{pim_idx}_token_std"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
+        elif hasattr(pim, "base_alpha"):
+            stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(pim.base_alpha.detach()).item())
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
                 ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
                 ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
                 ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
@@ -929,8 +943,6 @@ def parse_args():
     if args.inject_scale <= 0:
         parser.error("--inject_scale must be > 0.")
 
-    if args.memory_mode == "gme" and args.inject_mode != "fixed":
-        parser.error("memory_mode='gme' currently supports only inject_mode='fixed'.")
     if args.memory_mode == "full" and args.inject_mode != "adaptive":
         parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
 

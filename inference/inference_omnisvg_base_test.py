@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_omnisvg_base_test.py \
     --data_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
     --hvm_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
     --sample_indices $(seq 0 999) \
-    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/omnisvg_base_test \
+    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/omnisvg_baseline222 \
     --num_candidates 5 \
     --save_png \
     --save_gt \
@@ -93,6 +93,31 @@ def split_indices(indices: List[int], num_parts: int) -> List[List[int]]:
 # Model loading (OmniSVG base only, no HVM)
 # ============================================================================
 
+def _remap_omnisvg_keys_for_qwen25vl(state_dict: dict) -> dict:
+    """Remap OmniSVG checkpoint keys (Qwen2-VL layout) to Qwen2.5-VL SketchDecoder layout.
+
+    Qwen2-VL (OmniSVG ckpt):           Qwen2.5-VL (SketchDecoder):
+      transformer.visual.*         →  transformer.model.visual.*
+      transformer.model.layers.*   →  transformer.model.language_model.layers.*
+      transformer.model.embed_*    →  transformer.model.language_model.embed_*
+      transformer.model.norm.*     →  transformer.model.language_model.norm.*
+      transformer.lm_head.*        →  transformer.lm_head.*  (unchanged)
+    """
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if new_k.startswith("transformer.visual."):
+            new_k = "transformer.model.visual." + new_k[len("transformer.visual."):]
+        elif (
+            new_k.startswith("transformer.model.")
+            and not new_k.startswith("transformer.model.visual.")
+            and not new_k.startswith("transformer.model.language_model.")
+        ):
+            new_k = "transformer.model.language_model." + new_k[len("transformer.model."):]
+        remapped[new_k] = v
+    return remapped
+
+
 def load_base_model(
     model_size: str,
     config_dir: str = None,
@@ -129,16 +154,43 @@ def load_base_model(
     )
 
     ckpt_path = omnisvg_checkpoint or token_config.checkpoint or defaults["checkpoint"]
-    if ckpt_path and os.path.exists(ckpt_path):
-        print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
-        if os.path.isdir(ckpt_path):
-            ckpt_file = find_checkpoint_file(ckpt_path)
-            state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
-        else:
-            state_dict = load_checkpoint_state_dict(ckpt_path)
-        if state_dict:
-            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-            print(f"  [{device}] Loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"[{device}] OmniSVG checkpoint not found: {ckpt_path}. "
+            "Please set --omnisvg_checkpoint explicitly."
+        )
+
+    print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
+    if os.path.isdir(ckpt_path):
+        ckpt_file = find_checkpoint_file(ckpt_path)
+        state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
+    else:
+        state_dict = load_checkpoint_state_dict(ckpt_path)
+
+    if not state_dict:
+        raise RuntimeError(f"[{device}] Empty OmniSVG state dict from {ckpt_path}")
+
+    total_keys = len(state_dict)
+
+    missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+    loaded_count = total_keys - len(unexpected)
+
+    if loaded_count < total_keys * 0.5:
+        remapped = _remap_omnisvg_keys_for_qwen25vl(state_dict)
+        missing2, unexpected2 = base_model.load_state_dict(remapped, strict=False)
+        loaded2 = total_keys - len(unexpected2)
+        if loaded2 > loaded_count:
+            missing, unexpected, loaded_count = missing2, unexpected2, loaded2
+            print(f"  [{device}] Applied Qwen2-VL → Qwen2.5-VL key remap")
+
+    print(
+        f"  [{device}] OmniSVG loaded: {loaded_count}/{total_keys}, "
+        f"missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+    if loaded_count < total_keys * 0.5:
+        raise RuntimeError(
+            f"[{device}] OmniSVG checkpoint load failed: only {loaded_count}/{total_keys} keys matched"
+        )
 
     print(f"[{device}][3/3] Moving model to {device} ...")
     base_model = base_model.to(device).eval()

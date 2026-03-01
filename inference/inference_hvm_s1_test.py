@@ -4,14 +4,23 @@ HVM-SVG Inference Script for Test Holdout Dataset (Multi-GPU Data Parallel)
 ============================================================================
 专门用于测试 holdout 数据集的推理脚本
 
+训练配置: CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh \
+    --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 \
+    --pim_layer_indices -1 --run_name s1_gme_last1_fixed003 \
+    --output_dir /mnt/data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03
+
 适配 Stage1 架构: memory_mode=gme, inject_mode=fixed, inject_scale=0.03, pim_layer=[27]
   - GME-only: 只使用 gist memory (3 ref images → 32 gist tokens)
   - 无 PME: 不需要 group_features
   - SimpleGMEInjectionModule: hidden × gist cross-attention + fixed scale
   - 无 AdaptiveGate: 固定缩放注入
 
-用法示例:
-# 测试所有1000个样本 (使用5张GPU)
+可用 checkpoints (outputs_s1_fixed0.03/):
+  - hvm_step_4000.pt
+  - hvm_step_6000.pt
+  - hvm_step_8000.pt
+
+用法示例 (step 4000):
 CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1_test.py \
     --base_model /mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct \
     --omnisvg_checkpoint /mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B \
@@ -26,8 +35,20 @@ CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1_test.py \
     --save_refs \
     --resume
 
-
-
+用法示例 (step 8000):
+CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1_test.py \
+    --base_model /mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct \
+    --omnisvg_checkpoint /mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B \
+    --hvm_checkpoint /mnt/a100_1_data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03/hvm_step_8000.pt \
+    --data_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
+    --hvm_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
+    --sample_indices $(seq 0 999) \
+    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/s1_fixed0.03_step8000_test \
+    --num_candidates 5 \
+    --save_png \
+    --save_gt \
+    --save_refs \
+    --resume
 """
 
 import argparse
@@ -112,6 +133,31 @@ def split_indices(indices: List[int], num_parts: int) -> List[List[int]]:
 # Model loading
 # ============================================================================
 
+def _remap_omnisvg_keys_for_qwen25vl(state_dict: dict) -> dict:
+    """Remap OmniSVG checkpoint keys (Qwen2-VL layout) to Qwen2.5-VL SketchDecoder layout.
+
+    Qwen2-VL (OmniSVG ckpt):           Qwen2.5-VL (SketchDecoder):
+      transformer.visual.*         →  transformer.model.visual.*
+      transformer.model.layers.*   →  transformer.model.language_model.layers.*
+      transformer.model.embed_*    →  transformer.model.language_model.embed_*
+      transformer.model.norm.*     →  transformer.model.language_model.norm.*
+      transformer.lm_head.*        →  transformer.lm_head.*  (unchanged)
+    """
+    remapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+        if new_k.startswith("transformer.visual."):
+            new_k = "transformer.model.visual." + new_k[len("transformer.visual."):]
+        elif (
+            new_k.startswith("transformer.model.")
+            and not new_k.startswith("transformer.model.visual.")
+            and not new_k.startswith("transformer.model.language_model.")
+        ):
+            new_k = "transformer.model.language_model." + new_k[len("transformer.model."):]
+        remapped[new_k] = v
+    return remapped
+
+
 def _load_omnisvg_weights_with_key_alignment(
     base_model: SketchDecoder,
     checkpoint_path: str,
@@ -120,12 +166,10 @@ def _load_omnisvg_weights_with_key_alignment(
     """
     Load OmniSVG weights with key-space alignment.
 
-    OmniSVG checkpoints may store keys for:
-      - SketchDecoder wrapper: "transformer.*"
-      - Raw HF model: "model.*", "lm_head.*", ...
-
-    This helper auto-selects the correct target to avoid silent full mismatch
-    (e.g. missing=728, unexpected=728).
+    Handles three key formats:
+      1. Qwen2.5-VL SketchDecoder keys (direct match)
+      2. Qwen2-VL SketchDecoder keys (needs remap)
+      3. Raw HF model keys (load into base_model.transformer)
     """
     if os.path.isdir(checkpoint_path):
         ckpt_file = find_checkpoint_file(checkpoint_path)
@@ -136,31 +180,41 @@ def _load_omnisvg_weights_with_key_alignment(
     if not state_dict:
         raise RuntimeError(f"[{device}] Empty OmniSVG state dict from {checkpoint_path}")
 
-    preview_keys = list(state_dict.keys())[:50]
-    has_transformer_prefix = any(k.startswith("transformer.") for k in preview_keys)
+    total_keys = len(state_dict)
+    preview_keys = list(state_dict.keys())[:10]
+    has_transformer_prefix = any(k.startswith("transformer.") for k in state_dict)
 
     if has_transformer_prefix:
-        # Checkpoint was saved from SketchDecoder wrapper.
+        # Try direct load first
         missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-        target_name = "SketchDecoder(base_model)"
+        loaded_count = total_keys - len(unexpected)
+
+        if loaded_count < total_keys * 0.5:
+            # Most keys didn't match — likely Qwen2-VL key layout, try remap
+            remapped = _remap_omnisvg_keys_for_qwen25vl(state_dict)
+            missing2, unexpected2 = base_model.load_state_dict(remapped, strict=False)
+            loaded2 = total_keys - len(unexpected2)
+            if loaded2 > loaded_count:
+                missing, unexpected, loaded_count = missing2, unexpected2, loaded2
+                print(f"  [{device}] Applied Qwen2-VL → Qwen2.5-VL key remap")
+
+        target_name = "SketchDecoder"
     else:
-        # Checkpoint contains raw HF model keys. Load directly into wrapped transformer.
         missing, unexpected = base_model.transformer.load_state_dict(state_dict, strict=False)
+        loaded_count = total_keys - len(unexpected)
         target_name = "base_model.transformer"
 
-    loaded_count = len(state_dict) - len(unexpected)
     print(
         f"  [{device}] OmniSVG load -> {target_name}: "
-        f"loaded={loaded_count}/{len(state_dict)}, "
+        f"loaded={loaded_count}/{total_keys}, "
         f"missing={len(missing)}, unexpected={len(unexpected)}"
     )
 
-    # Fail fast if nothing was actually loaded (common silent failure mode).
-    if len(unexpected) == len(state_dict):
+    if loaded_count < total_keys * 0.5:
         sample = ", ".join(preview_keys[:5])
         raise RuntimeError(
-            f"[{device}] OmniSVG checkpoint key mismatch: no parameters loaded from {checkpoint_path}. "
-            f"Sample keys: {sample}"
+            f"[{device}] OmniSVG checkpoint key mismatch: only {loaded_count}/{total_keys} loaded "
+            f"from {checkpoint_path}. Sample keys: {sample}"
         )
 
 
@@ -270,7 +324,7 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
                    tokenizer, hvm_config, device="cuda"):
     """将参考特征注入 HVM 模型。
 
-    Stage1 (gme + fixed): 只需要 gist_feats，不需要 PME 和 text_feats。
+    GME mode (gme + fixed / gme + adaptive): 只需要 gist_feats。
     Full mode: 需要 gist_feats + part_feats + text_feats。
     """
     hvm_dtype = next(model.gme.parameters()).dtype
@@ -284,12 +338,11 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
         gfl_on_device = [[gf.to(device=device, dtype=hvm_dtype) for gf in group_features]]
         model._part_feats, model._part_mask = model.pme(gfl_on_device)
     else:
-        # gme + fixed 模式: 不需要 part_feats
         model._part_feats = None
         model._part_mask = None
 
     # Text feats: 仅在 full mode 下使用
-    if hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "fixed":
+    if hvm_config.memory_mode == "gme":
         model._text_feats = None
         model._text_mask = None
     else:

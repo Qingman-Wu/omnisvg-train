@@ -499,6 +499,63 @@ class AdaptiveGate(nn.Module):
 
 
 # ============================================================================
+# Layer-Gated GME Injection Module (Stage1.5)
+# ============================================================================
+
+class LayerGatedGMEInjectionModule(nn.Module):
+    """
+    GME-only + layer gate 注入模块：
+      - 仅使用 gist memory（GME 输出）
+      - 单次 hidden × gist cross-attention
+      - Layer gate: 可学习标量 tanh(alpha) 控制注入强度
+      - 无 token gate（相比 AdaptiveGate 更轻量）
+
+    相比 SimpleGMEInjectionModule: fixed scale → learnable layer gate
+    相比 AdaptiveGate: 去掉 token-level gate，只保留 layer-level gate
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_gist_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.base_alpha = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+        delta = self.hidden_gist_cross_attn(
+            q=query,
+            k=gist_feats,
+            v=gist_feats,
+        )
+
+        layer_gate = torch.tanh(self.base_alpha)
+        injection = layer_gate * delta
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_rms = delta.detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "layer_gate": layer_gate.detach().float(),
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Simple GME Injection Module (Stage1)
 # ============================================================================
 
