@@ -112,6 +112,58 @@ def split_indices(indices: List[int], num_parts: int) -> List[List[int]]:
 # Model loading
 # ============================================================================
 
+def _load_omnisvg_weights_with_key_alignment(
+    base_model: SketchDecoder,
+    checkpoint_path: str,
+    device: str,
+):
+    """
+    Load OmniSVG weights with key-space alignment.
+
+    OmniSVG checkpoints may store keys for:
+      - SketchDecoder wrapper: "transformer.*"
+      - Raw HF model: "model.*", "lm_head.*", ...
+
+    This helper auto-selects the correct target to avoid silent full mismatch
+    (e.g. missing=728, unexpected=728).
+    """
+    if os.path.isdir(checkpoint_path):
+        ckpt_file = find_checkpoint_file(checkpoint_path)
+        state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
+    else:
+        state_dict = load_checkpoint_state_dict(checkpoint_path)
+
+    if not state_dict:
+        raise RuntimeError(f"[{device}] Empty OmniSVG state dict from {checkpoint_path}")
+
+    preview_keys = list(state_dict.keys())[:50]
+    has_transformer_prefix = any(k.startswith("transformer.") for k in preview_keys)
+
+    if has_transformer_prefix:
+        # Checkpoint was saved from SketchDecoder wrapper.
+        missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
+        target_name = "SketchDecoder(base_model)"
+    else:
+        # Checkpoint contains raw HF model keys. Load directly into wrapped transformer.
+        missing, unexpected = base_model.transformer.load_state_dict(state_dict, strict=False)
+        target_name = "base_model.transformer"
+
+    loaded_count = len(state_dict) - len(unexpected)
+    print(
+        f"  [{device}] OmniSVG load -> {target_name}: "
+        f"loaded={loaded_count}/{len(state_dict)}, "
+        f"missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+
+    # Fail fast if nothing was actually loaded (common silent failure mode).
+    if len(unexpected) == len(state_dict):
+        sample = ", ".join(preview_keys[:5])
+        raise RuntimeError(
+            f"[{device}] OmniSVG checkpoint key mismatch: no parameters loaded from {checkpoint_path}. "
+            f"Sample keys: {sample}"
+        )
+
+
 def load_hvm_model(
     model_size: str,
     hvm_config_path: str,
@@ -157,16 +209,13 @@ def load_hvm_model(
     )
 
     ckpt_path = omnisvg_checkpoint or token_config.checkpoint or defaults["checkpoint"]
-    if ckpt_path and os.path.exists(ckpt_path):
-        print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
-        if os.path.isdir(ckpt_path):
-            ckpt_file = find_checkpoint_file(ckpt_path)
-            state_dict = load_checkpoint_state_dict(ckpt_file) if ckpt_file else None
-        else:
-            state_dict = load_checkpoint_state_dict(ckpt_path)
-        if state_dict:
-            missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
-            print(f"  [{device}] Loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"[{device}] OmniSVG checkpoint not found: {ckpt_path}. "
+            "Please set --omnisvg_checkpoint explicitly."
+        )
+    print(f"  [{device}] Loading OmniSVG checkpoint from {ckpt_path}")
+    _load_omnisvg_weights_with_key_alignment(base_model, ckpt_path, device)
 
     print(f"[{device}][3/4] Building HVM model ...")
     model = HVMSketchDecoder(
