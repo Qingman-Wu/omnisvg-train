@@ -59,6 +59,7 @@ class HVMDataset(Dataset):
         max_len: int = 2048,
         shuffle_rag: bool = False,
         is_eval: bool = False,
+        split: str = "train",  # 新增: train, val, test, test_holdout
     ):
         """
         Args:
@@ -69,6 +70,7 @@ class HVMDataset(Dataset):
             max_len: 最大 SVG token 序列长度
             shuffle_rag: 是否全局打乱 ref 对应关系 (ablation)
             is_eval: 是否为 eval 模式 (val/test)，影响 features 路径格式
+            split: 数据集划分 (train / val / test / test_holdout)
         """
         self.data_dir = data_dir
         self.hvm_dir = hvm_dir
@@ -77,6 +79,7 @@ class HVMDataset(Dataset):
         self.train_config = train_config or TrainConfig()
         self.shuffle_rag = shuffle_rag
         self.is_eval = is_eval
+        self.split = split
         self.features_dir = os.path.join(hvm_dir, "features")
         self.group_features_dir = os.path.join(hvm_dir, "group_features")
 
@@ -84,11 +87,24 @@ class HVMDataset(Dataset):
         self.svg_tokenizer = SVGTokenizer(token_config)
 
         # 加载预计算数据
-        mode_str = "eval" if is_eval else "train"
-        print(f"[HVM Dataset] Loading precomputed data ({mode_str})...")
+        print(f"[HVM Dataset] Loading precomputed data ({split})...")
         self.metadata = self._load_jsonl(os.path.join(hvm_dir, "metadata.jsonl"))
-        self.rag_results = self._load_jsonl(os.path.join(hvm_dir, "rag_results_train.jsonl"))
-        self.groups_data = self._load_jsonl(os.path.join(hvm_dir, "groups_train_ref.jsonl"))
+        
+        # 根据 split 自动选择对应的 jsonl 文件
+        if split == "train":
+            rag_file = "rag_results_train.jsonl"
+            groups_file = "groups_train_ref.jsonl"
+        elif split == "test_holdout":
+            # 测试集 holdout 数据，文件名与 train 保持一致（因为是独立的目录）
+            rag_file = "rag_results_train.jsonl"
+            groups_file = "groups_train_ref.jsonl"
+        else:
+            # 默认 fallback
+            rag_file = "rag_results.jsonl"
+            groups_file = "groups.jsonl"
+            
+        self.rag_results = self._load_jsonl(os.path.join(hvm_dir, rag_file))
+        self.groups_data = self._load_jsonl(os.path.join(hvm_dir, groups_file))
 
         # 建立 idx → metadata/rag/groups 的快速查找
         self.idx_to_meta = {r["idx"]: r for r in self.metadata}
