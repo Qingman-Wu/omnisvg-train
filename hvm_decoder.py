@@ -137,7 +137,23 @@ class HVMSketchDecoder(nn.Module):
     def _install_hooks(self):
         """在指定 decoder layer 后注册 forward hook"""
         qwen_model = self.base_model.transformer.model  # Qwen2_5_VLModel
-        decoder_layers = qwen_model.layers
+        
+        # 兼容 Qwen2.5-VL 和普通 Qwen2
+        decoder_layers = None
+        if hasattr(qwen_model, "layers"):
+            decoder_layers = qwen_model.layers
+        elif hasattr(qwen_model, "language_model"):
+            # Qwen2.5-VL 可能将 layers 放在 language_model 中
+            if hasattr(qwen_model.language_model, "layers"):
+                decoder_layers = qwen_model.language_model.layers
+            elif hasattr(qwen_model.language_model, "model") and hasattr(qwen_model.language_model.model, "layers"):
+                decoder_layers = qwen_model.language_model.model.layers
+            else:
+                # Fallback: search for layers in language_model
+                decoder_layers = getattr(qwen_model.language_model, "layers", None)
+        
+        if decoder_layers is None:
+            raise AttributeError(f"Could not find 'layers' in {type(qwen_model).__name__}. Available attributes: {dir(qwen_model)}")
 
         for layer_idx, pim_idx in self._pim_map.items():
             if layer_idx >= len(decoder_layers):
