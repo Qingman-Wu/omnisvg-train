@@ -556,6 +556,78 @@ class LayerGatedGMEInjectionModule(nn.Module):
 
 
 # ============================================================================
+# Layer-Gated GME+PME Injection Module (Stage2a)
+# ============================================================================
+
+class LayerGatedGMEPMEInjectionModule(nn.Module):
+    """
+    GME+PME 双路独立 cross-attention + layer gate 注入模块：
+      - Gist 路: hidden × gist cross-attention（全局风格信息）
+      - Part 路: hidden × part cross-attention（局部零件信息，带 kv_mask）
+      - 两路 delta 加法融合
+      - Layer gate: tanh(alpha) 控制总注入强度
+
+    相比 LayerGatedGMEInjectionModule: 新增 Part 路
+    消融对照: 后续 Stage2c 的 PrefrontalInjectionModule（层次化 4 步融合）
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_gist_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.hidden_part_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.base_alpha = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        part_feats: torch.Tensor,
+        part_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.hidden_gist_cross_attn(
+            q=query, k=gist_feats, v=gist_feats,
+        )
+        delta_part = self.hidden_part_cross_attn(
+            q=query, k=part_feats, v=part_feats,
+            kv_mask=part_mask,
+        )
+
+        delta = delta_gist + delta_part
+        layer_gate = torch.tanh(self.base_alpha)
+        injection = layer_gate * delta
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_part_rms = delta_part.detach().float().pow(2).mean().sqrt()
+            delta_rms = delta.detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "layer_gate": layer_gate.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_part_rms": delta_part_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Simple GME Injection Module (Stage1)
 # ============================================================================
 

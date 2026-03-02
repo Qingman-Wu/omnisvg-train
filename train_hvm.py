@@ -256,6 +256,8 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
             stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(pim.base_alpha.detach()).item())
             last_stats = getattr(pim, "last_stats", None) or {}
             for src_key, dst_key in [
+                ("delta_gist_rms", f"gate/pim_{pim_idx}_delta_gist_rms"),
+                ("delta_part_rms", f"gate/pim_{pim_idx}_delta_part_rms"),
                 ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
                 ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
                 ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
@@ -865,8 +867,8 @@ def parse_args():
     parser.add_argument("--pim_layer_indices", type=str, default=None,
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
-    parser.add_argument("--memory_mode", type=str, default="full", choices=["full", "gme"],
-                        help="Memory pipeline: full (GME+PME) or gme (GME-only simple path).")
+    parser.add_argument("--memory_mode", type=str, default="full", choices=["full", "gme", "gme_pme"],
+                        help="Memory pipeline: full (GME+PME+Text) or gme (GME-only) or gme_pme (GME+PME, no text).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -945,6 +947,8 @@ def parse_args():
 
     if args.memory_mode == "full" and args.inject_mode != "adaptive":
         parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_pme" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='gme_pme' currently supports only inject_mode='adaptive'.")
 
     return args
 

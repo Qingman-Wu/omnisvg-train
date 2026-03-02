@@ -24,6 +24,7 @@ from hvm_modules import (
     PrefrontalInjectionModule,
     SimpleGMEInjectionModule,
     LayerGatedGMEInjectionModule,
+    LayerGatedGMEPMEInjectionModule,
     count_parameters,
 )
 
@@ -80,6 +81,12 @@ class HVMSketchDecoder(nn.Module):
             self.pme = None
             self.pims = nn.ModuleList([
                 LayerGatedGMEInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
+        elif hvm_config.memory_mode == "gme_pme":
+            self.pme = PartMemoryEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                LayerGatedGMEPMEInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         else:
@@ -201,13 +208,20 @@ class HVMSketchDecoder(nn.Module):
                     hidden_states,
                     gist_feats,
                 )
+            elif self.hvm_config.memory_mode == "gme_pme":
+                part_feats = self._part_feats.expand(B, -1, -1)
+                part_mask = self._part_mask.expand(B, -1)
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    gist_feats,
+                    part_feats,
+                    part_mask,
+                )
             else:
                 part_feats = self._part_feats.expand(B, -1, -1)
                 text_feats = self._text_feats.expand(B, -1, -1)
                 part_mask = self._part_mask.expand(B, -1)
                 text_mask = self._text_mask.expand(B, -1) if self._text_mask is not None else None
-
-                # 应用 PIM
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
                     gist_feats,
@@ -303,9 +317,7 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
-            else:
-                # PME: 逐 group 独立渲染的 features → ≤16 个 part tokens
-                # 将 group features 移到正确的 device 和 dtype
+            elif self.hvm_config.memory_mode == "gme_pme":
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
                     for sample_gfs in group_features_list
@@ -313,9 +325,16 @@ class HVMSketchDecoder(nn.Module):
                 self._part_feats, self._part_mask = self.pme(
                     gfl_on_device,
                 )  # [B, 16, d_model], [B, 16]
-
-                # Text feats: 参考文本 raw embedding
-                #在 HVMSketchDecoder 中缓存并传递 ref_text_mask 到每个 PIM hook。
+                self._text_feats = None
+                self._text_mask = None
+            else:
+                gfl_on_device = [
+                    [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
+                    for sample_gfs in group_features_list
+                ]
+                self._part_feats, self._part_mask = self.pme(
+                    gfl_on_device,
+                )  # [B, 16, d_model], [B, 16]
                 self._text_mask = ref_text_mask.to(device=device, dtype=torch.bool)
                 self._text_feats = self._prepare_text_feats(
                     ref_text_ids.to(device),
