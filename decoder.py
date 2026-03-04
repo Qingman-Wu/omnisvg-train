@@ -87,8 +87,9 @@ class SketchDecoder(nn.Module):
             if labels is not None:
                 labels = labels.to(target_device)
             
-            self.transformer.rope_deltas = None
-            position_ids, _ = self.transformer.get_rope_index(
+            rope_model = self.transformer if hasattr(self.transformer, 'get_rope_index') else self.transformer.model
+            rope_model.rope_deltas = None
+            position_ids, _ = rope_model.get_rope_index(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 image_grid_thw=image_grid_thw

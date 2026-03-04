@@ -94,6 +94,7 @@ EVAL_EVERY=500                      # 每 N 个 optimizer step 评估一次 val 
 # -- Ablation --
 DISABLE_HVM=false                   # true: baseline 模式，不注入 HVM (只跑冻结 OmniSVG)
 SHUFFLE_RAG=false                   # true: 打乱 batch 内 ref_features 对应关系 (验证 RAG 信息 vs 参数效应)
+DELTA_LN=false                      # true: delta 上加 LayerNorm 稳定 scale
 
 # ===================== 解析命令行覆盖 =====================
 while [[ $# -gt 0 ]]; do
@@ -123,6 +124,7 @@ while [[ $# -gt 0 ]]; do
         --no_val)         VAL_DATA_DIR=""; VAL_HVM_DIR=""; shift 1 ;;
         --disable_hvm)    DISABLE_HVM=true;         shift 1 ;;
         --shuffle_rag)    SHUFFLE_RAG=true;         shift 1 ;;
+        --delta_ln)       DELTA_LN=true;            shift 1 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -185,6 +187,9 @@ if [ "$DISABLE_HVM" = true ]; then
 fi
 if [ "$SHUFFLE_RAG" = true ]; then
     echo "  *** SHUFFLE RAG ABLATION: ref correspondence broken ***"
+fi
+if [ "$DELTA_LN" = true ]; then
+    echo "  *** DELTA LAYERNORM: enabled ***"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -254,6 +259,11 @@ fi
 # Ablation: shuffle RAG
 if [ "$SHUFFLE_RAG" = true ]; then
     TRAIN_ARGS+=(--shuffle_rag)
+fi
+
+# Ablation: delta LayerNorm
+if [ "$DELTA_LN" = true ]; then
+    TRAIN_ARGS+=(--delta_ln)
 fi
 
 # ===================== 保存启动快照 =====================

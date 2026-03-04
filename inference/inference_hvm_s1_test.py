@@ -89,7 +89,7 @@ from tokenizer import SVGTokenizer
 # ---------------------------------------------------------------------------
 DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-EXTRA_CANDIDATES_BUFFER = 4
+EXTRA_CANDIDATES_BUFFER = 0
 MIN_SVG_LENGTH = 20
 EMPTY_THRESHOLD = 250
 

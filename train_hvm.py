@@ -122,6 +122,24 @@ def load_omnisvg_base(
             state_dict = load_checkpoint_state_dict(ckpt_path)
 
         if state_dict:
+            # Remap keys for transformers >=4.57 where Qwen2_5_VL restructured:
+            #   model.X → model.language_model.X  (language parts)
+            #   visual.X → model.visual.X
+            model_keys = set(model.state_dict().keys())
+            sample_ckpt_key = next(iter(state_dict))
+            if sample_ckpt_key not in model_keys:
+                remapped = {}
+                for k, v in state_dict.items():
+                    new_k = k
+                    if k.startswith("transformer.visual."):
+                        new_k = k.replace("transformer.visual.", "transformer.model.visual.", 1)
+                    elif k.startswith("transformer.model.") and not k.startswith("transformer.model.language_model.") and not k.startswith("transformer.model.visual."):
+                        new_k = k.replace("transformer.model.", "transformer.model.language_model.", 1)
+                    remapped[new_k] = v
+                if next(iter(remapped)) in model_keys:
+                    print(f"  Remapped {len(remapped)} checkpoint keys for transformers compat")
+                    state_dict = remapped
+
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             print(f"  Loaded: missing={len(missing)}, unexpected={len(unexpected)}")
     else:
@@ -398,12 +416,19 @@ def train(args):
         inject_mode=args.inject_mode,
         inject_scale=args.inject_scale,
         pim_layer_indices_override=args.pim_layer_indices,
+        delta_ln=args.delta_ln,
     )
 
     # ---- Accelerator ----
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
+    # DeepSpeed ZeRO-2 handles gradient accumulation internally;
+    # its reduce_scatter is incompatible with accelerate's no_sync().
+    import contextlib
+    from accelerate.utils import DistributedType
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        accelerator.no_sync = lambda model: contextlib.nullcontext()
     set_seed(args.seed)
 
     # ---- Tokenizer & Processor ----
@@ -893,6 +918,8 @@ def parse_args():
                         help="Fixed injection scale for inject_mode=fixed.")
     parser.add_argument("--gate_alpha_init", type=float, default=0.05,
                         help="Initial value for AdaptiveGate base_alpha (default: 0.05)")
+    parser.add_argument("--delta_ln", action="store_true", default=False,
+                        help="Add LayerNorm on delta before gating (stabilize delta scale).")
 
     # Data
     parser.add_argument("--data_dir", type=str,

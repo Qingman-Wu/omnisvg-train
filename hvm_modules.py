@@ -57,6 +57,7 @@ class HVMConfig:
     inject_mode: str = "adaptive"  # adaptive: gate 注入, fixed: 固定缩放注入
     inject_scale: float = 0.1      # inject_mode=fixed 时生效
     pim_layer_indices_override: Optional[List[int]] = None
+    delta_ln: bool = False           # delta 上加 LayerNorm 稳定 scale
 
     # === RAG ===
     num_references: int = 3
@@ -508,7 +509,7 @@ class LayerGatedGMEInjectionModule(nn.Module):
       - 仅使用 gist memory（GME 输出）
       - 单次 hidden × gist cross-attention
       - Layer gate: 可学习标量 tanh(alpha) 控制注入强度
-      - 无 token gate（相比 AdaptiveGate 更轻量）
+      - 可选 delta LayerNorm 稳定 scale（config.delta_ln=True）
 
     相比 SimpleGMEInjectionModule: fixed scale → learnable layer gate
     相比 AdaptiveGate: 去掉 token-level gate，只保留 layer-level gate
@@ -523,6 +524,7 @@ class LayerGatedGMEInjectionModule(nn.Module):
             config.pim_num_heads,
             d_inner=config.d_pim_inner,
         )
+        self.delta_norm = nn.LayerNorm(d) if config.delta_ln else None
         self.base_alpha = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
         self.last_stats = {}
 
@@ -537,6 +539,8 @@ class LayerGatedGMEInjectionModule(nn.Module):
             k=gist_feats,
             v=gist_feats,
         )
+        if self.delta_norm is not None:
+            delta = self.delta_norm(delta)
 
         layer_gate = torch.tanh(self.base_alpha)
         injection = layer_gate * delta
