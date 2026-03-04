@@ -628,6 +628,87 @@ class LayerGatedGMEPMEInjectionModule(nn.Module):
 
 
 # ============================================================================
+# Dual-Gated GME+PME Injection Module (Stage2b)
+# ============================================================================
+
+class DualGatedGMEPMEInjectionModule(nn.Module):
+    """
+    GME+PME 双路独立 cross-attention + 独立 gate 注入模块：
+      - Gist 路: hidden × gist cross-attention + tanh(alpha_gist)
+      - Part 路: hidden × part cross-attention + tanh(alpha_part)
+      - 两路分别 gate 后再相加注入
+
+    相比 LayerGatedGMEPMEInjectionModule:
+      - 共享 gate → 独立 gate，解耦 Gist/Part 的 scale 差异
+      - 可通过 alpha_gist / alpha_part 的值诊断两路各自的贡献
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_gist_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.hidden_part_cross_attn = MultiHeadAttention(
+            d,
+            config.pim_num_heads,
+            d_inner=config.d_pim_inner,
+        )
+        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.alpha_part = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        part_feats: torch.Tensor,
+        part_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.hidden_gist_cross_attn(
+            q=query, k=gist_feats, v=gist_feats,
+        )
+        delta_part = self.hidden_part_cross_attn(
+            q=query, k=part_feats, v=part_feats,
+            kv_mask=part_mask,
+        )
+
+        gate_gist = torch.tanh(self.alpha_gist)
+        gate_part = torch.tanh(self.alpha_part)
+
+        inject_gist = gate_gist * delta_gist
+        inject_part = gate_part * delta_part
+        injection = inject_gist + inject_part
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_part_rms = delta_part.detach().float().pow(2).mean().sqrt()
+            inject_gist_rms = inject_gist.detach().float().pow(2).mean().sqrt()
+            inject_part_rms = inject_part.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_gist + delta_part).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_gist": gate_gist.detach().float(),
+                "gate_part": gate_part.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_part_rms": delta_part_rms,
+                "inject_gist_rms": inject_gist_rms,
+                "inject_part_rms": inject_part_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Simple GME Injection Module (Stage1)
 # ============================================================================
 

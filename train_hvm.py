@@ -252,6 +252,24 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
                     stats[dst_key] = val
+        elif hasattr(pim, "alpha_gist"):
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_part"] = float(torch.tanh(pim.alpha_part.detach()).item())
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("gate_gist", f"gate/pim_{pim_idx}_gate_gist"),
+                ("gate_part", f"gate/pim_{pim_idx}_gate_part"),
+                ("delta_gist_rms", f"gate/pim_{pim_idx}_delta_gist_rms"),
+                ("delta_part_rms", f"gate/pim_{pim_idx}_delta_part_rms"),
+                ("inject_gist_rms", f"gate/pim_{pim_idx}_inject_gist_rms"),
+                ("inject_part_rms", f"gate/pim_{pim_idx}_inject_part_rms"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
         elif hasattr(pim, "base_alpha"):
             stats[f"gate/pim_{pim_idx}_tanh_alpha"] = float(torch.tanh(pim.base_alpha.detach()).item())
             last_stats = getattr(pim, "last_stats", None) or {}
@@ -867,8 +885,8 @@ def parse_args():
     parser.add_argument("--pim_layer_indices", type=str, default=None,
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
-    parser.add_argument("--memory_mode", type=str, default="full", choices=["full", "gme", "gme_pme"],
-                        help="Memory pipeline: full (GME+PME+Text) or gme (GME-only) or gme_pme (GME+PME, no text).")
+    parser.add_argument("--memory_mode", type=str, default="full", choices=["full", "gme", "gme_pme", "gme_pme_dual"],
+                        help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), gme_pme_dual (GME+PME dual gate).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -949,6 +967,8 @@ def parse_args():
         parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_pme" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_pme' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_pme_dual" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='gme_pme_dual' currently supports only inject_mode='adaptive'.")
 
     return args
 

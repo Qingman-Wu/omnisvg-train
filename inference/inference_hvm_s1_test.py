@@ -341,8 +341,8 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
         model._part_feats = None
         model._part_mask = None
 
-    # Text feats: 仅在 full mode 下使用
-    if hvm_config.memory_mode == "gme":
+    # Text feats: 仅在 full mode 下使用 (gme 和 gme_pme 都不需要 text)
+    if hvm_config.memory_mode in ("gme", "gme_pme"):
         model._text_feats = None
         model._text_mask = None
     else:

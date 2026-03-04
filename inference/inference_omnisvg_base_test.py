@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_omnisvg_base_test.py \
     --data_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
     --hvm_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
     --sample_indices $(seq 0 999) \
-    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/omnisvg_baseline222 \
+    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/omnisvg_baseline \
     --num_candidates 5 \
     --save_png \
     --save_gt \
