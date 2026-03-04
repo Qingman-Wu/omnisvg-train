@@ -26,6 +26,7 @@ from hvm_modules import (
     LayerGatedGMEInjectionModule,
     LayerGatedGMEPMEInjectionModule,
     DualGatedGMEPMEInjectionModule,
+    HierarchicalGMEPMEInjectionModule,
     count_parameters,
 )
 
@@ -94,6 +95,12 @@ class HVMSketchDecoder(nn.Module):
             self.pme = PartMemoryEncoder(hvm_config)
             self.pims = nn.ModuleList([
                 DualGatedGMEPMEInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
+        elif hvm_config.memory_mode == "gme_pme_hier":
+            self.pme = PartMemoryEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                HierarchicalGMEPMEInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         else:
@@ -215,7 +222,7 @@ class HVMSketchDecoder(nn.Module):
                     hidden_states,
                     gist_feats,
                 )
-            elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual"):
+            elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier"):
                 part_feats = self._part_feats.expand(B, -1, -1)
                 part_mask = self._part_mask.expand(B, -1)
                 hidden_states = self.pims[pim_idx](
@@ -324,7 +331,7 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
-            elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual"):
+            elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier"):
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
                     for sample_gfs in group_features_list

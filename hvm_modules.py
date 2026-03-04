@@ -713,6 +713,114 @@ class DualGatedGMEPMEInjectionModule(nn.Module):
 
 
 # ============================================================================
+# Hierarchical GME+PME Injection Module (Stage2c)
+# ============================================================================
+
+class HierarchicalGMEPMEInjectionModule(nn.Module):
+    """
+    GME+PME 层次化融合 + 双独立 gate 注入模块：
+      - Part 预处理:
+        Step 1: Part × Gist cross-attention → Part 获得全局上下文
+        Step 2: Part self-attention → 各组带着全局上下文互相整合
+      - 注入:
+        Gist 路: hidden × gist cross-attention + tanh(alpha_gist)  (与 DualGated 完全一致)
+        Part 路: hidden × refined_part cross-attention + tanh(alpha_part)
+
+    相比 DualGatedGMEPMEInjectionModule:
+      - 唯一区别: Part features 先经过 Part×Gist + Part self-attn 预处理
+      - Gist 路完全不变, gate 机制完全不变
+      - 消融目标: 验证层次化 Part 融合是否让 Part 变得有用
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        # Part 预处理 (新增)
+        self.part_gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.part_gist_norm = nn.LayerNorm(d)
+        self.part_self_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.part_self_norm = nn.LayerNorm(d)
+
+        # 注入 (与 DualGated 完全一致)
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.hidden_part_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.alpha_part = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        part_feats: torch.Tensor,
+        part_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # === Part 预处理: 层次化融合 ===
+        # Step 1: Part × Gist cross-attention — Part 在全局中定位自己
+        step1_out = self.part_gist_cross_attn(
+            q=part_feats, k=gist_feats, v=gist_feats,
+        )
+        context_part = self.part_gist_norm(step1_out + part_feats)
+
+        # Step 2: Part self-attention — 各组带着全局上下文互相整合
+        step2_out = self.part_self_attn(
+            q=context_part, k=context_part, v=context_part,
+            kv_mask=part_mask,
+        )
+        refined_part = self.part_self_norm(step2_out + context_part)
+
+        # === 双 Gate 注入 (与 DualGated 完全一致) ===
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.hidden_gist_cross_attn(
+            q=query, k=gist_feats, v=gist_feats,
+        )
+        delta_part = self.hidden_part_cross_attn(
+            q=query, k=refined_part, v=refined_part,
+            kv_mask=part_mask,
+        )
+
+        gate_gist = torch.tanh(self.alpha_gist)
+        gate_part = torch.tanh(self.alpha_part)
+
+        inject_gist = gate_gist * delta_gist
+        inject_part = gate_part * delta_part
+        injection = inject_gist + inject_part
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_part_rms = delta_part.detach().float().pow(2).mean().sqrt()
+            inject_gist_rms = inject_gist.detach().float().pow(2).mean().sqrt()
+            inject_part_rms = inject_part.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_gist + delta_part).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_gist": gate_gist.detach().float(),
+                "gate_part": gate_part.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_part_rms": delta_part_rms,
+                "inject_gist_rms": inject_gist_rms,
+                "inject_part_rms": inject_part_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Simple GME Injection Module (Stage1)
 # ============================================================================
 
