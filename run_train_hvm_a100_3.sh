@@ -42,6 +42,7 @@ INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 GATE_ALPHA_INIT=0.05
+GME_NUM_QUERIES=32
 DELTA_LN=true
 
 # -- 训练超参 --
@@ -87,6 +88,7 @@ while [[ $# -gt 0 ]]; do
         --resume)          RESUME_FROM="$2";         shift 2 ;;
         --hvm_ckpt)        HVM_CHECKPOINT="$2";      shift 2 ;;
         --gate_alpha_init) GATE_ALPHA_INIT="$2";     shift 2 ;;
+        --gme_num_queries) GME_NUM_QUERIES="$2";    shift 2 ;;
         --memory_mode)     MEMORY_MODE="$2";         shift 2 ;;
         --inject_mode)     INJECT_MODE="$2";         shift 2 ;;
         --inject_scale)    INJECT_SCALE="$2";        shift 2 ;;
@@ -141,6 +143,7 @@ echo "  Effective BS:      ${EFFECTIVE_BS}"
 echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
 echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
+echo "  GME num queries:   ${GME_NUM_QUERIES}"
 echo "  Memory mode:       ${MEMORY_MODE}"
 echo "  Inject mode:       ${INJECT_MODE}"
 echo "  PIM layers:        ${PIM_LAYER_INDICES}"
@@ -177,6 +180,7 @@ TRAIN_ARGS=(
     --inject_mode "$INJECT_MODE"
     --inject_scale "$INJECT_SCALE"
     --gate_alpha_init "$GATE_ALPHA_INIT"
+    --gme_num_queries "$GME_NUM_QUERIES"
     --batch_size "$BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --epochs "$EPOCHS"

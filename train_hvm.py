@@ -412,6 +412,7 @@ def train(args):
         pim_layer_interval=args.pim_layer_interval, #4，每隔 N 层插入 PIM
         num_decoder_layers=28,
         gate_alpha_init=args.gate_alpha_init,
+        gme_num_queries=args.gme_num_queries,
         memory_mode=args.memory_mode,
         inject_mode=args.inject_mode,
         inject_scale=args.inject_scale,
@@ -920,6 +921,8 @@ def parse_args():
                         help="Fixed injection scale for inject_mode=fixed.")
     parser.add_argument("--gate_alpha_init", type=float, default=0.05,
                         help="Initial value for AdaptiveGate base_alpha (default: 0.05)")
+    parser.add_argument("--gme_num_queries", type=int, default=32,
+                        help="Number of GME QFormer queries (default: 32)")
     parser.add_argument("--delta_ln", action="store_true", default=False,
                         help="Add LayerNorm on delta before gating (stabilize delta scale).")
 

@@ -54,6 +54,7 @@ D_QFORMER=1024                      # QFormer 内部维度
 D_PIM_INNER=512                     # PIM attention bottleneck 维度
 PIM_LAYER_INTERVAL=4                # 每隔 N 层插入 PIM
 GATE_ALPHA_INIT=0.0                # AdaptiveGate 冷启动初值 (tanh后约等于本值)
+GME_NUM_QUERIES=32                  # GME QFormer query 数量
 MEMORY_MODE="full"                  # full / gme
 INJECT_MODE="adaptive"              # adaptive / fixed
 INJECT_SCALE=0.1                    # fixed 注入强度
@@ -108,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --resume)         RESUME_FROM="$2";         shift 2 ;;
         --hvm_ckpt)       HVM_CHECKPOINT="$2";      shift 2 ;;
         --gate_alpha_init) GATE_ALPHA_INIT="$2";    shift 2 ;;
+        --gme_num_queries) GME_NUM_QUERIES="$2";   shift 2 ;;
         --memory_mode)    MEMORY_MODE="$2";         shift 2 ;;
         --inject_mode)    INJECT_MODE="$2";         shift 2 ;;
         --inject_scale)   INJECT_SCALE="$2";        shift 2 ;;
@@ -162,6 +164,7 @@ echo "  Effective BS:      ${EFFECTIVE_BS}"
 echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
 echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
+echo "  GME num queries:   ${GME_NUM_QUERIES}"
 echo "  Memory mode:       ${MEMORY_MODE}"
 echo "  Inject mode:       ${INJECT_MODE}"
 echo "  Inject scale:      ${INJECT_SCALE}"
@@ -210,6 +213,7 @@ TRAIN_ARGS=(
     --inject_mode "$INJECT_MODE"
     --inject_scale "$INJECT_SCALE"
     --gate_alpha_init "$GATE_ALPHA_INIT"
+    --gme_num_queries "$GME_NUM_QUERIES"
     --batch_size "$BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --epochs "$EPOCHS"
