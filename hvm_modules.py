@@ -821,6 +821,92 @@ class HierarchicalGMEPMEInjectionModule(nn.Module):
 
 
 # ============================================================================
+# Single-Path Hierarchical GME+PME Injection Module (Stage2d)
+# ============================================================================
+
+class SinglePathHierarchicalInjectionModule(nn.Module):
+    """
+    GME+PME 层次化融合 + 单路注入模块：
+      - Part 预处理 (与 Hierarchical 完全一致):
+        Step 1: Part × Gist cross-attention → Part 获得全局上下文
+        Step 2: Part self-attention → 各组带着全局上下文互相整合
+      - 单路注入:
+        Hidden × refined_part cross-attention → delta
+        tanh(alpha) 层级 gate
+
+    相比 HierarchicalGMEPMEInjectionModule:
+      - 去掉独立的 Gist 注入路径 (hidden × gist)
+      - Gist 信息只通过 Step 1 融入 Part 后间接注入
+      - 单 gate (无 alpha_gist / alpha_part 分离)
+      - 消融目标: 验证 gist+part 融合后单路注入 vs 双路分别注入
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        # Part 预处理 (与 Hierarchical 完全一致)
+        self.part_gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.part_gist_norm = nn.LayerNorm(d)
+        self.part_self_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.part_self_norm = nn.LayerNorm(d)
+
+        # 单路注入
+        self.hidden_norm = nn.LayerNorm(d)
+        self.hidden_aligned_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.base_alpha = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        part_feats: torch.Tensor,
+        part_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # === Part 预处理: 层次化融合 ===
+        step1_out = self.part_gist_cross_attn(
+            q=part_feats, k=gist_feats, v=gist_feats,
+        )
+        context_part = self.part_gist_norm(step1_out + part_feats)
+
+        step2_out = self.part_self_attn(
+            q=context_part, k=context_part, v=context_part,
+            kv_mask=part_mask,
+        )
+        refined_part = self.part_self_norm(step2_out + context_part)
+
+        # === 单路注入: hidden × refined_part ===
+        query = self.hidden_norm(hidden_state)
+        delta = self.hidden_aligned_cross_attn(
+            q=query, k=refined_part, v=refined_part,
+            kv_mask=part_mask,
+        )
+
+        layer_gate = torch.tanh(self.base_alpha)
+        injection = layer_gate * delta
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_rms = delta.detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "layer_gate": layer_gate.detach().float(),
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
 # Simple GME Injection Module (Stage1)
 # ============================================================================
 

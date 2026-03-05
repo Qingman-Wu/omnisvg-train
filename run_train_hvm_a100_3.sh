@@ -8,8 +8,8 @@
 #   CUDA_VISIBLE_DEVICES=0,1 bash run_train_a100_2.sh --num_gpus 2
 #
 # 当前实验:
-#   s2_gme_last4_adaptive_gate_ln (GME-only + LayerNorm on delta)
-#   对比: s2_gme_last4_adaptive_gate (无 LN 版，a100_1 已跑完)
+#   s2d_hier_singlepath_last4 (GME+PME 层次化融合 + 单路注入)
+#   对比: s2c_gme_pme_hier (双路注入 + dual gate)
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -37,13 +37,13 @@ OMNISVG_CHECKPOINT="/mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
 # -- HVM 架构 --
 D_QFORMER=1024
 D_PIM_INNER=512
-MEMORY_MODE="gme"
+MEMORY_MODE="gme_pme_single"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 GATE_ALPHA_INIT=0.05
 GME_NUM_QUERIES=32
-DELTA_LN=true
+DELTA_LN=false
 
 # -- 训练超参 --
 # 3卡: bs4 × grad_accum8 × 3gpu = 96 (与 a100_1 的 bs4 × 4 × 6 = 96 一致)
@@ -61,12 +61,12 @@ MIXED_PRECISION="bf16"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/a100_4_data2/wuqingman/omnisvg-train/outputs_s2_gme_last4_adaptive_gate_ln"
+OUTPUT_DIR="/mnt/a100_1_data3/wuqingman/omnisvg-train/outputs_s2d_hier_singlepath_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 EVAL_EVERY=500
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s2_gme_last4_adaptive_gate_ln"
+SWANLAB_RUN_NAME="s2d_hier_singlepath_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
