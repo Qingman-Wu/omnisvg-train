@@ -129,6 +129,8 @@ while [[ $# -gt 0 ]]; do
         --delta_ln)       DELTA_LN=true;            shift 1 ;;
         --dra_d_inner)    DRA_D_INNER="$2";         shift 2 ;;
         --dra_n_heads)    DRA_N_HEADS="$2";         shift 2 ;;
+        --cdm_num_queries) CDM_NUM_QUERIES="$2";    shift 2 ;;
+        --cdm_num_layers) CDM_NUM_LAYERS="$2";      shift 2 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -199,6 +201,10 @@ fi
 if [ "$MEMORY_MODE" = "gme_dra" ]; then
     echo "  DRA d_inner:       ${DRA_D_INNER:-128}"
     echo "  DRA n_heads:       ${DRA_N_HEADS:-4}"
+fi
+if [ "$MEMORY_MODE" = "gme_cdm" ]; then
+    echo "  CDM queries:       ${CDM_NUM_QUERIES:-16}"
+    echo "  CDM layers:        ${CDM_NUM_LAYERS:-6}"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -282,6 +288,14 @@ if [ -n "$DRA_D_INNER" ]; then
 fi
 if [ -n "$DRA_N_HEADS" ]; then
     TRAIN_ARGS+=(--dra_n_heads "$DRA_N_HEADS")
+fi
+
+# CDM 参数
+if [ -n "$CDM_NUM_QUERIES" ]; then
+    TRAIN_ARGS+=(--cdm_num_queries "$CDM_NUM_QUERIES")
+fi
+if [ -n "$CDM_NUM_LAYERS" ]; then
+    TRAIN_ARGS+=(--cdm_num_layers "$CDM_NUM_LAYERS")
 fi
 
 # ===================== 保存启动快照 =====================

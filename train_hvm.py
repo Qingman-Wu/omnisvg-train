@@ -270,6 +270,24 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
                     stats[dst_key] = val
+        elif hasattr(pim, "alpha_detail"):
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = float(torch.tanh(pim.alpha_detail.detach()).item())
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("gate_gist", f"gate/pim_{pim_idx}_gate_gist"),
+                ("gate_detail", f"gate/pim_{pim_idx}_gate_detail"),
+                ("delta_gist_rms", f"gate/pim_{pim_idx}_delta_gist_rms"),
+                ("delta_detail_rms", f"gate/pim_{pim_idx}_delta_detail_rms"),
+                ("inject_gist_rms", f"gate/pim_{pim_idx}_inject_gist_rms"),
+                ("inject_detail_rms", f"gate/pim_{pim_idx}_inject_detail_rms"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
         elif hasattr(pim, "alpha_ref"):
             stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
             stats[f"gate/pim_{pim_idx}_tanh_alpha_ref"] = float(torch.tanh(pim.alpha_ref.detach()).item())
@@ -438,6 +456,8 @@ def train(args):
         delta_ln=args.delta_ln,
         dra_d_inner=args.dra_d_inner,
         dra_n_heads=args.dra_n_heads,
+        cdm_num_queries=args.cdm_num_queries,
+        cdm_num_layers=args.cdm_num_layers,
     )
 
     # ---- Accelerator ----
@@ -932,11 +952,12 @@ def parse_args():
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
     parser.add_argument("--memory_mode", type=str, default="full",
-                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra"],
+                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm"],
                         help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), "
                              "gme_pme_dual (GME+PME dual gate), gme_pme_hier (GME+PME hierarchical fusion + dual gate), "
                              "gme_pme_single (GME+PME hierarchical fusion + single path injection), "
-                             "gme_dra (GME + Direct Reference Attention).")
+                             "gme_dra (GME + Direct Reference Attention), "
+                             "gme_cdm (GME + Complementary Detail Memory).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -951,6 +972,10 @@ def parse_args():
                         help="DRA ref cross-attn bottleneck dimension (default: 128)")
     parser.add_argument("--dra_n_heads", type=int, default=4,
                         help="DRA ref cross-attn number of heads (default: 4)")
+    parser.add_argument("--cdm_num_queries", type=int, default=16,
+                        help="CDM number of learnable queries (default: 16)")
+    parser.add_argument("--cdm_num_layers", type=int, default=6,
+                        help="CDM QFormer number of layers (default: 6)")
 
     # Data
     parser.add_argument("--data_dir", type=str,
@@ -1033,6 +1058,8 @@ def parse_args():
         parser.error("memory_mode='gme_pme_single' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_dra" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_dra' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_cdm" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
 
     return args
 

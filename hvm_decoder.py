@@ -29,6 +29,8 @@ from hvm_modules import (
     HierarchicalGMEPMEInjectionModule,
     SinglePathHierarchicalInjectionModule,
     DRAInjectionModule,
+    CDMEncoder,
+    CDMInjectionModule,
     count_parameters,
 )
 
@@ -75,6 +77,7 @@ class HVMSketchDecoder(nn.Module):
 
         # ---- HVM Modules (trainable) ----
         self.gme = GistMemoryEncoder(hvm_config)
+        self.cdm = None
         if hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "fixed":
             self.pme = None
             self.pims = nn.ModuleList([
@@ -117,6 +120,13 @@ class HVMSketchDecoder(nn.Module):
                 DRAInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
+        elif hvm_config.memory_mode == "gme_cdm":
+            self.pme = None
+            self.cdm = CDMEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                CDMInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
         else:
             self.pme = PartMemoryEncoder(hvm_config)
             self.pims = nn.ModuleList([
@@ -133,6 +143,8 @@ class HVMSketchDecoder(nn.Module):
         self.gme = self.gme.to(dtype=base_dtype)
         if self.pme is not None:
             self.pme = self.pme.to(dtype=base_dtype)
+        if self.cdm is not None:
+            self.cdm = self.cdm.to(dtype=base_dtype)
         self.pims = self.pims.to(dtype=base_dtype)
         print(f"[HVM] HVM modules dtype set to {base_dtype}")
 
@@ -145,6 +157,7 @@ class HVMSketchDecoder(nn.Module):
         self._part_mask = None
         self._text_mask = None
         self._ref_feats = None
+        self._detail_feats = None
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
@@ -243,6 +256,13 @@ class HVMSketchDecoder(nn.Module):
                     hidden_states,
                     gist_feats,
                     ref_feats,
+                )
+            elif self.hvm_config.memory_mode == "gme_cdm":
+                detail_feats = self._detail_feats.expand(B, -1, -1)
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    gist_feats,
+                    detail_feats,
                 )
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
                 part_feats = self._part_feats.expand(B, -1, -1)
@@ -362,6 +382,16 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
+            elif self.hvm_config.memory_mode == "gme_cdm":
+                # CDM: gist_feats detach 后和展平的 ref_features 一起送入 CDM 编码器
+                B_ref = ref_features.shape[0]
+                flat_ref = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
+                self._detail_feats = self.cdm(flat_ref, self._gist_feats.detach())
+                self._ref_feats = None
+                self._part_feats = None
+                self._part_mask = None
+                self._text_feats = None
+                self._text_mask = None
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
@@ -389,6 +419,7 @@ class HVMSketchDecoder(nn.Module):
             # 没有 HVM 输入，退化为普通 OmniSVG
             self._gist_feats = None
             self._ref_feats = None
+            self._detail_feats = None
             self._part_feats = None
             self._text_feats = None
             self._part_mask = None
@@ -419,6 +450,8 @@ class HVMSketchDecoder(nn.Module):
         params.extend(self.gme.parameters())
         if self.pme is not None:
             params.extend(self.pme.parameters())
+        if self.cdm is not None:
+            params.extend(self.cdm.parameters())
         params.extend(self.pims.parameters())
         return params
 
@@ -430,6 +463,9 @@ class HVMSketchDecoder(nn.Module):
         if self.pme is not None:
             for name, param in self.pme.named_parameters():
                 named_params.append((f"pme.{name}", param))
+        if self.cdm is not None:
+            for name, param in self.cdm.named_parameters():
+                named_params.append((f"cdm.{name}", param))
         for name, param in self.pims.named_parameters():
             named_params.append((f"pims.{name}", param))
         return named_params
@@ -442,6 +478,9 @@ class HVMSketchDecoder(nn.Module):
         if self.pme is not None:
             for name, param in self.pme.named_parameters():
                 state_dict[f"pme.{name}"] = param.data
+        if self.cdm is not None:
+            for name, param in self.cdm.named_parameters():
+                state_dict[f"cdm.{name}"] = param.data
         for name, param in self.pims.named_parameters():
             state_dict[f"pims.{name}"] = param.data
         torch.save(state_dict, save_path)
@@ -452,6 +491,7 @@ class HVMSketchDecoder(nn.Module):
         state_dict = torch.load(load_path, map_location="cpu", weights_only=True)
         gme_dict = {k.replace("gme.", ""): v for k, v in state_dict.items() if k.startswith("gme.")}
         pme_dict = {k.replace("pme.", ""): v for k, v in state_dict.items() if k.startswith("pme.")}
+        cdm_dict = {k.replace("cdm.", ""): v for k, v in state_dict.items() if k.startswith("cdm.")}
         pims_dict = {k.replace("pims.", ""): v for k, v in state_dict.items() if k.startswith("pims.")}
 
         self.gme.load_state_dict(gme_dict, strict=True)
@@ -459,6 +499,10 @@ class HVMSketchDecoder(nn.Module):
             self.pme.load_state_dict(pme_dict, strict=True)
         elif pme_dict:
             print("[HVM] Warning: checkpoint contains PME weights, but current mode disables PME. Skipping PME load.")
+        if self.cdm is not None:
+            self.cdm.load_state_dict(cdm_dict, strict=True)
+        elif cdm_dict:
+            print("[HVM] Warning: checkpoint contains CDM weights, but current mode disables CDM. Skipping CDM load.")
         self.pims.load_state_dict(pims_dict, strict=True)
         print(f"[HVM] Loaded HVM checkpoint from {load_path}")
 
@@ -474,6 +518,9 @@ class HVMSketchDecoder(nn.Module):
         print(f"    GME: {count_parameters(self.gme) / 1e6:.1f}M")
         pme_params = count_parameters(self.pme) / 1e6 if self.pme is not None else 0.0
         print(f"    PME: {pme_params:.1f}M")
+        cdm_params = count_parameters(self.cdm) / 1e6 if self.cdm is not None else 0.0
+        if cdm_params > 0:
+            print(f"    CDM: {cdm_params:.1f}M")
         print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
         print(f"  Memory mode: {self.hvm_config.memory_mode}")
         print(f"  Inject mode: {self.hvm_config.inject_mode}")

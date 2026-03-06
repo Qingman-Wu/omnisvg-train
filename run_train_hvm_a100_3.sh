@@ -8,10 +8,10 @@
 #   CUDA_VISIBLE_DEVICES=0,1 bash run_train_a100_2.sh --num_gpus 2
 #
 # 当前实验:
-#   s3_dra_last4 (GME + Direct Reference Attention)
+#   s3_cdm_last4 (GME + Complementary Detail Memory)
 #   对比: s2_gme_last4_adaptive_gate (GME-only adaptive)
-#   核心假设: 原始 ref_features [B,768,3584] 通过窄 bottleneck 注入,
-#             能否提供 QFormer 压缩丢失的细粒度信息？
+#   核心假设: 16 个 learnable queries 先看 gist 再从 ref 中提取互补细节,
+#             能否捕获 GME 32 gist tokens 遗漏的信息？
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -39,7 +39,7 @@ OMNISVG_CHECKPOINT="/mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
 # -- HVM 架构 --
 D_QFORMER=1024
 D_PIM_INNER=512
-MEMORY_MODE="gme_dra"
+MEMORY_MODE="gme_cdm"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
@@ -48,6 +48,8 @@ GME_NUM_QUERIES=32
 DELTA_LN=false
 DRA_D_INNER=128
 DRA_N_HEADS=4
+CDM_NUM_QUERIES=16
+CDM_NUM_LAYERS=6
 
 # -- 训练超参 --
 # 3卡: bs4 × grad_accum8 × 3gpu = 96 (与 a100_1 的 bs4 × 4 × 6 = 96 一致)
@@ -65,12 +67,12 @@ MIXED_PRECISION="bf16"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/a100_1_data3/wuqingman/omnisvg-train/outputs_s3_dra_last4"
+OUTPUT_DIR="/mnt/a100_1_data3/wuqingman/omnisvg-train/outputs_s3_cdm_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 EVAL_EVERY=500
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s3_dra_last4"
+SWANLAB_RUN_NAME="s3_cdm_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -108,6 +110,8 @@ while [[ $# -gt 0 ]]; do
         --no_delta_ln)     DELTA_LN=false;           shift 1 ;;
         --dra_d_inner)     DRA_D_INNER="$2";         shift 2 ;;
         --dra_n_heads)     DRA_N_HEADS="$2";         shift 2 ;;
+        --cdm_num_queries) CDM_NUM_QUERIES="$2";     shift 2 ;;
+        --cdm_num_layers)  CDM_NUM_LAYERS="$2";      shift 2 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -157,6 +161,10 @@ echo "  Delta LayerNorm:   ${DELTA_LN}"
 if [ "$MEMORY_MODE" = "gme_dra" ]; then
     echo "  DRA d_inner:       ${DRA_D_INNER}"
     echo "  DRA n_heads:       ${DRA_N_HEADS}"
+fi
+if [ "$MEMORY_MODE" = "gme_cdm" ]; then
+    echo "  CDM queries:       ${CDM_NUM_QUERIES}"
+    echo "  CDM layers:        ${CDM_NUM_LAYERS}"
 fi
 echo "  Mixed precision:   ${MIXED_PRECISION}"
 echo "  Output dir:        ${OUTPUT_DIR}"
@@ -242,6 +250,10 @@ fi
 
 if [ "$MEMORY_MODE" = "gme_dra" ]; then
     TRAIN_ARGS+=(--dra_d_inner "$DRA_D_INNER" --dra_n_heads "$DRA_N_HEADS")
+fi
+
+if [ "$MEMORY_MODE" = "gme_cdm" ]; then
+    TRAIN_ARGS+=(--cdm_num_queries "$CDM_NUM_QUERIES" --cdm_num_layers "$CDM_NUM_LAYERS")
 fi
 
 # ===================== 保存启动快照 =====================

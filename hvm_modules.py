@@ -48,6 +48,12 @@ class HVMConfig:
     pme_max_groups: int = 4
     pme_max_tokens: int = 16     # 4 groups × 4 queries
 
+    # === CDM (Complementary Detail Memory) ===
+    cdm_num_queries: int = 16
+    cdm_num_layers: int = 6
+    cdm_num_heads: int = 8
+    cdm_ff_mult: int = 4
+
     # === DRA (Direct Reference Attention) ===
     dra_d_inner: int = 128           # DRA ref path bottleneck 维度
     dra_n_heads: int = 4             # DRA ref path attention heads
@@ -319,6 +325,121 @@ class GistMemoryEncoder(nn.Module):
         flat_feats = ref_features.reshape(B, N_ref * T, D)
         # 过 QFormer: 768 tokens → 32 queries
         return self.qformer(flat_feats)  # [B, 32, d_model]
+
+
+# ============================================================================
+# CDM (Complementary Detail Memory) Encoder
+# ============================================================================
+
+class CDMQFormerLayer(nn.Module):
+    """
+    CDM QFormer 单层: SelfAttn → CrossAttn(gist) → CrossAttn(ref) → FFN
+    比标准 QFormerLayer 多一路 gist cross-attention，实现"残差提取"。
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads)
+        self.norm_sa = nn.LayerNorm(d_model)
+
+        self.gist_cross_attn = MultiHeadAttention(d_model, n_heads)
+        self.norm_gist_ca = nn.LayerNorm(d_model)
+
+        self.ref_cross_attn = MultiHeadAttention(d_model, n_heads)
+        self.norm_ref_ca = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+        self.norm_ff = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        gist_kv: torch.Tensor,
+        ref_kv: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            queries: [B, Nq, D]
+            gist_kv: [B, 32, D]   gist features (detached)
+            ref_kv:  [B, 768, D]  raw ref features (projected)
+        """
+        q_norm = self.norm_sa(queries)
+        queries = queries + self.self_attn(q_norm, q_norm, q_norm)
+
+        q_norm = self.norm_gist_ca(queries)
+        queries = queries + self.gist_cross_attn(q_norm, gist_kv, gist_kv)
+
+        q_norm = self.norm_ref_ca(queries)
+        queries = queries + self.ref_cross_attn(q_norm, ref_kv, ref_kv)
+
+        queries = queries + self.ffn(self.norm_ff(queries))
+        return queries
+
+
+class CDMEncoder(nn.Module):
+    """
+    互补细节记忆编码器 (Complementary Detail Memory)。
+
+    16 个 learnable queries 先了解 gist 覆盖了什么，
+    再从原始 768 ref tokens 中提取 gist 遗漏的互补细节。
+
+    输入:
+      - ref_features: [B, 768, 3584]  (展平后的 3 张参考图 vision features)
+      - gist_feats:   [B, 32, 3584]   (GME 输出, detached)
+    输出:
+      - detail_feats: [B, 16, 3584]
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        self.config = config
+        d_q = config.d_qformer  # 1024
+
+        self.queries = nn.Parameter(torch.randn(1, config.cdm_num_queries, d_q) * 0.02)
+
+        self.ref_proj = nn.Linear(config.d_vision, d_q, bias=False)
+        self.ref_norm = nn.LayerNorm(d_q)
+
+        self.gist_proj = nn.Linear(config.d_model, d_q, bias=False)
+        self.gist_norm = nn.LayerNorm(d_q)
+
+        d_ff = d_q * config.cdm_ff_mult
+        self.layers = nn.ModuleList([
+            CDMQFormerLayer(d_q, config.cdm_num_heads, d_ff)
+            for _ in range(config.cdm_num_layers)
+        ])
+
+        self.output_proj = nn.Linear(d_q, config.d_model, bias=False)
+        self.output_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        ref_features: torch.Tensor,
+        gist_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            ref_features: [B, 768, d_vision]
+            gist_feats:   [B, 32, d_model]  (should be detached by caller)
+        Returns:
+            detail_feats: [B, cdm_num_queries, d_model]
+        """
+        B = ref_features.shape[0]
+        dtype = self.ref_proj.weight.dtype
+
+        ref_kv = self.ref_norm(self.ref_proj(ref_features.to(dtype=dtype)))
+        gist_kv = self.gist_norm(self.gist_proj(gist_feats.to(dtype=dtype)))
+
+        queries = self.queries.expand(B, -1, -1)
+
+        for layer in self.layers:
+            queries = layer(queries, gist_kv, ref_kv)
+
+        return self.output_norm(self.output_proj(queries))
 
 
 # ============================================================================
@@ -979,6 +1100,80 @@ class DRAInjectionModule(nn.Module):
                 "delta_ref_rms": delta_ref_rms,
                 "inject_gist_rms": inject_gist_rms,
                 "inject_ref_rms": inject_ref_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
+# CDM Injection Module (Stage3)
+# ============================================================================
+
+class CDMInjectionModule(nn.Module):
+    """
+    GME + CDM 注入模块：
+      - Gist 路:   hidden × gist cross-attn (d_inner=512, 8 heads) + tanh(α_gist)
+      - Detail 路: hidden × detail cross-attn (d_inner=512, 8 heads) + tanh(α_detail)
+      - 两路分别 gate 后相加注入
+
+    与 DRA 的区别: Detail KV 是 CDM 编码器的 16 tokens 而非原始 768 tokens，
+    所以 d_inner 不需要收窄，和 Gist 路规格一致。
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        self.hidden_norm = nn.LayerNorm(d)
+
+        self.gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+
+        self.detail_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        detail_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+        delta_detail = self.detail_cross_attn(q=query, k=detail_feats, v=detail_feats)
+
+        gate_gist = torch.tanh(self.alpha_gist)
+        gate_detail = torch.tanh(self.alpha_detail)
+
+        inject_gist = gate_gist * delta_gist
+        inject_detail = gate_detail * delta_detail
+        injection = inject_gist + inject_detail
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_detail_rms = delta_detail.detach().float().pow(2).mean().sqrt()
+            inject_gist_rms = inject_gist.detach().float().pow(2).mean().sqrt()
+            inject_detail_rms = inject_detail.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_gist + delta_detail).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_gist": gate_gist.detach().float(),
+                "gate_detail": gate_detail.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_detail_rms": delta_detail_rms,
+                "inject_gist_rms": inject_gist_rms,
+                "inject_detail_rms": inject_detail_rms,
                 "delta_rms": delta_rms,
                 "inject_rms": inject_rms,
                 "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
