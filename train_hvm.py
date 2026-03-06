@@ -270,6 +270,24 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
                     stats[dst_key] = val
+        elif hasattr(pim, "alpha_ref"):
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_ref"] = float(torch.tanh(pim.alpha_ref.detach()).item())
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("gate_gist", f"gate/pim_{pim_idx}_gate_gist"),
+                ("gate_ref", f"gate/pim_{pim_idx}_gate_ref"),
+                ("delta_gist_rms", f"gate/pim_{pim_idx}_delta_gist_rms"),
+                ("delta_ref_rms", f"gate/pim_{pim_idx}_delta_ref_rms"),
+                ("inject_gist_rms", f"gate/pim_{pim_idx}_inject_gist_rms"),
+                ("inject_ref_rms", f"gate/pim_{pim_idx}_inject_ref_rms"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
         elif hasattr(pim, "alpha_gist"):
             stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
             stats[f"gate/pim_{pim_idx}_tanh_alpha_part"] = float(torch.tanh(pim.alpha_part.detach()).item())
@@ -418,6 +436,8 @@ def train(args):
         inject_scale=args.inject_scale,
         pim_layer_indices_override=args.pim_layer_indices,
         delta_ln=args.delta_ln,
+        dra_d_inner=args.dra_d_inner,
+        dra_n_heads=args.dra_n_heads,
     )
 
     # ---- Accelerator ----
@@ -912,10 +932,11 @@ def parse_args():
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
     parser.add_argument("--memory_mode", type=str, default="full",
-                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"],
+                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra"],
                         help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), "
                              "gme_pme_dual (GME+PME dual gate), gme_pme_hier (GME+PME hierarchical fusion + dual gate), "
-                             "gme_pme_single (GME+PME hierarchical fusion + single path injection).")
+                             "gme_pme_single (GME+PME hierarchical fusion + single path injection), "
+                             "gme_dra (GME + Direct Reference Attention).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -926,6 +947,10 @@ def parse_args():
                         help="Number of GME QFormer queries (default: 32)")
     parser.add_argument("--delta_ln", action="store_true", default=False,
                         help="Add LayerNorm on delta before gating (stabilize delta scale).")
+    parser.add_argument("--dra_d_inner", type=int, default=128,
+                        help="DRA ref cross-attn bottleneck dimension (default: 128)")
+    parser.add_argument("--dra_n_heads", type=int, default=4,
+                        help="DRA ref cross-attn number of heads (default: 4)")
 
     # Data
     parser.add_argument("--data_dir", type=str,
@@ -1006,6 +1031,8 @@ def parse_args():
         parser.error("memory_mode='gme_pme_hier' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_pme_single" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_pme_single' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_dra" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='gme_dra' currently supports only inject_mode='adaptive'.")
 
     return args
 

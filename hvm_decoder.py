@@ -28,6 +28,7 @@ from hvm_modules import (
     DualGatedGMEPMEInjectionModule,
     HierarchicalGMEPMEInjectionModule,
     SinglePathHierarchicalInjectionModule,
+    DRAInjectionModule,
     count_parameters,
 )
 
@@ -110,6 +111,12 @@ class HVMSketchDecoder(nn.Module):
                 SinglePathHierarchicalInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
+        elif hvm_config.memory_mode == "gme_dra":
+            self.pme = None
+            self.pims = nn.ModuleList([
+                DRAInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
         else:
             self.pme = PartMemoryEncoder(hvm_config)
             self.pims = nn.ModuleList([
@@ -137,6 +144,7 @@ class HVMSketchDecoder(nn.Module):
         self._text_feats = None
         self._part_mask = None
         self._text_mask = None
+        self._ref_feats = None
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
@@ -228,6 +236,13 @@ class HVMSketchDecoder(nn.Module):
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
                     gist_feats,
+                )
+            elif self.hvm_config.memory_mode == "gme_dra":
+                ref_feats = self._ref_feats.expand(B, -1, -1)
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    gist_feats,
+                    ref_feats,
                 )
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
                 part_feats = self._part_feats.expand(B, -1, -1)
@@ -334,6 +349,15 @@ class HVMSketchDecoder(nn.Module):
             self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
 
             if self.hvm_config.memory_mode == "gme":
+                self._ref_feats = None
+                self._part_feats = None
+                self._part_mask = None
+                self._text_feats = None
+                self._text_mask = None
+            elif self.hvm_config.memory_mode == "gme_dra":
+                # DRA: 将 [B, 3, 256, 3584] reshape 为 [B, 768, 3584] 作为原始 ref tokens
+                B_ref = ref_features.shape[0]
+                self._ref_feats = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
                 self._part_feats = None
                 self._part_mask = None
                 self._text_feats = None
@@ -364,6 +388,7 @@ class HVMSketchDecoder(nn.Module):
         else:
             # 没有 HVM 输入，退化为普通 OmniSVG
             self._gist_feats = None
+            self._ref_feats = None
             self._part_feats = None
             self._text_feats = None
             self._part_mask = None

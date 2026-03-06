@@ -127,6 +127,8 @@ while [[ $# -gt 0 ]]; do
         --disable_hvm)    DISABLE_HVM=true;         shift 1 ;;
         --shuffle_rag)    SHUFFLE_RAG=true;         shift 1 ;;
         --delta_ln)       DELTA_LN=true;            shift 1 ;;
+        --dra_d_inner)    DRA_D_INNER="$2";         shift 2 ;;
+        --dra_n_heads)    DRA_N_HEADS="$2";         shift 2 ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -193,6 +195,10 @@ if [ "$SHUFFLE_RAG" = true ]; then
 fi
 if [ "$DELTA_LN" = true ]; then
     echo "  *** DELTA LAYERNORM: enabled ***"
+fi
+if [ "$MEMORY_MODE" = "gme_dra" ]; then
+    echo "  DRA d_inner:       ${DRA_D_INNER:-128}"
+    echo "  DRA n_heads:       ${DRA_N_HEADS:-4}"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -268,6 +274,14 @@ fi
 # Ablation: delta LayerNorm
 if [ "$DELTA_LN" = true ]; then
     TRAIN_ARGS+=(--delta_ln)
+fi
+
+# DRA 参数
+if [ -n "$DRA_D_INNER" ]; then
+    TRAIN_ARGS+=(--dra_d_inner "$DRA_D_INNER")
+fi
+if [ -n "$DRA_N_HEADS" ]; then
+    TRAIN_ARGS+=(--dra_n_heads "$DRA_N_HEADS")
 fi
 
 # ===================== 保存启动快照 =====================

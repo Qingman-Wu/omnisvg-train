@@ -48,6 +48,10 @@ class HVMConfig:
     pme_max_groups: int = 4
     pme_max_tokens: int = 16     # 4 groups × 4 queries
 
+    # === DRA (Direct Reference Attention) ===
+    dra_d_inner: int = 128           # DRA ref path bottleneck 维度
+    dra_n_heads: int = 4             # DRA ref path attention heads
+
     # === PIM ===
     pim_num_heads: int = 8
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
@@ -898,6 +902,83 @@ class SinglePathHierarchicalInjectionModule(nn.Module):
             inject_rms = injection.detach().float().pow(2).mean().sqrt()
             self.last_stats = {
                 "layer_gate": layer_gate.detach().float(),
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
+# DRA (Direct Reference Attention) Injection Module (Stage3)
+# ============================================================================
+
+class DRAInjectionModule(nn.Module):
+    """
+    GME + Direct Reference Attention 注入模块：
+      - Gist 路: hidden × gist cross-attn (d_inner=512, 8 heads) + tanh(α_gist)
+      - Ref 路:  hidden × ref_features cross-attn (d_inner=128, 4 heads) + tanh(α_ref)
+      - 两路分别 gate 后相加注入
+
+    核心假设检验: 模型能否利用未经 QFormer 压缩的原始 ref_features？
+      - α_ref > 0 → 模型能用细粒度信息，QFormer 压缩有信息损失
+      - α_ref → 0 → 32 gist tokens 已充分，不需要更细粒度信息
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        self.hidden_norm = nn.LayerNorm(d)
+
+        # Gist 路 (与 LayerGatedGMEInjectionModule 一致)
+        self.gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+
+        # Ref 路 (极窄 bottleneck)
+        self.ref_cross_attn = MultiHeadAttention(
+            d, config.dra_n_heads, d_inner=config.dra_d_inner,
+        )
+        self.alpha_ref = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        ref_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+        delta_ref = self.ref_cross_attn(q=query, k=ref_feats, v=ref_feats)
+
+        gate_gist = torch.tanh(self.alpha_gist)
+        gate_ref = torch.tanh(self.alpha_ref)
+
+        inject_gist = gate_gist * delta_gist
+        inject_ref = gate_ref * delta_ref
+        injection = inject_gist + inject_ref
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_ref_rms = delta_ref.detach().float().pow(2).mean().sqrt()
+            inject_gist_rms = inject_gist.detach().float().pow(2).mean().sqrt()
+            inject_ref_rms = inject_ref.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_gist + delta_ref).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_gist": gate_gist.detach().float(),
+                "gate_ref": gate_ref.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_ref_rms": delta_ref_rms,
+                "inject_gist_rms": inject_gist_rms,
+                "inject_ref_rms": inject_ref_rms,
                 "delta_rms": delta_rms,
                 "inject_rms": inject_rms,
                 "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
