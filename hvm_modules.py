@@ -54,6 +54,11 @@ class HVMConfig:
     cdm_num_heads: int = 8
     cdm_ff_mult: int = 4
 
+    # === EDR (Execution-aware Detail Routing) ===
+    edr_d_router: int = 256
+    edr_top_k: int = 2
+    edr_disable_conf: bool = False
+
     # === DRA (Direct Reference Attention) ===
     dra_d_inner: int = 128           # DRA ref path bottleneck 维度
     dra_n_heads: int = 4             # DRA ref path attention heads
@@ -1103,6 +1108,152 @@ class DRAInjectionModule(nn.Module):
                 "delta_rms": delta_rms,
                 "inject_rms": inject_rms,
                 "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
+# EDR (Execution-aware Detail Routing) Injection Module
+# ============================================================================
+
+class DetailRouter(nn.Module):
+    """
+    最小版 detail router：
+      - 用当前 hidden_state 对 detail_bank 中的每个 slot 打分
+      - 通过 softmax 熵得到 router 置信度 conf
+      - 只保留 top-k slots 并加权聚合成 routed_detail
+
+    输入:
+      - hidden_state: [B, L, d_model]
+      - detail_bank:  [B, N_detail, d_model]
+    输出:
+      - routed_detail: [B, L, d_model]
+      - conf:          [B, L, 1]
+      - router_stats:  标量诊断信息
+    """
+
+    def __init__(self, d_model: int, d_router: int, top_k: int):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_router, bias=False)
+        self.k_proj = nn.Linear(d_model, d_router, bias=False)
+        self.scale = d_router ** -0.5
+        self.top_k = top_k
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        detail_bank: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        score = torch.matmul(
+            self.q_proj(hidden_state),
+            self.k_proj(detail_bank).transpose(-1, -2),
+        ) * self.scale  # [B, L, N_detail]
+
+        score_fp32 = score.float()
+        full_prob = torch.softmax(score_fp32, dim=-1)
+        entropy = -(full_prob * torch.log(full_prob.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
+
+        num_slots = detail_bank.shape[1]
+        if num_slots > 1:
+            conf = 1.0 - entropy / math.log(num_slots)
+        else:
+            conf = torch.ones_like(entropy)
+        conf = conf.clamp_(0.0, 1.0)
+
+        k = min(self.top_k, num_slots)
+        topk_vals, topk_idx = torch.topk(score_fp32, k=k, dim=-1)
+        topk_prob = torch.softmax(topk_vals, dim=-1)
+
+        sparse_prob = torch.zeros_like(score_fp32)
+        sparse_prob.scatter_(-1, topk_idx, topk_prob)
+        routed_detail = torch.matmul(sparse_prob.to(dtype=detail_bank.dtype), detail_bank)
+
+        if num_slots > 1:
+            slot_usage = sparse_prob.detach().mean(dim=(0, 1))
+            slot_usage_entropy = -(
+                slot_usage * torch.log(slot_usage.clamp_min(1e-8))
+            ).sum() / math.log(num_slots)
+        else:
+            slot_usage_entropy = torch.tensor(0.0, device=detail_bank.device)
+
+        router_stats = {
+            "router_conf_mean": conf.detach().float().mean(),
+            "router_entropy_mean": entropy.detach().float().mean(),
+            "router_top1_prob_mean": topk_prob[..., 0].detach().float().mean(),
+            "router_active_ratio": (conf.detach().float() > 0.5).float().mean(),
+            "router_slot_usage_entropy": slot_usage_entropy.detach().float(),
+        }
+        return routed_detail, conf.to(dtype=detail_bank.dtype), router_stats
+
+
+class EDRInjectionModule(nn.Module):
+    """
+    GME + CDM + EDR 最小版注入模块：
+      - Gist 路保持原始 cross-attn 注入
+      - Detail 路不再直接 attention 16 个 slots，而是先路由再注入
+      - E1 最小版: delta_detail = routed_detail
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        self.hidden_norm = nn.LayerNorm(d)
+        self.gist_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.detail_router = DetailRouter(
+            d_model=d,
+            d_router=config.edr_d_router,
+            top_k=config.edr_top_k,
+        )
+        self.disable_conf = bool(config.edr_disable_conf)
+
+        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        gist_feats: torch.Tensor,
+        detail_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+        routed_detail, conf, router_stats = self.detail_router(query, detail_feats)
+        effective_conf = torch.ones_like(conf) if self.disable_conf else conf
+        delta_detail = routed_detail
+
+        gate_gist = torch.tanh(self.alpha_gist)
+        gate_detail = torch.tanh(self.alpha_detail)
+
+        inject_gist = gate_gist * delta_gist
+        inject_detail = gate_detail * effective_conf * delta_detail
+        injection = inject_gist + inject_detail
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_gist_rms = delta_gist.detach().float().pow(2).mean().sqrt()
+            delta_detail_rms = delta_detail.detach().float().pow(2).mean().sqrt()
+            inject_gist_rms = inject_gist.detach().float().pow(2).mean().sqrt()
+            inject_detail_rms = inject_detail.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_gist + delta_detail).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_gist": gate_gist.detach().float(),
+                "gate_detail": gate_detail.detach().float(),
+                "delta_gist_rms": delta_gist_rms,
+                "delta_detail_rms": delta_detail_rms,
+                "inject_gist_rms": inject_gist_rms,
+                "inject_detail_rms": inject_detail_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+                "router_effective_conf_mean": effective_conf.detach().float().mean(),
+                **router_stats,
             }
 
         return hidden_state + injection

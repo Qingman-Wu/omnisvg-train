@@ -31,6 +31,7 @@ from hvm_modules import (
     DRAInjectionModule,
     CDMEncoder,
     CDMInjectionModule,
+    EDRInjectionModule,
     count_parameters,
 )
 
@@ -125,6 +126,13 @@ class HVMSketchDecoder(nn.Module):
             self.cdm = CDMEncoder(hvm_config)
             self.pims = nn.ModuleList([
                 CDMInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
+        elif hvm_config.memory_mode == "gme_cdm_edr":
+            self.pme = None
+            self.cdm = CDMEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                EDRInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         else:
@@ -257,7 +265,7 @@ class HVMSketchDecoder(nn.Module):
                     gist_feats,
                     ref_feats,
                 )
-            elif self.hvm_config.memory_mode == "gme_cdm":
+            elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
                 detail_feats = self._detail_feats.expand(B, -1, -1)
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
@@ -382,8 +390,8 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
-            elif self.hvm_config.memory_mode == "gme_cdm":
-                # CDM: gist_feats detach 后和展平的 ref_features 一起送入 CDM 编码器
+            elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+                # CDM / EDR: gist_feats detach 后和展平的 ref_features 一起送入 CDM 编码器
                 B_ref = ref_features.shape[0]
                 flat_ref = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
                 self._detail_feats = self.cdm(flat_ref, self._gist_feats.detach())

@@ -284,6 +284,12 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
                 ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
                 ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+                ("router_conf_mean", f"gate/pim_{pim_idx}_router_conf_mean"),
+                ("router_effective_conf_mean", f"gate/pim_{pim_idx}_router_effective_conf_mean"),
+                ("router_entropy_mean", f"gate/pim_{pim_idx}_router_entropy_mean"),
+                ("router_top1_prob_mean", f"gate/pim_{pim_idx}_router_top1_prob_mean"),
+                ("router_active_ratio", f"gate/pim_{pim_idx}_router_active_ratio"),
+                ("router_slot_usage_entropy", f"gate/pim_{pim_idx}_router_slot_usage_entropy"),
             ]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
@@ -458,6 +464,9 @@ def train(args):
         dra_n_heads=args.dra_n_heads,
         cdm_num_queries=args.cdm_num_queries,
         cdm_num_layers=args.cdm_num_layers,
+        edr_d_router=args.edr_d_router,
+        edr_top_k=args.edr_top_k,
+        edr_disable_conf=args.edr_disable_conf,
     )
 
     # ---- Accelerator ----
@@ -952,12 +961,13 @@ def parse_args():
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
     parser.add_argument("--memory_mode", type=str, default="full",
-                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm"],
+                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr"],
                         help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), "
                              "gme_pme_dual (GME+PME dual gate), gme_pme_hier (GME+PME hierarchical fusion + dual gate), "
                              "gme_pme_single (GME+PME hierarchical fusion + single path injection), "
                              "gme_dra (GME + Direct Reference Attention), "
-                             "gme_cdm (GME + Complementary Detail Memory).")
+                             "gme_cdm (GME + Complementary Detail Memory), "
+                             "gme_cdm_edr (GME + CDM + Execution-aware Detail Router).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -976,6 +986,12 @@ def parse_args():
                         help="CDM number of learnable queries (default: 16)")
     parser.add_argument("--cdm_num_layers", type=int, default=6,
                         help="CDM QFormer number of layers (default: 6)")
+    parser.add_argument("--edr_d_router", type=int, default=256,
+                        help="EDR router bottleneck dimension (default: 256)")
+    parser.add_argument("--edr_top_k", type=int, default=2,
+                        help="EDR sparse top-k detail slots (default: 2)")
+    parser.add_argument("--edr_disable_conf", action="store_true", default=False,
+                        help="Disable EDR confidence suppression and force conf=1 during detail injection.")
 
     # Data
     parser.add_argument("--data_dir", type=str,
@@ -1045,6 +1061,10 @@ def parse_args():
 
     if args.inject_scale <= 0:
         parser.error("--inject_scale must be > 0.")
+    if args.edr_d_router <= 0:
+        parser.error("--edr_d_router must be > 0.")
+    if args.edr_top_k <= 0:
+        parser.error("--edr_top_k must be > 0.")
 
     if args.memory_mode == "full" and args.inject_mode != "adaptive":
         parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
@@ -1060,6 +1080,8 @@ def parse_args():
         parser.error("memory_mode='gme_dra' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
 
     return args
 

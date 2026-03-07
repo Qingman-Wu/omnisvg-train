@@ -2,48 +2,30 @@
 """
 HVM-SVG Inference Script for Test Holdout Dataset (Multi-GPU Data Parallel)
 ============================================================================
-专门用于测试 holdout 数据集的推理脚本
+通用 HVM 推理脚本，支持所有 memory_mode / inject_mode 组合。
 
-训练配置: CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 bash run_train_hvm.sh \
-    --num_gpus 6 --memory_mode gme --inject_mode fixed --inject_scale 0.03 \
-    --pim_layer_indices -1 --run_name s1_gme_last1_fixed003 \
-    --output_dir /mnt/data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03
+支持的 memory_mode:
+  - gme (Stage1): GME-only
+  - gme + adaptive (Stage1.5): GME + layer gate
+  - gme_pme (Stage2a): GME+PME shared gate
+  - gme_pme_dual (Stage2b): GME+PME dual independent gates
+  - gme_pme_hier (Stage2c): GME+PME hierarchical fusion
+  - gme_pme_single (Stage2d): GME+PME single-path hierarchical
+  - gme_dra (Stage3): GME + Direct Reference Attention
+  - gme_cdm (Stage3): GME + Complementary Detail Memory
+  - full: GME+PME+Text (PrefrontalInjectionModule)
 
-适配 Stage1 架构: memory_mode=gme, inject_mode=fixed, inject_scale=0.03, pim_layer=[27]
-  - GME-only: 只使用 gist memory (3 ref images → 32 gist tokens)
-  - 无 PME: 不需要 group_features
-  - SimpleGMEInjectionModule: hidden × gist cross-attention + fixed scale
-  - 无 AdaptiveGate: 固定缩放注入
+memory_mode 由 HVM checkpoint 目录下的 hvm_model_config.json 自动确定。
 
-可用 checkpoints (outputs_s1_fixed0.03/):
-  - hvm_step_4000.pt
-  - hvm_step_6000.pt
-  - hvm_step_8000.pt
-
-用法示例 (step 4000):
-CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1_test.py \
+用法示例 (S2b: gme_pme_dual, step 4000, 在 a100_4 上运行):
+CUDA_VISIBLE_DEVICES=0,2,3 python inference/inference_hvm_s1_test.py \
     --base_model /mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct \
     --omnisvg_checkpoint /mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B \
-    --hvm_checkpoint /mnt/a100_1_data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03/hvm_step_4000.pt \
-    --data_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
-    --hvm_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
+    --hvm_checkpoint /mnt/data2/wuqingman/omnisvg-train/outputs_s2b_gme_pme_dual/hvm_step_4000.pt \
+    --data_dir /mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
+    --hvm_dir /mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
     --sample_indices $(seq 0 999) \
-    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/s1_fixed0.03_step4000_test \
-    --num_candidates 5 \
-    --save_png \
-    --save_gt \
-    --save_refs \
-    --resume
-
-用法示例 (step 8000):
-CUDA_VISIBLE_DEVICES=4,5,7 python inference/inference_hvm_s1_test.py \
-    --base_model /mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct \
-    --omnisvg_checkpoint /mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B \
-    --hvm_checkpoint /mnt/a100_1_data2/wuqingman/omnisvg-train/outputs_s1_fixed0.03/hvm_step_8000.pt \
-    --data_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout \
-    --hvm_dir /mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test \
-    --sample_indices $(seq 0 999) \
-    --output_dir /mnt/a100_1_data2/wuqingman/omnisvg-train/inference_results/s1_fixed0.03_step8000_test \
+    --output_dir ./inference_results/s2b_gme_pme_dual_step4000_test \
     --num_candidates 5 \
     --save_png \
     --save_gt \
@@ -341,8 +323,23 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
         model._part_feats = None
         model._part_mask = None
 
-    # Text feats: 仅在 full mode 下使用 (gme 和 gme_pme 都不需要 text)
-    if hvm_config.memory_mode in ("gme", "gme_pme"):
+    # DRA: 需要原始 ref_features 展平
+    if hvm_config.memory_mode == "gme_dra":
+        model._ref_feats = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
+    else:
+        model._ref_feats = None
+
+    # CDM: gist detach + 展平 ref 送入 CDM 编码器
+    if hvm_config.memory_mode == "gme_cdm" and model.cdm is not None:
+        flat_ref = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
+        model._detail_feats = model.cdm(flat_ref, model._gist_feats.detach())
+    else:
+        model._detail_feats = None
+
+    # Text feats: 仅 full mode 需要（其他模式都不需要 text）
+    NO_TEXT_MODES = ("gme", "gme_pme", "gme_pme_dual", "gme_pme_hier",
+                     "gme_pme_single", "gme_dra", "gme_cdm")
+    if hvm_config.memory_mode in NO_TEXT_MODES:
         model._text_feats = None
         model._text_mask = None
     else:
@@ -362,6 +359,8 @@ def clear_hvm_memory(model):
     model._text_feats = None
     model._part_mask = None
     model._text_mask = None
+    model._ref_feats = None
+    model._detail_feats = None
 
 
 # ============================================================================
@@ -802,10 +801,10 @@ def parse_args():
 
     # data - 默认使用 test holdout 数据集
     p.add_argument("--data_dir", type=str,
-                   default="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout",
+                   default="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test_holdout",
                    help="测试数据集目录")
     p.add_argument("--hvm_dir", type=str,
-                   default="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test",
+                   default="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_test",
                    help="HVM 预计算特征目录")
     p.add_argument("--sample_indices", type=int, nargs="+", default=[0],
                    help="要推理的样本索引，例如: --sample_indices $(seq 0 999)")
