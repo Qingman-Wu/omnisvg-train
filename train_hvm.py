@@ -271,7 +271,11 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 if val is not None:
                     stats[dst_key] = val
         elif hasattr(pim, "alpha_detail"):
-            stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
+            gist_enabled = bool(getattr(pim, "enable_gist", True))
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = (
+                float(torch.tanh(pim.alpha_gist.detach()).item()) if gist_enabled else 0.0
+            )
+            stats[f"gate/pim_{pim_idx}_gist_enabled"] = 1.0 if gist_enabled else 0.0
             detail_enabled = bool(getattr(pim, "enable_detail", True))
             stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = (
                 float(torch.tanh(pim.alpha_detail.detach()).item()) if detail_enabled else 0.0
@@ -471,6 +475,7 @@ def train(args):
         edr_d_router=args.edr_d_router,
         edr_top_k=args.edr_top_k,
         edr_disable_conf=args.edr_disable_conf,
+        edr_disable_gist=args.edr_disable_gist,
         edr_detail_layer_indices_override=args.edr_detail_layer_indices,
     )
 
@@ -723,6 +728,7 @@ def train(args):
             accelerator.print(f"  Inject scale: {hvm_config.inject_scale}")
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
         if hvm_config.memory_mode == "gme_cdm_edr":
+            accelerator.print(f"  EDR disable gist: {hvm_config.edr_disable_gist}")
             accelerator.print(f"  EDR detail layers: {hvm_config.edr_detail_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
@@ -999,6 +1005,8 @@ def parse_args():
                         help="EDR sparse top-k detail slots (default: 2)")
     parser.add_argument("--edr_disable_conf", action="store_true", default=False,
                         help="Disable EDR confidence suppression and force conf=1 during detail injection.")
+    parser.add_argument("--edr_disable_gist", action="store_true", default=False,
+                        help="Disable EDR gist injection and keep only routed detail injection.")
     parser.add_argument("--edr_detail_layer_indices", type=str, default=None,
                         help="Comma-separated decoder layer indices where EDR detail path is enabled. "
                              "Defaults to all PIM layers; gist path still runs on every PIM layer.")
@@ -1096,6 +1104,8 @@ def parse_args():
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
+    if args.edr_disable_gist and args.memory_mode != "gme_cdm_edr":
+        parser.error("--edr_disable_gist is only supported when memory_mode='gme_cdm_edr'.")
     if args.edr_detail_layer_indices is not None:
         if args.memory_mode != "gme_cdm_edr":
             parser.error("--edr_detail_layer_indices is only supported when memory_mode='gme_cdm_edr'.")

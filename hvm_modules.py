@@ -58,6 +58,7 @@ class HVMConfig:
     edr_d_router: int = 256
     edr_top_k: int = 2
     edr_disable_conf: bool = False
+    edr_disable_gist: bool = False
     edr_detail_layer_indices_override: Optional[List[int]] = None
 
     # === DRA (Direct Reference Attention) ===
@@ -1217,6 +1218,7 @@ class EDRInjectionModule(nn.Module):
             top_k=config.edr_top_k,
         )
         self.disable_conf = bool(config.edr_disable_conf)
+        self.enable_gist = not bool(config.edr_disable_gist)
         self.enable_detail = bool(enable_detail)
 
         self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
@@ -1231,9 +1233,18 @@ class EDRInjectionModule(nn.Module):
     ) -> torch.Tensor:
         query = self.hidden_norm(hidden_state)
 
-        delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
-        gate_gist = torch.tanh(self.alpha_gist)
-        inject_gist = gate_gist * delta_gist
+        if self.enable_gist:
+            delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+            gate_gist = torch.tanh(self.alpha_gist)
+            inject_gist = gate_gist * delta_gist
+        else:
+            delta_gist = torch.zeros_like(hidden_state)
+            gate_gist = torch.zeros(
+                (),
+                device=hidden_state.device,
+                dtype=hidden_state.dtype,
+            )
+            inject_gist = torch.zeros_like(hidden_state)
 
         if self.enable_detail:
             routed_detail, conf, router_stats = self.detail_router(query, detail_feats)
@@ -1273,6 +1284,7 @@ class EDRInjectionModule(nn.Module):
             self.last_stats = {
                 "gate_gist": gate_gist.detach().float(),
                 "gate_detail": gate_detail.detach().float(),
+                "gist_enabled": float(self.enable_gist),
                 "detail_enabled": float(self.enable_detail),
                 "delta_gist_rms": delta_gist_rms,
                 "delta_detail_rms": delta_detail_rms,
