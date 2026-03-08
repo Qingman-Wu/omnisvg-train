@@ -1,21 +1,31 @@
 #!/bin/bash
+{
 # ============================================================================
 # SVG Generation Metrics - 统一运行脚本
 # ============================================================================
 #
 # 用法:
 #   # tag=base
-#   CUDA_VISIBLE_DEVICES=4 RESUME=1 bash metrics/run_all.sh inference_results/omnisvg_baseline base
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/omnisvg_baseline base
 #   # tag=hvm
+#   CUDA_VISIBLE_DEVICES=1 RESUME=1 bash metrics/run_all.sh inference_results/s1_fixed0.03_step4000_test hvm
+#   CUDA_VISIBLE_DEVICES=2 RESUME=1 bash metrics/run_all.sh inference_results/0302_1330_s1_fixed0.03_allshuffle hvm
+#   CUDA_VISIBLE_DEVICES=3 RESUME=1 bash metrics/run_all.sh inference_results/0302_1416_s1_fixed0.03_last4_step4000 hvm
+#   CUDA_VISIBLE_DEVICES=4 RESUME=1 bash metrics/run_all.sh inference_results/s2_gme_last4_adaptive_gate_step4000_test hvm
+#   CUDA_VISIBLE_DEVICES=5 RESUME=1 bash metrics/run_all.sh inference_results/s2a_gme_pme_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s2a_gme_pme_every4_step4000 hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s2b_gme_pme_dual_last4_adaptive hvm
 
-#   CUDA_VISIBLE_DEVICES=4 RESUME=1 bash metrics/run_all.sh inference_results/0302_1416_s1_fixed0.03_last4_step4000 hvm
-#
-#   # 指定 GPU
-#   CUDA_VISIBLE_DEVICES=1 bash metrics/run_all.sh inference_results/exp1
-#
-#   # 调试: 只跑前 20 个样本
-#   MAX_SAMPLES=20 bash metrics/run_all.sh inference_results/exp1
-#
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s2_gme_last4_adaptive_gate_layernorm_step4000_test hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s2c_gme_pme_hier_last4_adaptive_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s2d_gme_pme_hier_singlepath_last4_step4000_test hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s3_dra_gme_ref_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s3_cdm_gme_pme-with-ref_last4_step2000_test hvm
+
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s4_gme_cdm_edr_e1_last4_try1_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s4_gme_cdm_edr_e1_topk16_last4_try2_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s4_gme_cdm_edr_e1_noconf_last4_try3_step2000_test hvm
+
 # 输出保存到: metrics/metrics_results/<exp_name>/
 #   ├── ssim.csv + ssim.json
 #   ├── mse.csv + mse.json
@@ -110,3 +120,6 @@ for k in ['min_mean','max_mean','avg_mean','trimmed_mean']:
     fi
 done
 echo "==============="
+
+exit
+}

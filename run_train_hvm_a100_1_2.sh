@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / EDR 无稀疏路由)
+# HVM-SVG 训练启动脚本 (A100_1_2 / EDR top1)
 # =============================================================================
 #
 # 使用方法:
@@ -9,7 +9,7 @@
 #
 # 默认实验:
 #   GME + CDM + EDR(E1) + last4 + adaptive
-#   稀疏路由消融: top_k=16 (对 16 个 detail slots 不做稀疏裁剪)
+#   稀疏路由变体: top_k=1 (每个 token 只保留 1 个 detail slot)
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -42,7 +42,7 @@ GME_NUM_QUERIES=32
 CDM_NUM_QUERIES=16
 CDM_NUM_LAYERS=6
 EDR_D_ROUTER=256
-EDR_TOP_K=16
+EDR_TOP_K=1
 EDR_DISABLE_CONF=false
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
@@ -66,11 +66,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_e1_topk16_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_e1_topk1_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s4_gme_cdm_edr_e1_topk16_last4"
+SWANLAB_RUN_NAME="s4_gme_cdm_edr_e1_topk1_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""

@@ -58,6 +58,7 @@ class HVMConfig:
     edr_d_router: int = 256
     edr_top_k: int = 2
     edr_disable_conf: bool = False
+    edr_detail_layer_indices_override: Optional[List[int]] = None
 
     # === DRA (Direct Reference Attention) ===
     dra_d_inner: int = 128           # DRA ref path bottleneck 维度
@@ -92,6 +93,13 @@ class HVMConfig:
     @property
     def num_pims(self) -> int:
         return len(self.pim_layer_indices)
+
+    @property
+    def edr_detail_layer_indices(self) -> List[int]:
+        """EDR detail 路实际生效的 decoder 层。默认与 PIM 层一致。"""
+        if self.edr_detail_layer_indices_override is None:
+            return list(self.pim_layer_indices)
+        return list(self.edr_detail_layer_indices_override)
 
 
 # ============================================================================
@@ -1195,7 +1203,7 @@ class EDRInjectionModule(nn.Module):
       - E1 最小版: delta_detail = routed_detail
     """
 
-    def __init__(self, config: HVMConfig):
+    def __init__(self, config: HVMConfig, enable_detail: bool = True):
         super().__init__()
         d = config.d_model
 
@@ -1209,6 +1217,7 @@ class EDRInjectionModule(nn.Module):
             top_k=config.edr_top_k,
         )
         self.disable_conf = bool(config.edr_disable_conf)
+        self.enable_detail = bool(enable_detail)
 
         self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
         self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
@@ -1223,15 +1232,34 @@ class EDRInjectionModule(nn.Module):
         query = self.hidden_norm(hidden_state)
 
         delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
-        routed_detail, conf, router_stats = self.detail_router(query, detail_feats)
-        effective_conf = torch.ones_like(conf) if self.disable_conf else conf
-        delta_detail = routed_detail
-
         gate_gist = torch.tanh(self.alpha_gist)
-        gate_detail = torch.tanh(self.alpha_detail)
-
         inject_gist = gate_gist * delta_gist
-        inject_detail = gate_detail * effective_conf * delta_detail
+
+        if self.enable_detail:
+            routed_detail, conf, router_stats = self.detail_router(query, detail_feats)
+            effective_conf = torch.ones_like(conf) if self.disable_conf else conf
+            delta_detail = routed_detail
+            gate_detail = torch.tanh(self.alpha_detail)
+            inject_detail = gate_detail * effective_conf * delta_detail
+        else:
+            gate_detail = torch.zeros_like(gate_gist)
+            delta_detail = torch.zeros_like(hidden_state)
+            inject_detail = torch.zeros_like(hidden_state)
+            effective_conf = torch.zeros(
+                hidden_state.shape[0],
+                hidden_state.shape[1],
+                1,
+                device=hidden_state.device,
+                dtype=hidden_state.dtype,
+            )
+            router_stats = {
+                "router_conf_mean": torch.tensor(0.0, device=hidden_state.device),
+                "router_entropy_mean": torch.tensor(0.0, device=hidden_state.device),
+                "router_top1_prob_mean": torch.tensor(0.0, device=hidden_state.device),
+                "router_active_ratio": torch.tensor(0.0, device=hidden_state.device),
+                "router_slot_usage_entropy": torch.tensor(0.0, device=hidden_state.device),
+            }
+
         injection = inject_gist + inject_detail
 
         with torch.no_grad():
@@ -1245,6 +1273,7 @@ class EDRInjectionModule(nn.Module):
             self.last_stats = {
                 "gate_gist": gate_gist.detach().float(),
                 "gate_detail": gate_detail.detach().float(),
+                "detail_enabled": float(self.enable_detail),
                 "delta_gist_rms": delta_gist_rms,
                 "delta_detail_rms": delta_detail_rms,
                 "inject_gist_rms": inject_gist_rms,

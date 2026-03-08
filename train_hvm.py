@@ -272,7 +272,11 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                     stats[dst_key] = val
         elif hasattr(pim, "alpha_detail"):
             stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = float(torch.tanh(pim.alpha_gist.detach()).item())
-            stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = float(torch.tanh(pim.alpha_detail.detach()).item())
+            detail_enabled = bool(getattr(pim, "enable_detail", True))
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = (
+                float(torch.tanh(pim.alpha_detail.detach()).item()) if detail_enabled else 0.0
+            )
+            stats[f"gate/pim_{pim_idx}_detail_enabled"] = 1.0 if detail_enabled else 0.0
             last_stats = getattr(pim, "last_stats", None) or {}
             for src_key, dst_key in [
                 ("gate_gist", f"gate/pim_{pim_idx}_gate_gist"),
@@ -467,6 +471,7 @@ def train(args):
         edr_d_router=args.edr_d_router,
         edr_top_k=args.edr_top_k,
         edr_disable_conf=args.edr_disable_conf,
+        edr_detail_layer_indices_override=args.edr_detail_layer_indices,
     )
 
     # ---- Accelerator ----
@@ -717,6 +722,8 @@ def train(args):
         if hvm_config.inject_mode == "fixed":
             accelerator.print(f"  Inject scale: {hvm_config.inject_scale}")
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
+        if hvm_config.memory_mode == "gme_cdm_edr":
+            accelerator.print(f"  EDR detail layers: {hvm_config.edr_detail_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     if val_dataloader is not None:
@@ -992,6 +999,9 @@ def parse_args():
                         help="EDR sparse top-k detail slots (default: 2)")
     parser.add_argument("--edr_disable_conf", action="store_true", default=False,
                         help="Disable EDR confidence suppression and force conf=1 during detail injection.")
+    parser.add_argument("--edr_detail_layer_indices", type=str, default=None,
+                        help="Comma-separated decoder layer indices where EDR detail path is enabled. "
+                             "Defaults to all PIM layers; gist path still runs on every PIM layer.")
 
     # Data
     parser.add_argument("--data_dir", type=str,
@@ -1058,6 +1068,10 @@ def parse_args():
         args.pim_layer_indices = parse_pim_layer_indices(args.pim_layer_indices, num_decoder_layers=28)
     except ValueError as exc:
         parser.error(str(exc))
+    try:
+        args.edr_detail_layer_indices = parse_pim_layer_indices(args.edr_detail_layer_indices, num_decoder_layers=28)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.inject_scale <= 0:
         parser.error("--inject_scale must be > 0.")
@@ -1082,6 +1096,17 @@ def parse_args():
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
+    if args.edr_detail_layer_indices is not None:
+        if args.memory_mode != "gme_cdm_edr":
+            parser.error("--edr_detail_layer_indices is only supported when memory_mode='gme_cdm_edr'.")
+        if args.pim_layer_indices is None:
+            active_pim_layers = list(range(args.pim_layer_interval - 1, 28, args.pim_layer_interval))
+        else:
+            active_pim_layers = list(args.pim_layer_indices)
+        invalid_detail_layers = [idx for idx in args.edr_detail_layer_indices if idx not in active_pim_layers]
+        if invalid_detail_layers:
+            parser.error("--edr_detail_layer_indices must be a subset of active PIM layers. "
+                         f"Invalid detail layers: {invalid_detail_layers}; active PIM layers: {active_pim_layers}.")
 
     return args
 

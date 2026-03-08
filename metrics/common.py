@@ -31,20 +31,31 @@ DEFAULT_OUTPUT_DIR = "/mnt/a100_1_data2/wuqingman/omnisvg-train/metrics/metrics_
 # Image loading
 # ============================================================================
 
+def _load_image_rgb_white_bg(path: str) -> Optional[Image.Image]:
+    """Load an image and composite transparency onto a white background."""
+    try:
+        with Image.open(path) as img:
+            rgba = img.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            return Image.alpha_composite(background, rgba).convert("RGB")
+    except Exception:
+        return None
+
+
 def load_image_as_array(path: str, size: int = EVAL_IMAGE_SIZE) -> Optional[np.ndarray]:
     """Load image as [H, W, 3] float32 in [0, 1]."""
     try:
-        img = Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+        img = _load_image_rgb_white_bg(path)
+        if img is None:
+            return None
+        img = img.resize((size, size), Image.LANCZOS)
         return np.array(img, dtype=np.float32) / 255.0
     except Exception:
         return None
 
 
 def load_image_pil(path: str) -> Optional[Image.Image]:
-    try:
-        return Image.open(path).convert("RGB")
-    except Exception:
-        return None
+    return _load_image_rgb_white_bg(path)
 
 
 # ============================================================================

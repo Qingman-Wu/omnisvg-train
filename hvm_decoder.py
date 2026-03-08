@@ -131,9 +131,13 @@ class HVMSketchDecoder(nn.Module):
         elif hvm_config.memory_mode == "gme_cdm_edr":
             self.pme = None
             self.cdm = CDMEncoder(hvm_config)
+            detail_layers = set(hvm_config.edr_detail_layer_indices)
             self.pims = nn.ModuleList([
-                EDRInjectionModule(hvm_config)
-                for _ in range(hvm_config.num_pims)
+                EDRInjectionModule(
+                    hvm_config,
+                    enable_detail=(layer_idx in detail_layers),
+                )
+                for layer_idx in hvm_config.pim_layer_indices
             ])
         else:
             self.pme = PartMemoryEncoder(hvm_config)
@@ -537,3 +541,5 @@ class HVMSketchDecoder(nn.Module):
         print(f"  Total: {total_params / 1e6:.0f}M params")
         print(f"  Trainable ratio: {trainable_params / total_params * 100:.1f}%")
         print(f"  PIM insertion layers: {self.hvm_config.pim_layer_indices}\n")
+        if self.hvm_config.memory_mode == "gme_cdm_edr":
+            print(f"  EDR detail layers: {self.hvm_config.edr_detail_layer_indices}\n")

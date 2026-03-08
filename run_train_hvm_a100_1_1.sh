@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / EDR E1)
+# HVM-SVG 训练启动脚本 (A100_1_1 / EDR detail 前两层)
 # =============================================================================
 #
 # 使用方法:
@@ -9,7 +9,8 @@
 #
 # 默认实验:
 #   GME + CDM + EDR(E1) + last4 + adaptive
-#   其中 E1 为最小版 detail correction:
+#   其中 gist 仍注入 last4，但 detail 路只在前两层 (24,25) 开启
+#   E1 为最小版 detail correction:
 #       delta_detail = routed_detail
 
 set -e
@@ -45,6 +46,7 @@ CDM_NUM_LAYERS=6
 EDR_D_ROUTER=256
 EDR_TOP_K=2
 EDR_DISABLE_CONF=false
+EDR_DETAIL_LAYER_INDICES="24,25"
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
@@ -67,11 +69,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_e1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_e1_detail24_25_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s4_gme_cdm_edr_e1_last4"
+SWANLAB_RUN_NAME="s4_gme_cdm_edr_e1_detail24_25_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -105,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
+        --edr_detail_layer_indices) EDR_DETAIL_LAYER_INDICES="$2"; shift 2 ;;
         --memory_mode)    MEMORY_MODE="$2";          shift 2 ;;
         --inject_mode)    INJECT_MODE="$2";          shift 2 ;;
         --inject_scale)   INJECT_SCALE="$2";         shift 2 ;;
@@ -208,6 +211,7 @@ if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
     echo "  EDR top-k:         ${EDR_TOP_K}"
     echo "  EDR disable conf:  ${EDR_DISABLE_CONF}"
+    echo "  EDR detail layers: ${EDR_DETAIL_LAYER_INDICES:-ALL PIM layers}"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -250,6 +254,10 @@ TRAIN_ARGS=(
 
 if [ -n "$PIM_LAYER_INDICES" ]; then
     TRAIN_ARGS+=(--pim_layer_indices "$PIM_LAYER_INDICES")
+fi
+
+if [ -n "$EDR_DETAIL_LAYER_INDICES" ]; then
+    TRAIN_ARGS+=(--edr_detail_layer_indices "$EDR_DETAIL_LAYER_INDICES")
 fi
 
 if [ -n "$VAL_DATA_DIR" ] && [ -n "$VAL_HVM_DIR" ]; then

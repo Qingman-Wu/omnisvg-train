@@ -13,6 +13,7 @@ HVM-SVG Inference Script for Test Holdout Dataset (Multi-GPU Data Parallel)
   - gme_pme_single (Stage2d): GME+PME single-path hierarchical
   - gme_dra (Stage3): GME + Direct Reference Attention
   - gme_cdm (Stage3): GME + Complementary Detail Memory
+  - gme_cdm_edr (Stage4): GME + CDM + Execution-aware Detail Router
   - full: GME+PME+Text (PrefrontalInjectionModule)
 
 memory_mode 由 HVM checkpoint 目录下的 hvm_model_config.json 自动确定。
@@ -329,8 +330,8 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
     else:
         model._ref_feats = None
 
-    # CDM: gist detach + 展平 ref 送入 CDM 编码器
-    if hvm_config.memory_mode == "gme_cdm" and model.cdm is not None:
+    # CDM / EDR: gist detach + 展平 ref 送入 CDM 编码器
+    if hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr") and model.cdm is not None:
         flat_ref = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
         model._detail_feats = model.cdm(flat_ref, model._gist_feats.detach())
     else:
@@ -338,7 +339,7 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
 
     # Text feats: 仅 full mode 需要（其他模式都不需要 text）
     NO_TEXT_MODES = ("gme", "gme_pme", "gme_pme_dual", "gme_pme_hier",
-                     "gme_pme_single", "gme_dra", "gme_cdm")
+                     "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr")
     if hvm_config.memory_mode in NO_TEXT_MODES:
         model._text_feats = None
         model._text_mask = None

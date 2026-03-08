@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 
 import torch
-from PIL import Image
 from tqdm import tqdm
 
 from common import (
