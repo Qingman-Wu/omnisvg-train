@@ -621,18 +621,8 @@ def compute_path_complexity(commands: List[Dict], bbox: Tuple[float, float, floa
 
 
 def decide_num_groups(total_complexity: float, num_paths: int) -> int:
-    """
-    根据总复杂度和 path 数量决定分组数。
-    1111111111具体分组界限待定
-    """
-    if total_complexity < 30 or num_paths <= 2:
-        return 1
-    elif total_complexity < 80 or num_paths <= 5:
-        return 2
-    elif total_complexity < 150:
-        return 3
-    else:
-        return 4
+    """固定分为 4 组。"""
+    return MAX_GROUPS
 
 
 def group_paths_sequential(
@@ -835,23 +825,16 @@ def stage_groups(data_dir: str, output_dir: str):
 def render_group_to_image(
     svg_string: str,
     group_path_indices: List[int],
-    group_bbox: Tuple[float, float, float, float],
     image_size: int = IMAGE_SIZE,
 ) -> Optional[Image.Image]:
     """
-    渲染一个 group 的 paths 为独立图片，裁剪到 group 的 bbox 范围。
+    渲染一个 group 的 paths 为独立图片，使用原始 SVG viewBox 尺寸。
 
     流程：
       1. 从原始 SVG 提取该 group 的 paths
-      2. 设置 viewbox 为 group 的 bbox（自动 crop + zoom）
+      2. viewBox 保持原始 SVG 尺寸 (0 0 200 200)
       3. 渲染为 448×448 的 PNG
       4. 返回 PIL Image
-
-    Args:
-        svg_string: 完整的 SVG 字符串
-        group_path_indices: 该 group 包含的 path 索引列表
-        group_bbox: (x0, y0, x1, y1) SVG viewbox 坐标, 已含 10% padding
-        image_size: 输出图像尺寸
     """
     import cairosvg
 
@@ -863,16 +846,11 @@ def render_group_to_image(
     if not all_path_tags:
         return None
 
-    # 构建 group SVG（viewbox 设为 bbox 区域）
-    x0, y0, x1, y1 = group_bbox
-    vb_w = max(x1 - x0, 1.0)
-    vb_h = max(y1 - y0, 1.0)
-
     svg_lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{x0:.2f} {y0:.2f} {vb_w:.2f} {vb_h:.2f}" '
+        f'viewBox="0 0 {VIEWBOX_SIZE} {VIEWBOX_SIZE}" '
         f'width="{image_size}" height="{image_size}">',
-        f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{vb_w:.2f}" height="{vb_h:.2f}" fill="white"/>',
+        f'<rect x="0" y="0" width="{VIEWBOX_SIZE}" height="{VIEWBOX_SIZE}" fill="white"/>',
     ]
 
     for pi in group_path_indices:
@@ -904,22 +882,15 @@ def stage_group_features(
     shard_id: int = 0,
 ):
     """
-    Stage 5: 逐 group 渲染 SVG → crop bbox → 448x448 → ViT+Merger → post-merge [256, 3584]
+    Stage 5: 逐 group 渲染 SVG → 原始尺寸 448x448 → ViT+Merger → post-merge [256, 3584]
 
-    对每个样本的每个 group:
-      1. 只渲染该 group 的 SVG paths，viewbox 设为 group 的 bbox（自动 crop + zoom）
+    对每个样本的每个 group (固定 4 组):
+      1. 只渲染该 group 的 SVG paths，viewBox 保持原始 SVG 尺寸 (0 0 200 200)
       2. 得到 448x448 的 PIL Image
       3. 通过 Qwen2.5-VL 完整 vision pipeline (encoder + merger) 得到 [256, 3584]
-         直接取 visual 模块输出，不需要 hook，features 已对齐 LLM 空间
 
     输出: group_features/{idx//1000:03d}/{idx:06d}.pt
            每个文件是一个 list of tensors，[256, 3584] per group
-
-    优势：
-      - 每个 group 的特征纯净，只表示该 group 的视觉外观
-      - 解决了 SVG 中先填色后描边导致 bbox 重叠的问题
-      - 小 group 被放大到 448x448，获得更精细的特征
-      - 已对齐 LLM 空间 (3584 维)，复用了 Qwen 训练好的 merger
     """
     import pyarrow.parquet as pq
 
@@ -1062,13 +1033,12 @@ def stage_group_features(
             group_images = []
             valid_group_indices = []
             for g_idx, g in enumerate(ginfo["groups"]):
-                bbox = tuple(g["bbox"])
                 path_indices = g["path_indices"]
 
                 if not path_indices:
                     continue
 
-                img = render_group_to_image(svg_str, path_indices, bbox)
+                img = render_group_to_image(svg_str, path_indices)
                 if img is not None:
                     group_images.append(img)
                     valid_group_indices.append(g_idx)

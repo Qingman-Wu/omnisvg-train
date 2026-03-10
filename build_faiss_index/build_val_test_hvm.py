@@ -59,7 +59,8 @@ from tqdm import tqdm
 # ============================================================================
 
 BASE_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration"
-FULL_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w")
+CORPUS_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w")       # 全库元数据 (metadata, faiss_index, text_embeddings)
+TRAIN_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w_nozoom") # train 处理结果 (features, groups, group_features)
 CORPUS_DATA_DIR = os.path.join(BASE_DIR, "data_retrieval_corpus")
 MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
@@ -67,11 +68,11 @@ CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
 SPLIT_CONFIG = {
     "val": {
         "parquet_dir": os.path.join(BASE_DIR, "data_val"),
-        "hvm_dir": os.path.join(BASE_DIR, "hvm_val"),
+        "hvm_dir": os.path.join(BASE_DIR, "hvm_val_nozoom"),
     },
     "test": {
         "parquet_dir": os.path.join(BASE_DIR, "data_test_holdout"),
-        "hvm_dir": os.path.join(BASE_DIR, "hvm_test"),
+        "hvm_dir": os.path.join(BASE_DIR, "hvm_test_nozoom"),
     },
 }
 
@@ -169,14 +170,8 @@ def parse_svg_paths(svg_string):
 
 
 def decide_num_groups(total_complexity, num_paths):
-    if total_complexity < 30 or num_paths <= 2:
-        return 1
-    elif total_complexity < 80 or num_paths <= 5:
-        return 2
-    elif total_complexity < 150:
-        return 3
-    else:
-        return 4
+    """固定分为 4 组。"""
+    return 4
 
 
 def _make_group(paths, indices, complexity):
@@ -224,20 +219,18 @@ def group_paths_sequential(paths, num_groups):
     return groups
 
 
-def render_group_to_image(svg_string, group_path_indices, group_bbox, image_size=IMAGE_SIZE):
+def render_group_to_image(svg_string, group_path_indices, image_size=IMAGE_SIZE):
+    """使用原始 SVG 尺寸渲染 group paths，不 crop/zoom。"""
     import cairosvg
     path_pattern = re.compile(r'<path\s[^>]*?(?:/>|>\s*</path>)', re.DOTALL)
     all_path_tags = path_pattern.findall(svg_string)
     if not all_path_tags:
         return None
-    x0, y0, x1, y1 = group_bbox
-    vb_w = max(x1 - x0, 1.0)
-    vb_h = max(y1 - y0, 1.0)
     svg_lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{x0:.2f} {y0:.2f} {vb_w:.2f} {vb_h:.2f}" '
+        f'viewBox="0 0 {VIEWBOX_SIZE} {VIEWBOX_SIZE}" '
         f'width="{image_size}" height="{image_size}">',
-        f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{vb_w:.2f}" height="{vb_h:.2f}" fill="white"/>',
+        f'<rect x="0" y="0" width="{VIEWBOX_SIZE}" height="{VIEWBOX_SIZE}" fill="white"/>',
     ]
     for pi in group_path_indices:
         if pi < len(all_path_tags):
@@ -258,7 +251,7 @@ def render_group_to_image(svg_string, group_path_indices, group_bbox, image_size
 
 def load_full_metadata():
     """加载全库 metadata（25w）"""
-    meta_path = os.path.join(FULL_HVM_DIR, "metadata.jsonl")
+    meta_path = os.path.join(CORPUS_HVM_DIR, "metadata.jsonl")
     meta = {}
     with open(meta_path) as f:
         for line in f:
@@ -339,7 +332,7 @@ def run_rag(split_name: str, hvm_out_dir: str, parquet_dir: str):
     print(f"  Saved metadata: {meta_path}")
 
     # 2. 加载已有的 faiss_index（全库 25w）
-    index_path = os.path.join(FULL_HVM_DIR, "faiss_index.bin")
+    index_path = os.path.join(CORPUS_HVM_DIR, "faiss_index.bin")
     print(f"  Loading FAISS index from {index_path}...")
     index = faiss.read_index(index_path)
     print(f"  FAISS index size: {index.ntotal}")
@@ -413,7 +406,7 @@ def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
 
     features_dir = os.path.join(hvm_out_dir, "features")
     os.makedirs(features_dir, exist_ok=True)
-    train_features_dir = os.path.join(FULL_HVM_DIR, "features")
+    train_features_dir = os.path.join(TRAIN_HVM_DIR, "features")
 
     # 加载 RAG 结果，收集所有需要 features 的 idx
     rag_path = os.path.join(hvm_out_dir, "rag_results_train.jsonl")
@@ -599,7 +592,7 @@ def run_groups(split_name: str, hvm_out_dir: str):
     print(f"  Unique Top-1 refs: {len(top1_refs)}")
 
     # 尝试从训练集 groups 复制
-    train_groups_path = os.path.join(FULL_HVM_DIR, "groups_train_ref.jsonl")
+    train_groups_path = os.path.join(TRAIN_HVM_DIR, "groups_train_ref.jsonl")
     train_groups = {}
     if os.path.exists(train_groups_path):
         with open(train_groups_path) as f:
@@ -681,7 +674,7 @@ def run_group_features(split_name: str, hvm_out_dir: str,
 
     gf_dir = os.path.join(hvm_out_dir, "group_features")
     os.makedirs(gf_dir, exist_ok=True)
-    train_gf_dir = os.path.join(FULL_HVM_DIR, "group_features")
+    train_gf_dir = os.path.join(TRAIN_HVM_DIR, "group_features")
 
     # 加载 RAG 结果
     rag_path = os.path.join(hvm_out_dir, "rag_results_train.jsonl")
@@ -787,7 +780,7 @@ def run_group_features(split_name: str, hvm_out_dir: str,
             for g in ginfo["groups"]:
                 if not g["path_indices"]:
                     continue
-                img = render_group_to_image(svg_str, g["path_indices"], tuple(g["bbox"]))
+                img = render_group_to_image(svg_str, g["path_indices"])
                 if img is not None:
                     group_images.append(img)
             if not group_images:

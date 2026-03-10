@@ -62,7 +62,8 @@ from tqdm import tqdm
 # Paths
 # ============================================================================
 
-FULL_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_full"
+INPUT_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w"
+OUTPUT_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom"
 FULL_DATA_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
 MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -82,7 +83,7 @@ def load_train_ref_indices():
         all_feature_indices: 需要提取 features 的全部 idx（ref + 训练样本自身）
         top1_refs: Top-1 ref idx（用于 groups / group_features）
     """
-    rag_path = os.path.join(FULL_HVM_DIR, "rag_results_train.jsonl")
+    rag_path = os.path.join(INPUT_HVM_DIR, "rag_results_train.jsonl")
     all_refs = set()
     top1_refs = set()
     train_indices = set()
@@ -100,7 +101,7 @@ def load_train_ref_indices():
 
 def load_metadata_for_indices(indices_set):
     """只加载需要的 idx 的 metadata。"""
-    meta_path = os.path.join(FULL_HVM_DIR, "metadata.jsonl")
+    meta_path = os.path.join(INPUT_HVM_DIR, "metadata.jsonl")
     meta = {}
     with open(meta_path) as f:
         for line in f:
@@ -212,14 +213,8 @@ def parse_svg_paths(svg_string):
 
 
 def decide_num_groups(total_complexity, num_paths):
-    if total_complexity < 30 or num_paths <= 2:
-        return 1
-    elif total_complexity < 80 or num_paths <= 5:
-        return 2
-    elif total_complexity < 150:
-        return 3
-    else:
-        return 4
+    """固定分为 4 组。"""
+    return 4
 
 
 def _make_group(paths, indices, complexity):
@@ -267,20 +262,18 @@ def group_paths_sequential(paths, num_groups):
     return groups
 
 
-def render_group_to_image(svg_string, group_path_indices, group_bbox, image_size=IMAGE_SIZE):
+def render_group_to_image(svg_string, group_path_indices, image_size=IMAGE_SIZE):
+    """使用原始 SVG 尺寸渲染 group paths，不 crop/zoom。"""
     import cairosvg
     path_pattern = re.compile(r'<path\s[^>]*?(?:/>|>\s*</path>)', re.DOTALL)
     all_path_tags = path_pattern.findall(svg_string)
     if not all_path_tags:
         return None
-    x0, y0, x1, y1 = group_bbox
-    vb_w = max(x1 - x0, 1.0)
-    vb_h = max(y1 - y0, 1.0)
     svg_lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{x0:.2f} {y0:.2f} {vb_w:.2f} {vb_h:.2f}" '
+        f'viewBox="0 0 {VIEWBOX_SIZE} {VIEWBOX_SIZE}" '
         f'width="{image_size}" height="{image_size}">',
-        f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{vb_w:.2f}" height="{vb_h:.2f}" fill="white"/>',
+        f'<rect x="0" y="0" width="{VIEWBOX_SIZE}" height="{VIEWBOX_SIZE}" fill="white"/>',
     ]
     for pi in group_path_indices:
         if pi < len(all_path_tags):
@@ -312,7 +305,7 @@ def run_groups(all_ref_indices, top1_ref_indices):
     tables = load_parquets_for_meta(meta)
     print(f"  Loaded {len(tables)} parquet files")
 
-    groups_path = os.path.join(FULL_HVM_DIR, "groups_train_ref.jsonl")
+    groups_path = os.path.join(OUTPUT_HVM_DIR, "groups_train_ref.jsonl")
     stats = {"1_group": 0, "2_groups": 0, "3_groups": 0, "4_groups": 0, "errors": 0}
 
     with open(groups_path, "w") as fout:
@@ -366,7 +359,7 @@ def run_features(all_ref_indices, shard_id, num_shards, batch_size):
     print(f"Stage: Features — shard {shard_id}/{num_shards}, {len(my_indices)} indices")
     print("=" * 60)
 
-    features_dir = os.path.join(FULL_HVM_DIR, "features")
+    features_dir = os.path.join(OUTPUT_HVM_DIR, "features")
     os.makedirs(features_dir, exist_ok=True)
 
     # Skip already done
@@ -457,7 +450,7 @@ def run_group_features(top1_ref_indices, shard_id, num_shards, batch_size):
     print(f"Stage: Group Features — shard {shard_id}/{num_shards}, {len(my_indices)} indices")
     print("=" * 60)
 
-    gf_dir = os.path.join(FULL_HVM_DIR, "group_features")
+    gf_dir = os.path.join(OUTPUT_HVM_DIR, "group_features")
     os.makedirs(gf_dir, exist_ok=True)
 
     # Skip done
@@ -472,7 +465,7 @@ def run_group_features(top1_ref_indices, shard_id, num_shards, batch_size):
         return
 
     # Load groups
-    groups_path = os.path.join(FULL_HVM_DIR, "groups_train_ref.jsonl")
+    groups_path = os.path.join(OUTPUT_HVM_DIR, "groups_train_ref.jsonl")
     groups_data = {}
     with open(groups_path) as f:
         for line in f:
@@ -532,7 +525,7 @@ def run_group_features(top1_ref_indices, shard_id, num_shards, batch_size):
             for g in ginfo["groups"]:
                 if not g["path_indices"]:
                     continue
-                img = render_group_to_image(svg_str, g["path_indices"], tuple(g["bbox"]))
+                img = render_group_to_image(svg_str, g["path_indices"])
                 if img is not None:
                     group_images.append(img)
 
