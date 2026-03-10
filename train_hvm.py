@@ -458,6 +458,8 @@ def train(args):
         model_size=args.model_size,
     )
     token_config = config.tokenization
+    if args.base_model:
+        token_config.base_model = args.base_model
     hvm_config = HVMConfig(
         d_model=3584,
         d_vision=3584,       # post-merge dim (GME & PME 统一)
@@ -983,6 +985,8 @@ def parse_args():
     # Model
     parser.add_argument("--model_size", type=str, default="8B", choices=["8B"])
     parser.add_argument("--config_dir", type=str, default="./configs")
+    parser.add_argument("--base_model", type=str, default=None,
+                        help="Override base_model path (e.g. Qwen2.5-VL) from tokenization.yaml")
     parser.add_argument("--omnisvg_checkpoint", type=str, default=None,
                         help="OmniSVG checkpoint path (None=use default)")
 

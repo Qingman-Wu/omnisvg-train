@@ -1,4 +1,4 @@
-#  s5_gme_cdm_edr_part_notag_topk1 详细实验方案
+#  s5_gme_cdm_edr_parttag_topk1 详细实验方案
 
 - 主实验：`part-tag + nozoom + GME + CDM + EDR(top1) + last4`
 - 消融实验：`part-no-tag + nozoom + GME + CDM + EDR(top1) + last4`
