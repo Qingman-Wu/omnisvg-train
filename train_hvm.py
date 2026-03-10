@@ -392,6 +392,10 @@ def evaluate_val_loss(
                 attention_mask=attention_mask,
                 ref_features=batch["ref_features"],
                 group_features_list=batch["group_features_list"],
+                part_features=batch["part_features"],
+                part_tag_meta=batch["part_tag_meta"],
+                part_group_ids=batch["part_group_ids"],
+                part_mask=batch["part_mask"],
                 ref_text_ids=batch["ref_text_ids"],
                 ref_text_mask=batch["ref_text_mask"],
             )
@@ -472,6 +476,9 @@ def train(args):
         dra_n_heads=args.dra_n_heads,
         cdm_num_queries=args.cdm_num_queries,
         cdm_num_layers=args.cdm_num_layers,
+        cdm_detail_source=args.cdm_detail_source,
+        cdm_use_tag_meta=not args.cdm_disable_tag_meta,
+        cdm_use_group_id=not args.cdm_disable_group_id,
         edr_d_router=args.edr_d_router,
         edr_top_k=args.edr_top_k,
         edr_disable_conf=args.edr_disable_conf,
@@ -685,6 +692,7 @@ def train(args):
                 "hvm_config": hvm_config.__dict__,
                 "num_pims": hvm_config.num_pims,
                 "pim_layers": hvm_config.pim_layer_indices,
+                "edr_detail_layers": hvm_config.edr_detail_layer_indices,
                 "trainable_params_M": sum(p.numel() for p in trainable_params) / 1e6,
                 **git_meta,
             },
@@ -705,6 +713,7 @@ def train(args):
                 **hvm_config.__dict__,
                 "pim_layer_indices": hvm_config.pim_layer_indices,
                 "num_pims": hvm_config.num_pims,
+                "edr_detail_layer_indices": hvm_config.edr_detail_layer_indices,
             }
             json.dump(config_dict, f, indent=2, default=str)
 
@@ -724,12 +733,19 @@ def train(args):
     if not args.disable_hvm:
         accelerator.print(f"  Memory mode: {hvm_config.memory_mode}")
         accelerator.print(f"  Inject mode: {hvm_config.inject_mode}")
+        if hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+            accelerator.print(f"  CDM detail source: {hvm_config.cdm_detail_source}")
+            accelerator.print(f"  CDM use tag meta: {hvm_config.cdm_use_tag_meta}")
+            accelerator.print(f"  CDM use group id: {hvm_config.cdm_use_group_id}")
+        if hvm_config.memory_mode == "gme_cdm_edr":
+            accelerator.print(f"  EDR d_router: {hvm_config.edr_d_router}")
+            accelerator.print(f"  EDR top-k: {hvm_config.edr_top_k}")
+            accelerator.print(f"  EDR disable conf: {hvm_config.edr_disable_conf}")
+            accelerator.print(f"  EDR disable gist: {hvm_config.edr_disable_gist}")
+            accelerator.print(f"  EDR detail layers: {hvm_config.edr_detail_layer_indices}")
         if hvm_config.inject_mode == "fixed":
             accelerator.print(f"  Inject scale: {hvm_config.inject_scale}")
         accelerator.print(f"  PIM layers: {hvm_config.pim_layer_indices}")
-        if hvm_config.memory_mode == "gme_cdm_edr":
-            accelerator.print(f"  EDR disable gist: {hvm_config.edr_disable_gist}")
-            accelerator.print(f"  EDR detail layers: {hvm_config.edr_detail_layer_indices}")
     if args.resume_from:
         accelerator.print(f"  Resuming from: step {global_step}, epoch {start_epoch + 1}")
     if val_dataloader is not None:
@@ -781,6 +797,10 @@ def train(args):
                         attention_mask=attention_mask,
                         ref_features=ref_features,
                         group_features_list=group_features_list,
+                        part_features=batch["part_features"],
+                        part_tag_meta=batch["part_tag_meta"],
+                        part_group_ids=batch["part_group_ids"],
+                        part_mask=batch["part_mask"],
                         ref_text_ids=ref_text_ids,
                         ref_text_mask=ref_text_mask,
                     )
@@ -999,6 +1019,14 @@ def parse_args():
                         help="CDM number of learnable queries (default: 16)")
     parser.add_argument("--cdm_num_layers", type=int, default=6,
                         help="CDM QFormer number of layers (default: 6)")
+    parser.add_argument("--cdm_detail_source", type=str, default="ref",
+                        choices=["ref", "part"],
+                        help="CDM detail source: ref=flattened 3x256 raw ref tokens, "
+                             "part=top1 grouped tokens with layout tags.")
+    parser.add_argument("--cdm_disable_tag_meta", action="store_true", default=False,
+                        help="Disable CDM layout tag meta ([cx, cy, w, h, z_start, z_end]) when using part detail source.")
+    parser.add_argument("--cdm_disable_group_id", action="store_true", default=False,
+                        help="Disable CDM group-id embedding when using part detail source.")
     parser.add_argument("--edr_d_router", type=int, default=256,
                         help="EDR router bottleneck dimension (default: 256)")
     parser.add_argument("--edr_top_k", type=int, default=2,

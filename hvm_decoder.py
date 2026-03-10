@@ -342,6 +342,10 @@ class HVMSketchDecoder(nn.Module):
         # HVM-specific inputs
         ref_features: Optional[torch.Tensor] = None,
         group_features_list: Optional[List[List[torch.Tensor]]] = None,
+        part_features: Optional[torch.Tensor] = None,
+        part_tag_meta: Optional[torch.Tensor] = None,
+        part_group_ids: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
         ref_text_ids: Optional[torch.Tensor] = None,
         ref_text_mask: Optional[torch.Tensor] = None,
         # Original model inputs (for compatibility)
@@ -362,6 +366,10 @@ class HVMSketchDecoder(nn.Module):
             group_features_list: List[List[Tensor]]       Top-1 参考的逐 group 渲染特征 (for PME)
                                  group_features_list[b] = [feat_g0, feat_g1, ...],
                                  每个 feat_gX: [256, 3584] (post-merge, LLM-aligned)
+            part_features:       [B, G, 256, 3584]       Top-1 参考的 group 特征 (for part-grounded CDM)
+            part_tag_meta:       [B, G, 6]               [cx, cy, w, h, z_start, z_end]
+            part_group_ids:      [B, G]                  group id (0,1,2,3)
+            part_mask:           [B, G]                  有效 group mask
             ref_text_ids:        [B, N_t]                 参考文本 token IDs
             ref_text_mask:       [B, N_t]                 参考文本 attention mask
 
@@ -395,10 +403,19 @@ class HVMSketchDecoder(nn.Module):
                 self._text_feats = None
                 self._text_mask = None
             elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
-                # CDM / EDR: gist_feats detach 后和展平的 ref_features 一起送入 CDM 编码器
-                B_ref = ref_features.shape[0]
-                flat_ref = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
-                self._detail_feats = self.cdm(flat_ref, self._gist_feats.detach())
+                # CDM / EDR: 兼容旧版 raw-ref tokens 与新版 part-grounded tagged tokens
+                if self.hvm_config.cdm_detail_source == "part" and part_features is not None:
+                    self._detail_feats = self.cdm(
+                        part_features.to(device=device, dtype=hvm_dtype),
+                        self._gist_feats.detach(),
+                        part_tag_meta=part_tag_meta.to(device=device, dtype=hvm_dtype) if part_tag_meta is not None else None,
+                        part_group_ids=part_group_ids.to(device=device) if part_group_ids is not None else None,
+                        part_mask=part_mask.to(device=device, dtype=torch.bool) if part_mask is not None else None,
+                    )
+                else:
+                    B_ref = ref_features.shape[0]
+                    flat_ref = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
+                    self._detail_feats = self.cdm(flat_ref, self._gist_feats.detach())
                 self._ref_feats = None
                 self._part_feats = None
                 self._part_mask = None
@@ -512,7 +529,14 @@ class HVMSketchDecoder(nn.Module):
         elif pme_dict:
             print("[HVM] Warning: checkpoint contains PME weights, but current mode disables PME. Skipping PME load.")
         if self.cdm is not None:
-            self.cdm.load_state_dict(cdm_dict, strict=True)
+            try:
+                self.cdm.load_state_dict(cdm_dict, strict=True)
+            except RuntimeError as exc:
+                missing, unexpected = self.cdm.load_state_dict(cdm_dict, strict=False)
+                print(
+                    "[HVM] Warning: CDM checkpoint loaded with strict=False "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)}): {exc}"
+                )
         elif cdm_dict:
             print("[HVM] Warning: checkpoint contains CDM weights, but current mode disables CDM. Skipping CDM load.")
         self.pims.load_state_dict(pims_dict, strict=True)
@@ -535,11 +559,16 @@ class HVMSketchDecoder(nn.Module):
             print(f"    CDM: {cdm_params:.1f}M")
         print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
         print(f"  Memory mode: {self.hvm_config.memory_mode}")
+        if self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+            print(f"  CDM detail source: {self.hvm_config.cdm_detail_source}")
+            print(f"  CDM use tag meta: {self.hvm_config.cdm_use_tag_meta}")
+            print(f"  CDM use group id: {self.hvm_config.cdm_use_group_id}")
+        if self.hvm_config.memory_mode == "gme_cdm_edr":
+            print(f"  EDR disable gist: {self.hvm_config.edr_disable_gist}")
+            print(f"  EDR detail layers: {self.hvm_config.edr_detail_layer_indices}")
         print(f"  Inject mode: {self.hvm_config.inject_mode}")
         if self.hvm_config.inject_mode == "fixed":
             print(f"  Inject scale: {self.hvm_config.inject_scale}")
         print(f"  Total: {total_params / 1e6:.0f}M params")
         print(f"  Trainable ratio: {trainable_params / total_params * 100:.1f}%")
         print(f"  PIM insertion layers: {self.hvm_config.pim_layer_indices}\n")
-        if self.hvm_config.memory_mode == "gme_cdm_edr":
-            print(f"  EDR detail layers: {self.hvm_config.edr_detail_layer_indices}\n")

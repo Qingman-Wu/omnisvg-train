@@ -53,6 +53,10 @@ class HVMConfig:
     cdm_num_layers: int = 6
     cdm_num_heads: int = 8
     cdm_ff_mult: int = 4
+    cdm_detail_source: str = "ref"   # ref: 3x256 raw ref tokens, part: 4x256 tagged part tokens
+    cdm_tag_meta_dim: int = 6        # [cx, cy, w, h, z_start, z_end]
+    cdm_use_tag_meta: bool = True
+    cdm_use_group_id: bool = True
 
     # === EDR (Execution-aware Detail Routing) ===
     edr_d_router: int = 256
@@ -374,12 +378,14 @@ class CDMQFormerLayer(nn.Module):
         queries: torch.Tensor,
         gist_kv: torch.Tensor,
         ref_kv: torch.Tensor,
+        ref_kv_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             queries: [B, Nq, D]
             gist_kv: [B, 32, D]   gist features (detached)
             ref_kv:  [B, 768, D]  raw ref features (projected)
+            ref_kv_mask: [B, N_ref] bool, True=有效
         """
         q_norm = self.norm_sa(queries)
         queries = queries + self.self_attn(q_norm, q_norm, q_norm)
@@ -388,7 +394,7 @@ class CDMQFormerLayer(nn.Module):
         queries = queries + self.gist_cross_attn(q_norm, gist_kv, gist_kv)
 
         q_norm = self.norm_ref_ca(queries)
-        queries = queries + self.ref_cross_attn(q_norm, ref_kv, ref_kv)
+        queries = queries + self.ref_cross_attn(q_norm, ref_kv, ref_kv, kv_mask=ref_kv_mask)
 
         queries = queries + self.ffn(self.norm_ff(queries))
         return queries
@@ -399,11 +405,15 @@ class CDMEncoder(nn.Module):
     互补细节记忆编码器 (Complementary Detail Memory)。
 
     16 个 learnable queries 先了解 gist 覆盖了什么，
-    再从原始 768 ref tokens 中提取 gist 遗漏的互补细节。
+    再从 detail source 中提取 gist 遗漏的互补细节。
 
     输入:
-      - ref_features: [B, 768, 3584]  (展平后的 3 张参考图 vision features)
-      - gist_feats:   [B, 32, 3584]   (GME 输出, detached)
+      - ref_features: [B, 768, 3584]      (旧版 CDM: 展平后的 3 张参考图 vision features)
+      - part_features: [B, G, 256, 3584]  (新版 CDM: Top-1 ref 的 group 特征)
+      - part_tag_meta: [B, G, 6]          (layout/order tag)
+      - part_group_ids: [B, G]            (group id: 0,1,2,3)
+      - part_mask: [B, G]                 (有效 group)
+      - gist_feats: [B, 32, 3584]         (GME 输出, detached)
     输出:
       - detail_feats: [B, 16, 3584]
     """
@@ -421,6 +431,13 @@ class CDMEncoder(nn.Module):
         self.gist_proj = nn.Linear(config.d_model, d_q, bias=False)
         self.gist_norm = nn.LayerNorm(d_q)
 
+        self.group_id_embedding = nn.Embedding(config.pme_max_groups, config.d_vision)
+        self.tag_meta_mlp = nn.Sequential(
+            nn.Linear(config.cdm_tag_meta_dim, d_q),
+            nn.GELU(),
+            nn.Linear(d_q, config.d_vision),
+        )
+
         d_ff = d_q * config.cdm_ff_mult
         self.layers = nn.ModuleList([
             CDMQFormerLayer(d_q, config.cdm_num_heads, d_ff)
@@ -434,24 +451,62 @@ class CDMEncoder(nn.Module):
         self,
         ref_features: torch.Tensor,
         gist_feats: torch.Tensor,
+        part_tag_meta: Optional[torch.Tensor] = None,
+        part_group_ids: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            ref_features: [B, 768, d_vision]
+            ref_features: [B, 768, d_vision] or [B, G, 256, d_vision]
             gist_feats:   [B, 32, d_model]  (should be detached by caller)
+            part_tag_meta: [B, G, 6]，仅 part-grounded CDM 使用
+            part_group_ids: [B, G]，仅 part-grounded CDM 使用
+            part_mask: [B, G]，仅 part-grounded CDM 使用
         Returns:
             detail_feats: [B, cdm_num_queries, d_model]
         """
         B = ref_features.shape[0]
         dtype = self.ref_proj.weight.dtype
-
-        ref_kv = self.ref_norm(self.ref_proj(ref_features.to(dtype=dtype)))
         gist_kv = self.gist_norm(self.gist_proj(gist_feats.to(dtype=dtype)))
+        ref_kv_mask = None
+
+        if ref_features.ndim == 4:
+            # part-grounded CDM: [B, G, 256, 3584] → 加 tag 后展平为 [B, G*256, 3584]
+            group_tokens = ref_features.to(dtype=dtype)
+            if self.config.cdm_use_tag_meta and part_tag_meta is not None:
+                tag_emb = self.tag_meta_mlp(part_tag_meta.to(dtype=dtype))
+            else:
+                tag_emb = torch.zeros(
+                    group_tokens.shape[0],
+                    group_tokens.shape[1],
+                    group_tokens.shape[-1],
+                    device=group_tokens.device,
+                    dtype=dtype,
+                )
+            if self.config.cdm_use_group_id and part_group_ids is not None:
+                safe_group_ids = part_group_ids.clamp(min=0, max=self.config.pme_max_groups - 1)
+                tag_emb = tag_emb + self.group_id_embedding(safe_group_ids.to(device=group_tokens.device))
+            if part_mask is not None:
+                tag_emb = tag_emb * part_mask.to(device=group_tokens.device, dtype=dtype).unsqueeze(-1)
+
+            tagged_tokens = group_tokens + tag_emb.unsqueeze(2)
+            flat_tokens = tagged_tokens.view(B, -1, tagged_tokens.shape[-1])
+
+            if part_mask is not None:
+                ref_kv_mask = part_mask.to(device=flat_tokens.device, dtype=torch.bool)
+                ref_kv_mask = ref_kv_mask.unsqueeze(-1).expand(-1, -1, group_tokens.shape[2]).reshape(B, -1)
+                empty_rows = ~ref_kv_mask.any(dim=1)
+                if empty_rows.any():
+                    ref_kv_mask = ref_kv_mask.clone()
+                    ref_kv_mask[empty_rows, 0] = True
+            ref_kv = self.ref_norm(self.ref_proj(flat_tokens))
+        else:
+            ref_kv = self.ref_norm(self.ref_proj(ref_features.to(dtype=dtype)))
 
         queries = self.queries.expand(B, -1, -1)
 
         for layer in self.layers:
-            queries = layer(queries, gist_kv, ref_kv)
+            queries = layer(queries, gist_kv, ref_kv, ref_kv_mask=ref_kv_mask)
 
         return self.output_norm(self.output_proj(queries))
 
@@ -1198,10 +1253,10 @@ class DetailRouter(nn.Module):
 
 class EDRInjectionModule(nn.Module):
     """
-    GME + CDM + EDR 最小版注入模块：
+    GME + CDM + EDR 注入模块：
       - Gist 路保持原始 cross-attn 注入
-      - Detail 路不再直接 attention 16 个 slots，而是先路由再注入
-      - E1 最小版: delta_detail = routed_detail
+      - Detail 路先对 CDM 的 16 个 detail slots 做 router
+      - 再用 routed_detail 经 conf 调制后注入 hidden_state
     """
 
     def __init__(self, config: HVMConfig, enable_detail: bool = True):

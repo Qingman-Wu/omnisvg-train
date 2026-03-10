@@ -303,8 +303,17 @@ def prepare_text_inputs(text, processor, token_config, device="cuda"):
     return input_ids, attention_mask
 
 
-def set_hvm_memory(model, ref_features, group_features, ref_text,
-                   tokenizer, hvm_config, device="cuda"):
+def set_hvm_memory(
+    model,
+    ref_features,
+    group_features,
+    ref_text,
+    tokenizer,
+    hvm_config,
+    device="cuda",
+    group_tag_meta=None,
+    group_ids=None,
+):
     """将参考特征注入 HVM 模型。
 
     GME mode (gme + fixed / gme + adaptive): 只需要 gist_feats。
@@ -330,10 +339,27 @@ def set_hvm_memory(model, ref_features, group_features, ref_text,
     else:
         model._ref_feats = None
 
-    # CDM / EDR: gist detach + 展平 ref 送入 CDM 编码器
+    # CDM / EDR: 兼容旧版 raw-ref tokens 与新版 part-grounded tagged tokens
     if hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr") and model.cdm is not None:
-        flat_ref = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
-        model._detail_feats = model.cdm(flat_ref, model._gist_feats.detach())
+        if hvm_config.cdm_detail_source == "part" and group_features:
+            part_tensor = torch.stack(group_features).unsqueeze(0).to(device=device, dtype=hvm_dtype)
+            part_tag_tensor = None
+            part_group_ids = None
+            part_mask = torch.ones(1, part_tensor.shape[1], device=device, dtype=torch.bool)
+            if group_tag_meta is not None:
+                part_tag_tensor = torch.as_tensor(group_tag_meta, dtype=hvm_dtype, device=device).unsqueeze(0)
+            if group_ids is not None:
+                part_group_ids = torch.as_tensor(group_ids, dtype=torch.long, device=device).unsqueeze(0)
+            model._detail_feats = model.cdm(
+                part_tensor,
+                model._gist_feats.detach(),
+                part_tag_meta=part_tag_tensor,
+                part_group_ids=part_group_ids,
+                part_mask=part_mask,
+            )
+        else:
+            flat_ref = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
+            model._detail_feats = model.cdm(flat_ref, model._gist_feats.detach())
     else:
         model._detail_feats = None
 
@@ -693,6 +719,8 @@ def run_on_single_gpu(
             tokenizer=tokenizer,
             hvm_config=hvm_config,
             device=device,
+            group_tag_meta=sample.get("ref_best_group_tag_meta"),
+            group_ids=sample.get("ref_best_group_ids"),
         )
 
         actual_num = args.num_candidates + EXTRA_CANDIDATES_BUFFER
