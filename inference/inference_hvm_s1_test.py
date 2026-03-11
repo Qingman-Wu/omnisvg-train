@@ -360,8 +360,10 @@ def set_hvm_memory(
         else:
             flat_ref = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
             model._detail_feats = model.cdm(flat_ref, model._gist_feats.detach())
+        model._detail_slot_mask = getattr(model.cdm, "last_detail_slot_mask", None)
     else:
         model._detail_feats = None
+        model._detail_slot_mask = None
 
     # Text feats: 仅 full mode 需要（其他模式都不需要 text）
     NO_TEXT_MODES = ("gme", "gme_pme", "gme_pme_dual", "gme_pme_hier",
@@ -388,6 +390,7 @@ def clear_hvm_memory(model):
     model._text_mask = None
     model._ref_feats = None
     model._detail_feats = None
+    model._detail_slot_mask = None
 
 
 # ============================================================================

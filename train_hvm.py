@@ -478,9 +478,12 @@ def train(args):
         dra_n_heads=args.dra_n_heads,
         cdm_num_queries=args.cdm_num_queries,
         cdm_num_layers=args.cdm_num_layers,
+        cdm_layout=args.cdm_layout,
+        cdm_group_queries_per_group=args.cdm_group_queries_per_group,
         cdm_detail_source=args.cdm_detail_source,
         cdm_use_tag_meta=not args.cdm_disable_tag_meta,
         cdm_use_group_id=not args.cdm_disable_group_id,
+        cdm_disable_gist=args.cdm_disable_gist,
         edr_d_router=args.edr_d_router,
         edr_top_k=args.edr_top_k,
         edr_disable_conf=args.edr_disable_conf,
@@ -736,7 +739,9 @@ def train(args):
         accelerator.print(f"  Memory mode: {hvm_config.memory_mode}")
         accelerator.print(f"  Inject mode: {hvm_config.inject_mode}")
         if hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+            accelerator.print(f"  CDM layout: {hvm_config.cdm_layout}")
             accelerator.print(f"  CDM detail source: {hvm_config.cdm_detail_source}")
+            accelerator.print(f"  CDM disable gist: {hvm_config.cdm_disable_gist}")
             accelerator.print(f"  CDM use tag meta: {hvm_config.cdm_use_tag_meta}")
             accelerator.print(f"  CDM use group id: {hvm_config.cdm_use_group_id}")
         if hvm_config.memory_mode == "gme_cdm_edr":
@@ -1023,10 +1028,16 @@ def parse_args():
                         help="CDM number of learnable queries (default: 16)")
     parser.add_argument("--cdm_num_layers", type=int, default=6,
                         help="CDM QFormer number of layers (default: 6)")
+    parser.add_argument("--cdm_layout", type=str, default="global", choices=["global", "groupwise"],
+                        help="CDM layout: global=all part tokens share one CDM, groupwise=each group runs through a shared CDM independently.")
+    parser.add_argument("--cdm_group_queries_per_group", type=int, default=4,
+                        help="Number of detail slots produced per group in groupwise CDM (default: 4).")
     parser.add_argument("--cdm_detail_source", type=str, default="ref",
                         choices=["ref", "part"],
                         help="CDM detail source: ref=flattened 3x256 raw ref tokens, "
                              "part=top1 grouped tokens with layout tags.")
+    parser.add_argument("--cdm_disable_gist", action="store_true", default=False,
+                        help="Disable CDM gist cross-attention while keeping the rest of the pipeline unchanged.")
     parser.add_argument("--cdm_disable_tag_meta", action="store_true", default=False,
                         help="Disable CDM layout tag meta ([cx, cy, w, h, z_start, z_end]) when using part detail source.")
     parser.add_argument("--cdm_disable_group_id", action="store_true", default=False,
@@ -1136,6 +1147,16 @@ def parse_args():
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
+    if args.cdm_disable_gist and args.memory_mode not in ("gme_cdm", "gme_cdm_edr"):
+        parser.error("--cdm_disable_gist is only supported when memory_mode is 'gme_cdm' or 'gme_cdm_edr'.")
+    if args.cdm_layout == "groupwise" and args.cdm_detail_source != "part":
+        parser.error("--cdm_layout groupwise requires --cdm_detail_source part.")
+    if args.cdm_layout == "groupwise" and args.cdm_num_queries != args.cdm_group_queries_per_group * 4:
+        parser.error(
+            "--cdm_layout groupwise requires "
+            "--cdm_num_queries == --cdm_group_queries_per_group * 4 "
+            f"(got {args.cdm_num_queries} vs {args.cdm_group_queries_per_group}*4)."
+        )
     if args.edr_disable_gist and args.memory_mode != "gme_cdm_edr":
         parser.error("--edr_disable_gist is only supported when memory_mode='gme_cdm_edr'.")
     if args.edr_detail_layer_indices is not None:

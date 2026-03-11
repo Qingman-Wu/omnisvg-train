@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / CDM part-tag nozoom + EDR top1)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Group-wise CDM + part-tag + EDR top1)
 # =============================================================================
 #
 # 使用方法:
@@ -8,9 +8,10 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2 bash run_train_hvm_a100_1_1.sh --num_gpus 3
 #
 # 默认实验:
-#   GME + CDM(part-tag) + EDR(E1 top1) + last4 + adaptive
-#   CDM detail source 使用 Top-1 ref 的 nozoom group tokens
-#   并叠加 group tag:
+#   GME + group-wise CDM(part-tag, Version B) + EDR(E1 top1) + last4 + adaptive
+#   每个 group 的 nozoom tokens 单独经过共享 CDM，得到 4 个 slots
+#   然后拼成 16 个 detail slots，再送入 EDR
+#   tag 在每组 4 个 slots 编码完成后注入:
 #       E_group_id + MLP([cx, cy, w, h, z_start, z_end])
 
 set -e
@@ -43,7 +44,10 @@ GATE_ALPHA_INIT=0.05
 GME_NUM_QUERIES=32
 CDM_NUM_QUERIES=16
 CDM_NUM_LAYERS=6
+CDM_LAYOUT="groupwise"
+CDM_GROUP_QUERIES_PER_GROUP=4
 CDM_DETAIL_SOURCE="part"
+CDM_DISABLE_GIST=false
 EDR_D_ROUTER=256
 EDR_TOP_K=1
 EDR_DISABLE_CONF=false
@@ -69,11 +73,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_parttag_nozoom_topk1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s6_groupwise_cdm_edr_parttag_nozoom_topk1_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s4_gme_cdm_edr_parttag_nozoom_topk1_last4"
+SWANLAB_RUN_NAME="s6_groupwise_cdm_edr_parttag_nozoom_topk1_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -104,7 +108,11 @@ while [[ $# -gt 0 ]]; do
         --gme_num_queries) GME_NUM_QUERIES="$2";     shift 2 ;;
         --cdm_num_queries) CDM_NUM_QUERIES="$2";     shift 2 ;;
         --cdm_num_layers) CDM_NUM_LAYERS="$2";       shift 2 ;;
+        --cdm_layout)     CDM_LAYOUT="$2";           shift 2 ;;
+        --cdm_group_queries_per_group) CDM_GROUP_QUERIES_PER_GROUP="$2"; shift 2 ;;
         --cdm_detail_source) CDM_DETAIL_SOURCE="$2"; shift 2 ;;
+        --cdm_disable_gist) CDM_DISABLE_GIST=true;   shift 1 ;;
+        --no_cdm_disable_gist) CDM_DISABLE_GIST=false; shift 1 ;;
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
@@ -206,7 +214,10 @@ fi
 if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM queries:       ${CDM_NUM_QUERIES}"
     echo "  CDM layers:        ${CDM_NUM_LAYERS}"
+    echo "  CDM layout:        ${CDM_LAYOUT}"
+    echo "  CDM slots/group:   ${CDM_GROUP_QUERIES_PER_GROUP}"
     echo "  CDM detail source: ${CDM_DETAIL_SOURCE}"
+    echo "  CDM disable gist:  ${CDM_DISABLE_GIST}"
 fi
 if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
@@ -235,6 +246,8 @@ TRAIN_ARGS=(
     --gme_num_queries "$GME_NUM_QUERIES"
     --cdm_num_queries "$CDM_NUM_QUERIES"
     --cdm_num_layers "$CDM_NUM_LAYERS"
+    --cdm_layout "$CDM_LAYOUT"
+    --cdm_group_queries_per_group "$CDM_GROUP_QUERIES_PER_GROUP"
     --cdm_detail_source "$CDM_DETAIL_SOURCE"
     --edr_d_router "$EDR_D_ROUTER"
     --edr_top_k "$EDR_TOP_K"
@@ -296,6 +309,10 @@ fi
 
 if [ "$EDR_DISABLE_CONF" = true ]; then
     TRAIN_ARGS+=(--edr_disable_conf)
+fi
+
+if [ "$CDM_DISABLE_GIST" = true ]; then
+    TRAIN_ARGS+=(--cdm_disable_gist)
 fi
 
 # ===================== 保存启动快照 =====================

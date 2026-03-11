@@ -53,10 +53,13 @@ class HVMConfig:
     cdm_num_layers: int = 6
     cdm_num_heads: int = 8
     cdm_ff_mult: int = 4
+    cdm_layout: str = "global"      # global: 所有 group tokens 共用一个 CDM, groupwise: 每个 group 单独过共享 CDM
+    cdm_group_queries_per_group: int = 4
     cdm_detail_source: str = "ref"   # ref: 3x256 raw ref tokens, part: 4x256 tagged part tokens
     cdm_tag_meta_dim: int = 6        # [cx, cy, w, h, z_start, z_end]
     cdm_use_tag_meta: bool = True
     cdm_use_group_id: bool = True
+    cdm_disable_gist: bool = False   # 关闭 CDM 内部 gist cross-attn（EDR gist 路仍可保留）
 
     # === EDR (Execution-aware Detail Routing) ===
     edr_d_router: int = 256
@@ -107,6 +110,60 @@ class HVMConfig:
         return list(self.edr_detail_layer_indices_override)
 
 
+def build_cdm_tag_embedding(
+    config: HVMConfig,
+    tag_meta_mlp: nn.Module,
+    group_id_embedding: nn.Embedding,
+    part_tag_meta: Optional[torch.Tensor],
+    part_group_ids: Optional[torch.Tensor],
+    part_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+    device: torch.device,
+    batch_size: int,
+    num_groups: int,
+    out_dim: int,
+) -> torch.Tensor:
+    if config.cdm_use_tag_meta and part_tag_meta is not None:
+        tag_emb = tag_meta_mlp(part_tag_meta.to(device=device, dtype=dtype))
+    else:
+        tag_emb = torch.zeros(batch_size, num_groups, out_dim, device=device, dtype=dtype)
+
+    if config.cdm_use_group_id and part_group_ids is not None:
+        safe_group_ids = part_group_ids.clamp(min=0, max=config.pme_max_groups - 1)
+        tag_emb = tag_emb + group_id_embedding(safe_group_ids.to(device=device))
+
+    if part_mask is not None:
+        tag_emb = tag_emb * part_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+
+    return tag_emb
+
+
+def build_detail_slot_mask(
+    part_mask: Optional[torch.Tensor],
+    slots_per_group: int,
+    max_slots: int,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    if part_mask is None:
+        return torch.ones(batch_size, max_slots, device=device, dtype=torch.bool)
+
+    slot_mask = part_mask.to(device=device, dtype=torch.bool).unsqueeze(-1)
+    slot_mask = slot_mask.expand(-1, -1, slots_per_group).reshape(part_mask.shape[0], -1)
+
+    if slot_mask.shape[1] < max_slots:
+        pad = torch.zeros(slot_mask.shape[0], max_slots - slot_mask.shape[1], device=device, dtype=torch.bool)
+        slot_mask = torch.cat([slot_mask, pad], dim=1)
+    elif slot_mask.shape[1] > max_slots:
+        slot_mask = slot_mask[:, :max_slots]
+
+    empty_rows = ~slot_mask.any(dim=-1)
+    if empty_rows.any():
+        slot_mask = slot_mask.clone()
+        slot_mask[empty_rows, 0] = True
+    return slot_mask
+
+
 # ============================================================================
 # Attention Primitives
 # ============================================================================
@@ -132,6 +189,37 @@ class MultiHeadAttention(nn.Module):
         self.to_k = nn.Linear(d_model, self.d_inner, bias=False)
         self.to_v = nn.Linear(d_model, self.d_inner, bias=False)
         self.to_out = nn.Linear(self.d_inner, d_model, bias=False)
+        self.capture_attn = False
+        self.last_attn = None
+
+    def _capture_attention_probs(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        kv_mask: Optional[torch.Tensor],
+    ) -> None:
+        if not self.capture_attn:
+            self.last_attn = None
+            return
+
+        with torch.no_grad():
+            score = torch.matmul(Q.float(), K.float().transpose(-1, -2)) * (self.d_head ** -0.5)
+            if kv_mask is not None:
+                valid_mask = kv_mask.to(device=score.device, dtype=torch.bool)
+                if valid_mask.ndim != 2:
+                    raise ValueError(f"kv_mask must be [B, Nk], got shape={tuple(valid_mask.shape)}")
+                if valid_mask.shape[0] != score.shape[0] or valid_mask.shape[1] != score.shape[-1]:
+                    raise ValueError(
+                        "kv_mask shape mismatch: "
+                        f"mask={tuple(valid_mask.shape)} vs attn={tuple(score.shape)}"
+                    )
+                valid_mask = valid_mask.clone()
+                empty_rows = ~valid_mask.any(dim=-1)
+                if empty_rows.any():
+                    valid_mask[empty_rows, 0] = True
+                score = score.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
+
+            self.last_attn = torch.softmax(score, dim=-1).detach().float()
 
     def forward(
         self,
@@ -167,6 +255,7 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.masked_fill(attn_mask == 1, 0.0)
 
         out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask)
+        self._capture_attention_probs(Q, K, kv_mask)
         # out: [B, H, Nq, d_head]
         out = out.transpose(1, 2).reshape(B, Nq, self.d_inner)
         return self.to_out(out)
@@ -372,29 +461,36 @@ class CDMQFormerLayer(nn.Module):
             nn.Linear(d_ff, d_model),
         )
         self.norm_ff = nn.LayerNorm(d_model)
+        self.capture_vis = False
+        self.last_ref_attn = None
 
     def forward(
         self,
         queries: torch.Tensor,
-        gist_kv: torch.Tensor,
+        gist_kv: Optional[torch.Tensor],
         ref_kv: torch.Tensor,
         ref_kv_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             queries: [B, Nq, D]
-            gist_kv: [B, 32, D]   gist features (detached)
+            gist_kv: [B, 32, D] or None  gist features (detached)
             ref_kv:  [B, 768, D]  raw ref features (projected)
             ref_kv_mask: [B, N_ref] bool, True=有效
         """
+        self.last_ref_attn = None
         q_norm = self.norm_sa(queries)
         queries = queries + self.self_attn(q_norm, q_norm, q_norm)
 
-        q_norm = self.norm_gist_ca(queries)
-        queries = queries + self.gist_cross_attn(q_norm, gist_kv, gist_kv)
+        if gist_kv is not None:
+            q_norm = self.norm_gist_ca(queries)
+            queries = queries + self.gist_cross_attn(q_norm, gist_kv, gist_kv)
 
         q_norm = self.norm_ref_ca(queries)
+        self.ref_cross_attn.capture_attn = bool(self.capture_vis)
         queries = queries + self.ref_cross_attn(q_norm, ref_kv, ref_kv, kv_mask=ref_kv_mask)
+        if self.capture_vis and self.ref_cross_attn.last_attn is not None:
+            self.last_ref_attn = self.ref_cross_attn.last_attn.detach()
 
         queries = queries + self.ffn(self.norm_ff(queries))
         return queries
@@ -446,6 +542,9 @@ class CDMEncoder(nn.Module):
 
         self.output_proj = nn.Linear(d_q, config.d_model, bias=False)
         self.output_norm = nn.LayerNorm(config.d_model)
+        self.capture_vis = False
+        self.last_vis = {}
+        self.last_detail_slot_mask = None
 
     def forward(
         self,
@@ -465,30 +564,38 @@ class CDMEncoder(nn.Module):
         Returns:
             detail_feats: [B, cdm_num_queries, d_model]
         """
+        self.last_vis = {}
         B = ref_features.shape[0]
         dtype = self.ref_proj.weight.dtype
-        gist_kv = self.gist_norm(self.gist_proj(gist_feats.to(dtype=dtype)))
+        gist_kv = None
+        if not self.config.cdm_disable_gist:
+            gist_kv = self.gist_norm(self.gist_proj(gist_feats.to(dtype=dtype)))
         ref_kv_mask = None
+        group_token_count = None
+        self.last_detail_slot_mask = torch.ones(
+            B,
+            self.config.cdm_num_queries,
+            device=ref_features.device,
+            dtype=torch.bool,
+        )
 
         if ref_features.ndim == 4:
             # part-grounded CDM: [B, G, 256, 3584] → 加 tag 后展平为 [B, G*256, 3584]
             group_tokens = ref_features.to(dtype=dtype)
-            if self.config.cdm_use_tag_meta and part_tag_meta is not None:
-                tag_emb = self.tag_meta_mlp(part_tag_meta.to(dtype=dtype))
-            else:
-                tag_emb = torch.zeros(
-                    group_tokens.shape[0],
-                    group_tokens.shape[1],
-                    group_tokens.shape[-1],
-                    device=group_tokens.device,
-                    dtype=dtype,
-                )
-            if self.config.cdm_use_group_id and part_group_ids is not None:
-                safe_group_ids = part_group_ids.clamp(min=0, max=self.config.pme_max_groups - 1)
-                tag_emb = tag_emb + self.group_id_embedding(safe_group_ids.to(device=group_tokens.device))
-            if part_mask is not None:
-                tag_emb = tag_emb * part_mask.to(device=group_tokens.device, dtype=dtype).unsqueeze(-1)
-
+            group_token_count = int(group_tokens.shape[2])
+            tag_emb = build_cdm_tag_embedding(
+                config=self.config,
+                tag_meta_mlp=self.tag_meta_mlp,
+                group_id_embedding=self.group_id_embedding,
+                part_tag_meta=part_tag_meta,
+                part_group_ids=part_group_ids,
+                part_mask=part_mask,
+                dtype=dtype,
+                device=group_tokens.device,
+                batch_size=group_tokens.shape[0],
+                num_groups=group_tokens.shape[1],
+                out_dim=group_tokens.shape[-1],
+            )
             tagged_tokens = group_tokens + tag_emb.unsqueeze(2)
             flat_tokens = tagged_tokens.view(B, -1, tagged_tokens.shape[-1])
 
@@ -504,11 +611,211 @@ class CDMEncoder(nn.Module):
             ref_kv = self.ref_norm(self.ref_proj(ref_features.to(dtype=dtype)))
 
         queries = self.queries.expand(B, -1, -1)
+        ref_attn_per_layer = []
 
         for layer in self.layers:
+            layer.capture_vis = bool(self.capture_vis)
             queries = layer(queries, gist_kv, ref_kv, ref_kv_mask=ref_kv_mask)
+            if self.capture_vis and layer.last_ref_attn is not None:
+                ref_attn_per_layer.append(layer.last_ref_attn.detach())
 
-        return self.output_norm(self.output_proj(queries))
+        detail_feats = self.output_norm(self.output_proj(queries))
+        if self.capture_vis:
+            self.last_vis = {
+                "detail_source": "part" if ref_features.ndim == 4 else "ref",
+                "detail_layout": "global",
+                "ref_attn_per_layer": ref_attn_per_layer,
+                "group_token_count": group_token_count,
+                "ref_kv_mask": ref_kv_mask.detach().clone() if ref_kv_mask is not None else None,
+                "part_mask": part_mask.detach().clone() if part_mask is not None else None,
+                "part_group_ids": part_group_ids.detach().clone() if part_group_ids is not None else None,
+                "part_tag_meta": part_tag_meta.detach().clone() if part_tag_meta is not None else None,
+                "detail_slot_mask": self.last_detail_slot_mask.detach().clone(),
+                "detail_feats": detail_feats.detach(),
+            }
+        return detail_feats
+
+
+class GroupwiseCDMEncoder(nn.Module):
+    """
+    Group-wise CDM:
+      - 每个 group 的 256 个视觉 tokens 单独经过一套共享权重的 CDM
+      - 每组输出固定 4 个 slots
+      - 4 组 concat 成最终 16 个 detail slots
+      - group_id / tag_meta 在每组 slots 编码完成后再注入（Version B）
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        self.config = config
+        d_q = config.d_qformer
+
+        if config.cdm_group_queries_per_group * config.pme_max_groups != config.cdm_num_queries:
+            raise ValueError(
+                "groupwise CDM requires "
+                f"cdm_group_queries_per_group({config.cdm_group_queries_per_group}) * "
+                f"pme_max_groups({config.pme_max_groups}) == cdm_num_queries({config.cdm_num_queries})"
+            )
+
+        self.queries = nn.Parameter(
+            torch.randn(1, config.cdm_group_queries_per_group, d_q) * 0.02
+        )
+
+        self.ref_proj = nn.Linear(config.d_vision, d_q, bias=False)
+        self.ref_norm = nn.LayerNorm(d_q)
+
+        self.gist_proj = nn.Linear(config.d_model, d_q, bias=False)
+        self.gist_norm = nn.LayerNorm(d_q)
+
+        self.group_id_embedding = nn.Embedding(config.pme_max_groups, config.d_model)
+        self.tag_meta_mlp = nn.Sequential(
+            nn.Linear(config.cdm_tag_meta_dim, d_q),
+            nn.GELU(),
+            nn.Linear(d_q, config.d_model),
+        )
+
+        d_ff = d_q * config.cdm_ff_mult
+        self.layers = nn.ModuleList([
+            CDMQFormerLayer(d_q, config.cdm_num_heads, d_ff)
+            for _ in range(config.cdm_num_layers)
+        ])
+
+        self.output_proj = nn.Linear(d_q, config.d_model, bias=False)
+        self.output_norm = nn.LayerNorm(config.d_model)
+        self.slot_tag_norm = nn.LayerNorm(config.d_model)
+        self.capture_vis = False
+        self.last_vis = {}
+        self.last_detail_slot_mask = None
+
+    def _stitch_group_attn(
+        self,
+        local_attn: torch.Tensor,
+        batch_size: int,
+        num_groups: int,
+        group_token_count: int,
+    ) -> torch.Tensor:
+        _, num_heads, _, _ = local_attn.shape
+        slots_per_group = self.config.cdm_group_queries_per_group
+        local_attn = local_attn.view(batch_size, num_groups, num_heads, slots_per_group, group_token_count)
+        global_attn = torch.zeros(
+            batch_size,
+            num_heads,
+            num_groups * slots_per_group,
+            num_groups * group_token_count,
+            device=local_attn.device,
+            dtype=local_attn.dtype,
+        )
+        for group_idx in range(num_groups):
+            q_start = group_idx * slots_per_group
+            q_end = q_start + slots_per_group
+            k_start = group_idx * group_token_count
+            k_end = k_start + group_token_count
+            global_attn[:, :, q_start:q_end, k_start:k_end] = local_attn[:, group_idx]
+        return global_attn
+
+    def forward(
+        self,
+        ref_features: torch.Tensor,
+        gist_feats: torch.Tensor,
+        part_tag_meta: Optional[torch.Tensor] = None,
+        part_group_ids: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if ref_features.ndim != 4:
+            raise ValueError(
+                f"GroupwiseCDMEncoder expects part features [B, G, T, D], got {tuple(ref_features.shape)}"
+            )
+
+        self.last_vis = {}
+        B, G, T, _ = ref_features.shape
+        dtype = self.ref_proj.weight.dtype
+        device = ref_features.device
+        group_tokens = ref_features.to(dtype=dtype)
+
+        if part_mask is None:
+            part_mask = torch.ones(B, G, device=device, dtype=torch.bool)
+        else:
+            part_mask = part_mask.to(device=device, dtype=torch.bool)
+
+        ref_kv = self.ref_norm(self.ref_proj(group_tokens.reshape(B * G, T, -1)))
+        ref_kv_mask = part_mask.reshape(B * G, 1).expand(-1, T)
+        empty_rows = ~ref_kv_mask.any(dim=1)
+        if empty_rows.any():
+            ref_kv_mask = ref_kv_mask.clone()
+            ref_kv_mask[empty_rows, 0] = True
+
+        gist_kv = None
+        if not self.config.cdm_disable_gist:
+            gist_base = self.gist_norm(self.gist_proj(gist_feats.to(dtype=dtype)))
+            gist_kv = gist_base.unsqueeze(1).expand(-1, G, -1, -1).reshape(B * G, gist_base.shape[1], -1)
+
+        queries = self.queries.expand(B * G, -1, -1)
+        ref_attn_per_layer = []
+        for layer in self.layers:
+            layer.capture_vis = bool(self.capture_vis)
+            queries = layer(queries, gist_kv, ref_kv, ref_kv_mask=ref_kv_mask)
+            if self.capture_vis and layer.last_ref_attn is not None:
+                ref_attn_per_layer.append(
+                    self._stitch_group_attn(
+                        layer.last_ref_attn.detach(),
+                        batch_size=B,
+                        num_groups=G,
+                        group_token_count=T,
+                    )
+                )
+
+        detail_slots = self.output_norm(self.output_proj(queries))
+        detail_slots = detail_slots.view(B, G, self.config.cdm_group_queries_per_group, -1)
+
+        tag_emb = build_cdm_tag_embedding(
+            config=self.config,
+            tag_meta_mlp=self.tag_meta_mlp,
+            group_id_embedding=self.group_id_embedding,
+            part_tag_meta=part_tag_meta,
+            part_group_ids=part_group_ids,
+            part_mask=part_mask,
+            dtype=detail_slots.dtype,
+            device=detail_slots.device,
+            batch_size=B,
+            num_groups=G,
+            out_dim=detail_slots.shape[-1],
+        )
+        detail_slots = self.slot_tag_norm(detail_slots + tag_emb.unsqueeze(2))
+        detail_slots = detail_slots * part_mask.to(dtype=detail_slots.dtype).unsqueeze(-1).unsqueeze(-1)
+
+        detail_feats = detail_slots.reshape(B, -1, detail_slots.shape[-1])
+        if detail_feats.shape[1] < self.config.cdm_num_queries:
+            pad_slots = self.config.cdm_num_queries - detail_feats.shape[1]
+            pad = torch.zeros(B, pad_slots, detail_feats.shape[-1], device=device, dtype=detail_feats.dtype)
+            detail_feats = torch.cat([detail_feats, pad], dim=1)
+        elif detail_feats.shape[1] > self.config.cdm_num_queries:
+            detail_feats = detail_feats[:, :self.config.cdm_num_queries]
+
+        self.last_detail_slot_mask = build_detail_slot_mask(
+            part_mask=part_mask,
+            slots_per_group=self.config.cdm_group_queries_per_group,
+            max_slots=self.config.cdm_num_queries,
+            device=device,
+            batch_size=B,
+        )
+        detail_feats = detail_feats * self.last_detail_slot_mask.to(dtype=detail_feats.dtype).unsqueeze(-1)
+
+        if self.capture_vis:
+            flat_ref_mask = part_mask.unsqueeze(-1).expand(-1, -1, T).reshape(B, -1)
+            self.last_vis = {
+                "detail_source": "part",
+                "detail_layout": "groupwise",
+                "ref_attn_per_layer": ref_attn_per_layer,
+                "group_token_count": T,
+                "ref_kv_mask": flat_ref_mask.detach().clone(),
+                "part_mask": part_mask.detach().clone(),
+                "part_group_ids": part_group_ids.detach().clone() if part_group_ids is not None else None,
+                "part_tag_meta": part_tag_meta.detach().clone() if part_tag_meta is not None else None,
+                "detail_slot_mask": self.last_detail_slot_mask.detach().clone(),
+                "detail_feats": detail_feats.detach(),
+            }
+
+        return detail_feats
 
 
 # ============================================================================
@@ -1203,35 +1510,87 @@ class DetailRouter(nn.Module):
         self.k_proj = nn.Linear(d_model, d_router, bias=False)
         self.scale = d_router ** -0.5
         self.top_k = top_k
+        self.capture_trace = False
+        self.last_trace = {}
 
     def forward(
         self,
         hidden_state: torch.Tensor,
         detail_bank: torch.Tensor,
+        detail_slot_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        self.last_trace = {}
         score = torch.matmul(
             self.q_proj(hidden_state),
             self.k_proj(detail_bank).transpose(-1, -2),
         ) * self.scale  # [B, L, N_detail]
 
         score_fp32 = score.float()
+        valid_slot_mask = None
+        num_slots = detail_bank.shape[1]
+        if detail_slot_mask is not None:
+            valid_slot_mask = detail_slot_mask.to(device=score_fp32.device, dtype=torch.bool)
+            if valid_slot_mask.ndim != 2:
+                raise ValueError(
+                    f"detail_slot_mask must be [B, N_detail], got shape={tuple(valid_slot_mask.shape)}"
+                )
+            if valid_slot_mask.shape[0] != score_fp32.shape[0] or valid_slot_mask.shape[1] != num_slots:
+                raise ValueError(
+                    "detail_slot_mask shape mismatch: "
+                    f"mask={tuple(valid_slot_mask.shape)} vs detail_bank={tuple(detail_bank.shape)}"
+                )
+            valid_slot_mask = valid_slot_mask.clone()
+            empty_rows = ~valid_slot_mask.any(dim=-1)
+            if empty_rows.any():
+                valid_slot_mask[empty_rows, 0] = True
+            score_fp32 = score_fp32.masked_fill(~valid_slot_mask[:, None, :], float("-inf"))
+
         full_prob = torch.softmax(score_fp32, dim=-1)
         entropy = -(full_prob * torch.log(full_prob.clamp_min(1e-8))).sum(dim=-1, keepdim=True)
 
-        num_slots = detail_bank.shape[1]
-        if num_slots > 1:
+        if valid_slot_mask is not None:
+            valid_slot_count = valid_slot_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+            valid_slot_count = valid_slot_count.to(device=entropy.device, dtype=entropy.dtype).view(-1, 1, 1)
+            valid_slot_log = valid_slot_count.clamp_min(2).log()
+            conf = torch.ones_like(entropy)
+            multi_slot_rows = valid_slot_count > 1
+            conf = torch.where(
+                multi_slot_rows,
+                1.0 - entropy / valid_slot_log,
+                conf,
+            )
+        elif num_slots > 1:
             conf = 1.0 - entropy / math.log(num_slots)
         else:
             conf = torch.ones_like(entropy)
         conf = conf.clamp_(0.0, 1.0)
 
-        k = min(self.top_k, num_slots)
+        if valid_slot_mask is not None:
+            min_valid_slots = int(valid_slot_mask.sum(dim=-1).min().item())
+            k = min(self.top_k, max(min_valid_slots, 1))
+        else:
+            k = min(self.top_k, num_slots)
         topk_vals, topk_idx = torch.topk(score_fp32, k=k, dim=-1)
         topk_prob = torch.softmax(topk_vals, dim=-1)
 
         sparse_prob = torch.zeros_like(score_fp32)
         sparse_prob.scatter_(-1, topk_idx, topk_prob)
         routed_detail = torch.matmul(sparse_prob.to(dtype=detail_bank.dtype), detail_bank)
+        if self.capture_trace:
+            with torch.no_grad():
+                self.last_trace = {
+                    "score": score_fp32.detach(),
+                    "full_prob": full_prob.detach(),
+                    "topk_idx": topk_idx.detach(),
+                    "topk_prob": topk_prob.detach(),
+                    "selected_slot": topk_idx[..., 0].detach() if k > 0 else None,
+                    "selected_prob": topk_prob[..., 0].detach() if k > 0 else None,
+                    "sparse_prob": sparse_prob.detach(),
+                    "conf": conf.detach().float(),
+                    "detail_slot_mask": valid_slot_mask.detach().clone() if valid_slot_mask is not None else None,
+                    "num_slots": num_slots,
+                    "top_k": k,
+                }
 
         if num_slots > 1:
             slot_usage = sparse_prob.detach().mean(dim=(0, 1))
@@ -1244,7 +1603,7 @@ class DetailRouter(nn.Module):
         router_stats = {
             "router_conf_mean": conf.detach().float().mean(),
             "router_entropy_mean": entropy.detach().float().mean(),
-            "router_top1_prob_mean": topk_prob[..., 0].detach().float().mean(),
+            "router_top1_prob_mean": full_prob.max(dim=-1).values.detach().float().mean(),
             "router_active_ratio": (conf.detach().float() > 0.5).float().mean(),
             "router_slot_usage_entropy": slot_usage_entropy.detach().float(),
         }
@@ -1279,13 +1638,19 @@ class EDRInjectionModule(nn.Module):
         self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
         self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
         self.last_stats = {}
+        self.capture_vis = False
+        self.last_trace = {}
 
     def forward(
         self,
         hidden_state: torch.Tensor,
         gist_feats: torch.Tensor,
         detail_feats: torch.Tensor,
+        detail_slot_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        self.last_trace = {}
+        self.detail_router.capture_trace = bool(self.capture_vis)
+        self.detail_router.last_trace = {}
         query = self.hidden_norm(hidden_state)
 
         if self.enable_gist:
@@ -1302,7 +1667,11 @@ class EDRInjectionModule(nn.Module):
             inject_gist = torch.zeros_like(hidden_state)
 
         if self.enable_detail:
-            routed_detail, conf, router_stats = self.detail_router(query, detail_feats)
+            routed_detail, conf, router_stats = self.detail_router(
+                query,
+                detail_feats,
+                detail_slot_mask=detail_slot_mask,
+            )
             effective_conf = torch.ones_like(conf) if self.disable_conf else conf
             delta_detail = routed_detail
             gate_detail = torch.tanh(self.alpha_detail)
@@ -1351,6 +1720,18 @@ class EDRInjectionModule(nn.Module):
                 "router_effective_conf_mean": effective_conf.detach().float().mean(),
                 **router_stats,
             }
+            if self.capture_vis:
+                router_trace = dict(self.detail_router.last_trace)
+                self.last_trace = {
+                    "enable_gist": self.enable_gist,
+                    "enable_detail": self.enable_detail,
+                    "effective_conf": effective_conf.detach().float(),
+                    "router_stats": {
+                        key: value.detach().float() if torch.is_tensor(value) else value
+                        for key, value in router_stats.items()
+                    },
+                    **router_trace,
+                }
 
         return hidden_state + injection
 

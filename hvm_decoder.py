@@ -30,6 +30,7 @@ from hvm_modules import (
     SinglePathHierarchicalInjectionModule,
     DRAInjectionModule,
     CDMEncoder,
+    GroupwiseCDMEncoder,
     CDMInjectionModule,
     EDRInjectionModule,
     count_parameters,
@@ -123,14 +124,14 @@ class HVMSketchDecoder(nn.Module):
             ])
         elif hvm_config.memory_mode == "gme_cdm":
             self.pme = None
-            self.cdm = CDMEncoder(hvm_config)
+            self.cdm = GroupwiseCDMEncoder(hvm_config) if hvm_config.cdm_layout == "groupwise" else CDMEncoder(hvm_config)
             self.pims = nn.ModuleList([
                 CDMInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         elif hvm_config.memory_mode == "gme_cdm_edr":
             self.pme = None
-            self.cdm = CDMEncoder(hvm_config)
+            self.cdm = GroupwiseCDMEncoder(hvm_config) if hvm_config.cdm_layout == "groupwise" else CDMEncoder(hvm_config)
             detail_layers = set(hvm_config.edr_detail_layer_indices)
             self.pims = nn.ModuleList([
                 EDRInjectionModule(
@@ -170,6 +171,7 @@ class HVMSketchDecoder(nn.Module):
         self._text_mask = None
         self._ref_feats = None
         self._detail_feats = None
+        self._detail_slot_mask = None
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
@@ -271,11 +273,22 @@ class HVMSketchDecoder(nn.Module):
                 )
             elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
                 detail_feats = self._detail_feats.expand(B, -1, -1)
-                hidden_states = self.pims[pim_idx](
-                    hidden_states,
-                    gist_feats,
-                    detail_feats,
-                )
+                if self.hvm_config.memory_mode == "gme_cdm_edr":
+                    detail_slot_mask = None
+                    if self._detail_slot_mask is not None:
+                        detail_slot_mask = self._detail_slot_mask.expand(B, -1)
+                    hidden_states = self.pims[pim_idx](
+                        hidden_states,
+                        gist_feats,
+                        detail_feats,
+                        detail_slot_mask,
+                    )
+                else:
+                    hidden_states = self.pims[pim_idx](
+                        hidden_states,
+                        gist_feats,
+                        detail_feats,
+                    )
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
                 part_feats = self._part_feats.expand(B, -1, -1)
                 part_mask = self._part_mask.expand(B, -1)
@@ -394,6 +407,7 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
+                self._detail_slot_mask = None
             elif self.hvm_config.memory_mode == "gme_dra":
                 # DRA: 将 [B, 3, 256, 3584] reshape 为 [B, 768, 3584] 作为原始 ref tokens
                 B_ref = ref_features.shape[0]
@@ -402,6 +416,7 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
+                self._detail_slot_mask = None
             elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
                 # CDM / EDR: 兼容旧版 raw-ref tokens 与新版 part-grounded tagged tokens
                 if self.hvm_config.cdm_detail_source == "part" and part_features is not None:
@@ -416,6 +431,7 @@ class HVMSketchDecoder(nn.Module):
                     B_ref = ref_features.shape[0]
                     flat_ref = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
                     self._detail_feats = self.cdm(flat_ref, self._gist_feats.detach())
+                self._detail_slot_mask = getattr(self.cdm, "last_detail_slot_mask", None)
                 self._ref_feats = None
                 self._part_feats = None
                 self._part_mask = None
@@ -431,6 +447,7 @@ class HVMSketchDecoder(nn.Module):
                 )  # [B, 16, d_model], [B, 16]
                 self._text_feats = None
                 self._text_mask = None
+                self._detail_slot_mask = None
             else:
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
@@ -444,6 +461,7 @@ class HVMSketchDecoder(nn.Module):
                     ref_text_ids.to(device),
                     self._text_mask,
                 )  # [B, N_t, d_model]
+                self._detail_slot_mask = None
         else:
             # 没有 HVM 输入，退化为普通 OmniSVG
             self._gist_feats = None
@@ -453,6 +471,7 @@ class HVMSketchDecoder(nn.Module):
             self._text_feats = None
             self._part_mask = None
             self._text_mask = None
+            self._detail_slot_mask = None
 
         # ================================================================
         # 2. 运行 base model forward (hooks 自动注入 PIM)
@@ -560,7 +579,9 @@ class HVMSketchDecoder(nn.Module):
         print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
         print(f"  Memory mode: {self.hvm_config.memory_mode}")
         if self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+            print(f"  CDM layout: {self.hvm_config.cdm_layout}")
             print(f"  CDM detail source: {self.hvm_config.cdm_detail_source}")
+            print(f"  CDM disable gist: {self.hvm_config.cdm_disable_gist}")
             print(f"  CDM use tag meta: {self.hvm_config.cdm_use_tag_meta}")
             print(f"  CDM use group id: {self.hvm_config.cdm_use_group_id}")
         if self.hvm_config.memory_mode == "gme_cdm_edr":
