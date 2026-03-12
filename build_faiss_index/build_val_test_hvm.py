@@ -6,12 +6,12 @@
 然后提取 val/test 样本自身及其 ref 的 features / groups / group_features。
 
 输出目录结构（以 val 为例）:
-  hvm_val/
+  hvm_val_nozoom_top3part/
     metadata.jsonl          # val 样本的 metadata（idx 从 0 开始）
     rag_results_train.jsonl # val 样本的 RAG 检索结果（ref_indices 指向全库 idx）
-    groups_train_ref.jsonl  # Top-1 ref 的 SVG 分组信息
+    groups_train_ref.jsonl  # Top-3 refs 的 SVG 分组信息
     features/               # val 样本 + ref 的整图 features
-    group_features/         # Top-1 ref 的 group features
+    group_features/         # Top-3 refs 的 group features
 
 用法:
     # 1. RAG 检索 + metadata（CPU，快速）
@@ -60,7 +60,8 @@ from tqdm import tqdm
 
 BASE_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration"
 CORPUS_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w")       # 全库元数据 (metadata, faiss_index, text_embeddings)
-TRAIN_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w_nozoom") # train 处理结果 (features, groups, group_features)
+TRAIN_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w_nozoom") # train nozoom 源结果
+TRAIN_TOP3PART_HVM_DIR = os.path.join(BASE_DIR, "hvm_precomputed_1w_nozoom_top3part")
 CORPUS_DATA_DIR = os.path.join(BASE_DIR, "data_retrieval_corpus")
 MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
@@ -68,11 +69,13 @@ CLIP_MODEL_PATH = "/mnt/data/wuqingman/models/openai/clip-vit-large-patch14"
 SPLIT_CONFIG = {
     "val": {
         "parquet_dir": os.path.join(BASE_DIR, "data_val"),
-        "hvm_dir": os.path.join(BASE_DIR, "hvm_val_nozoom"),
+        "hvm_dir": os.path.join(BASE_DIR, "hvm_val_nozoom_top3part"),
+        "source_hvm_dir": os.path.join(BASE_DIR, "hvm_val_nozoom"),
     },
     "test": {
         "parquet_dir": os.path.join(BASE_DIR, "data_test_holdout"),
-        "hvm_dir": os.path.join(BASE_DIR, "hvm_test_nozoom"),
+        "hvm_dir": os.path.join(BASE_DIR, "hvm_test_nozoom_top3part"),
+        "source_hvm_dir": os.path.join(BASE_DIR, "hvm_test_nozoom"),
     },
 }
 
@@ -260,6 +263,41 @@ def load_full_metadata():
     return meta
 
 
+def link_or_copy_file(src_path, dst_path):
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if os.path.exists(dst_path):
+        return
+    try:
+        os.link(src_path, dst_path)
+    except OSError:
+        import shutil
+        shutil.copy2(src_path, dst_path)
+
+
+def load_jsonl_index(paths):
+    indexed = {}
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                indexed.setdefault(rec["idx"], rec)
+    return indexed
+
+
+def collect_ref_indices(rag_path):
+    ref_indices = set()
+    with open(rag_path) as f:
+        for line in f:
+            r = json.loads(line)
+            for ref_idx in r["ref_indices"]:
+                ref_indices.add(ref_idx)
+    return sorted(ref_indices)
+
+
 def load_parquets_for_meta(meta_map, data_dir):
     """根据 metadata 加载需要的 parquet 文件。"""
     import pyarrow.parquet as pq
@@ -395,6 +433,7 @@ def run_rag(split_name: str, hvm_out_dir: str, parquet_dir: str):
 # ============================================================================
 
 def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
+                 source_hvm_dir: str,
                  shard_id: int, num_shards: int, batch_size: int):
     """
     提取 val/test 样本自身 + 其 ref 的整图 features [256, 3584]。
@@ -407,6 +446,8 @@ def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
     features_dir = os.path.join(hvm_out_dir, "features")
     os.makedirs(features_dir, exist_ok=True)
     train_features_dir = os.path.join(TRAIN_HVM_DIR, "features")
+    train_top3part_features_dir = os.path.join(TRAIN_TOP3PART_HVM_DIR, "features")
+    source_features_dir = os.path.join(source_hvm_dir, "features")
 
     # 加载 RAG 结果，收集所有需要 features 的 idx
     rag_path = os.path.join(hvm_out_dir, "rag_results_train.jsonl")
@@ -434,14 +475,15 @@ def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
         if os.path.exists(out_path):
             continue
 
-        # 尝试从训练集 features 复制
-        train_path = os.path.join(train_features_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt")
-        if os.path.exists(train_path):
-            os.makedirs(out_subdir, exist_ok=True)
-            import shutil
-            shutil.copy2(train_path, out_path)
-            refs_copied += 1
-        else:
+        copied = False
+        for base_dir in (train_top3part_features_dir, train_features_dir, source_features_dir):
+            train_path = os.path.join(base_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt")
+            if os.path.exists(train_path):
+                link_or_copy_file(train_path, out_path)
+                refs_copied += 1
+                copied = True
+                break
+        if not copied:
             refs_to_compute.append(ref_idx)
 
     print(f"  Ref features copied from train: {refs_copied}")
@@ -455,13 +497,21 @@ def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
             val_records.append(json.loads(line))
 
     val_to_compute = []
+    val_copied = 0
     for rec in val_records:
         idx = rec["idx"]
         out_subdir = os.path.join(features_dir, f"val_{idx // 1000:03d}")
         out_path = os.path.join(out_subdir, f"val_{idx:06d}.pt")
-        if not os.path.exists(out_path):
+        if os.path.exists(out_path):
+            continue
+        source_path = os.path.join(source_features_dir, f"val_{idx // 1000:03d}", f"val_{idx:06d}.pt")
+        if os.path.exists(source_path):
+            link_or_copy_file(source_path, out_path)
+            val_copied += 1
+        else:
             val_to_compute.append(rec)
 
+    print(f"  Val/test self features copied: {val_copied}")
     print(f"  Val/test self features to compute: {len(val_to_compute)}")
 
     # 合并所有需要计算的任务
@@ -575,34 +625,27 @@ def run_features(split_name: str, hvm_out_dir: str, parquet_dir: str,
 # Stage: Groups
 # ============================================================================
 
-def run_groups(split_name: str, hvm_out_dir: str):
-    """为 Top-1 ref 生成 SVG 分组信息。优先从训练集复制。"""
+def run_groups(split_name: str, hvm_out_dir: str, source_hvm_dir: str):
+    """为 Top-3 refs 生成 SVG 分组信息。优先从已有 nozoom / top3part 结果复制。"""
     print("=" * 60)
     print(f"Stage: Groups for {split_name}")
     print("=" * 60)
 
     # 加载 RAG 结果
     rag_path = os.path.join(hvm_out_dir, "rag_results_train.jsonl")
-    top1_refs = set()
-    with open(rag_path) as f:
-        for line in f:
-            r = json.loads(line)
-            top1_refs.add(r["ref_indices"][0])
+    ref_indices = collect_ref_indices(rag_path)
+    print(f"  Unique Top-3 refs: {len(ref_indices)}")
 
-    print(f"  Unique Top-1 refs: {len(top1_refs)}")
-
-    # 尝试从训练集 groups 复制
-    train_groups_path = os.path.join(TRAIN_HVM_DIR, "groups_train_ref.jsonl")
-    train_groups = {}
-    if os.path.exists(train_groups_path):
-        with open(train_groups_path) as f:
-            for line in f:
-                g = json.loads(line)
-                train_groups[g["idx"]] = g
+    source_group_paths = [
+        os.path.join(TRAIN_TOP3PART_HVM_DIR, "groups_train_ref.jsonl"),
+        os.path.join(source_hvm_dir, "groups_train_ref.jsonl"),
+        os.path.join(TRAIN_HVM_DIR, "groups_train_ref.jsonl"),
+    ]
+    train_groups = load_jsonl_index(source_group_paths)
 
     copied = 0
     to_compute = []
-    for ref_idx in sorted(top1_refs):
+    for ref_idx in ref_indices:
         if ref_idx in train_groups:
             copied += 1
         else:
@@ -654,7 +697,7 @@ def run_groups(split_name: str, hvm_out_dir: str):
                 }
 
     with open(groups_path, "w") as f:
-        for ref_idx in sorted(top1_refs):
+        for ref_idx in ref_indices:
             if ref_idx in train_groups:
                 f.write(json.dumps(train_groups[ref_idx]) + "\n")
 
@@ -666,8 +709,9 @@ def run_groups(split_name: str, hvm_out_dir: str):
 # ============================================================================
 
 def run_group_features(split_name: str, hvm_out_dir: str,
+                       source_hvm_dir: str,
                        shard_id: int, num_shards: int, batch_size: int):
-    """为 Top-1 ref 提取 group-level features。优先从训练集复制。"""
+    """为 Top-3 refs 提取 group-level features。优先从已有 nozoom / top3part 结果复制。"""
     print("=" * 60)
     print(f"Stage: Group Features for {split_name} (shard {shard_id}/{num_shards})")
     print("=" * 60)
@@ -675,33 +719,31 @@ def run_group_features(split_name: str, hvm_out_dir: str,
     gf_dir = os.path.join(hvm_out_dir, "group_features")
     os.makedirs(gf_dir, exist_ok=True)
     train_gf_dir = os.path.join(TRAIN_HVM_DIR, "group_features")
+    train_top3part_gf_dir = os.path.join(TRAIN_TOP3PART_HVM_DIR, "group_features")
+    source_gf_dir = os.path.join(source_hvm_dir, "group_features")
 
     # 加载 RAG 结果
     rag_path = os.path.join(hvm_out_dir, "rag_results_train.jsonl")
-    top1_refs = set()
-    with open(rag_path) as f:
-        for line in f:
-            r = json.loads(line)
-            top1_refs.add(r["ref_indices"][0])
-
-    top1_refs = sorted(top1_refs)
-    print(f"  Unique Top-1 refs: {len(top1_refs)}")
+    ref_indices = collect_ref_indices(rag_path)
+    print(f"  Unique Top-3 refs: {len(ref_indices)}")
 
     # 先复制已有的
     to_compute = []
     copied = 0
-    for ref_idx in top1_refs:
+    for ref_idx in ref_indices:
         out_subdir = os.path.join(gf_dir, f"{ref_idx // 1000:03d}")
         out_path = os.path.join(out_subdir, f"{ref_idx:06d}.pt")
         if os.path.exists(out_path):
             continue
-        train_path = os.path.join(train_gf_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt")
-        if os.path.exists(train_path):
-            os.makedirs(out_subdir, exist_ok=True)
-            import shutil
-            shutil.copy2(train_path, out_path)
-            copied += 1
-        else:
+        copied_one = False
+        for base_dir in (train_top3part_gf_dir, source_gf_dir, train_gf_dir):
+            train_path = os.path.join(base_dir, f"{ref_idx // 1000:03d}", f"{ref_idx:06d}.pt")
+            if os.path.exists(train_path):
+                link_or_copy_file(train_path, out_path)
+                copied += 1
+                copied_one = True
+                break
+        if not copied_one:
             to_compute.append(ref_idx)
 
     print(f"  Copied from train: {copied}")
@@ -817,25 +859,27 @@ def main():
     cfg = SPLIT_CONFIG[args.split]
     hvm_dir = cfg["hvm_dir"]
     parquet_dir = cfg["parquet_dir"]
+    source_hvm_dir = cfg["source_hvm_dir"]
 
     print(f"Building HVM data for: {args.split}")
     print(f"  Parquet dir: {parquet_dir}")
     print(f"  HVM output:  {hvm_dir}")
+    print(f"  HVM source:  {source_hvm_dir}")
     print()
 
     if args.stage == "all":
         run_rag(args.split, hvm_dir, parquet_dir)
-        run_features(args.split, hvm_dir, parquet_dir, 0, 1, args.batch_size)
-        run_groups(args.split, hvm_dir)
-        run_group_features(args.split, hvm_dir, 0, 1, args.batch_size)
+        run_features(args.split, hvm_dir, parquet_dir, source_hvm_dir, 0, 1, args.batch_size)
+        run_groups(args.split, hvm_dir, source_hvm_dir)
+        run_group_features(args.split, hvm_dir, source_hvm_dir, 0, 1, args.batch_size)
     elif args.stage == "rag":
         run_rag(args.split, hvm_dir, parquet_dir)
     elif args.stage == "features":
-        run_features(args.split, hvm_dir, parquet_dir, args.shard_id, args.num_shards, args.batch_size)
+        run_features(args.split, hvm_dir, parquet_dir, source_hvm_dir, args.shard_id, args.num_shards, args.batch_size)
     elif args.stage == "groups":
-        run_groups(args.split, hvm_dir)
+        run_groups(args.split, hvm_dir, source_hvm_dir)
     elif args.stage == "group_features":
-        run_group_features(args.split, hvm_dir, args.shard_id, args.num_shards, args.batch_size)
+        run_group_features(args.split, hvm_dir, source_hvm_dir, args.shard_id, args.num_shards, args.batch_size)
 
 
 if __name__ == "__main__":

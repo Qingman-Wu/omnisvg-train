@@ -3,14 +3,19 @@
 训练 1w 样本时，每个样本需要查看它的 Top-3 参考图。这些参考图大部分来自 250k 全库（不在原来的 1w 里），所以需要提前把这些参考图的视觉特征算好存到磁盘，训练时直接读取。
 需要算的东西有两种：
 Global features（整图特征）→ 给 GME 用，3 个 ref 都需要
-Group features（分组特征）→ 给 PME 用，只有 Top-1 ref 需要
+Group features（分组特征）→ 给 groupwise CDM / EDR 用，Top-3 ref 都需要
 
 只处理 rag_results_train.jsonl 中出现的 ref idx，而非 25 万全量。
 数据来源：
   - 训练集 parquet: data_test (idx 0-9999)
   - 全库 parquet:   data_retrieval_corpus (idx 10000+)
 
-输出目录: hvm_precomputed_full/ 下的 features/, groups.jsonl, group_features/
+输出目录: hvm_precomputed_1w_nozoom_top3part/ 下的
+  - metadata.jsonl
+  - rag_results_train.jsonl
+  - features/
+  - groups_train_ref.jsonl
+  - group_features/
 
 阶段：
     --stage groups          CPU，单进程，解析 SVG 生成 groups.jsonl
@@ -63,8 +68,10 @@ from tqdm import tqdm
 # ============================================================================
 
 INPUT_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w"
-OUTPUT_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom"
+SOURCE_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom"
+OUTPUT_HVM_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 FULL_DATA_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
+TRAIN_DATA_DIR = "/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
 MODEL_PATH = "/mnt/data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 
 VIEWBOX_SIZE = 200
@@ -81,11 +88,10 @@ def load_train_ref_indices():
 
     返回:
         all_feature_indices: 需要提取 features 的全部 idx（ref + 训练样本自身）
-        top1_refs: Top-1 ref idx（用于 groups / group_features）
+        topk_refs: Top-3 中所有 ref idx（用于 groups / group_features）
     """
     rag_path = os.path.join(INPUT_HVM_DIR, "rag_results_train.jsonl")
     all_refs = set()
-    top1_refs = set()
     train_indices = set()
     with open(rag_path) as f:
         for line in f:
@@ -94,9 +100,8 @@ def load_train_ref_indices():
             refs = r["ref_indices"]
             for ref in refs:
                 all_refs.add(ref)
-            top1_refs.add(refs[0])
     all_feature_indices = sorted(all_refs | train_indices)
-    return all_feature_indices, sorted(top1_refs)
+    return all_feature_indices, sorted(all_refs)
 
 
 def load_metadata_for_indices(indices_set):
@@ -121,8 +126,43 @@ def load_parquets_for_meta(meta_map):
         if os.path.exists(full_path):
             tables[pf] = pq.read_table(full_path)
         else:
-            print(f"  WARNING: {full_path} not found, skipping")
+            alt_path = os.path.join(TRAIN_DATA_DIR, pf)
+            if os.path.exists(alt_path):
+                tables[pf] = pq.read_table(alt_path)
+            else:
+                print(f"  WARNING: {full_path} / {alt_path} not found, skipping")
     return tables
+
+
+def ensure_output_scaffold():
+    os.makedirs(OUTPUT_HVM_DIR, exist_ok=True)
+    for filename in ("metadata.jsonl", "rag_results_train.jsonl"):
+        dst_path = os.path.join(OUTPUT_HVM_DIR, filename)
+        if os.path.exists(dst_path):
+            continue
+        src_candidates = [
+            os.path.join(SOURCE_HVM_DIR, filename),
+            os.path.join(INPUT_HVM_DIR, filename),
+        ]
+        for src_path in src_candidates:
+            if os.path.exists(src_path):
+                import shutil
+                shutil.copy2(src_path, dst_path)
+                print(f"  Copied scaffold: {src_path} -> {dst_path}")
+                break
+        else:
+            raise FileNotFoundError(f"Missing scaffold file: {filename}")
+
+
+def link_or_copy_file(src_path, dst_path):
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if os.path.exists(dst_path):
+        return
+    try:
+        os.link(src_path, dst_path)
+    except OSError:
+        import shutil
+        shutil.copy2(src_path, dst_path)
 
 
 # ============================================================================
@@ -292,13 +332,13 @@ def render_group_to_image(svg_string, group_path_indices, image_size=IMAGE_SIZE)
 # Stage: groups (CPU only, single process)
 # ============================================================================
 
-def run_groups(all_ref_indices, top1_ref_indices):
-    """只为 Top-1 ref 生成 groups（PME 只用 Top-1）。"""
+def run_groups(all_ref_indices, topk_ref_indices):
+    """为 Top-3 中所有 ref 生成 groups，并尽量复用旧 nozoom 结果。"""
     print("=" * 60)
-    print(f"Stage: Groups — 为 {len(top1_ref_indices)} 个 Top-1 ref 解析 SVG 分组")
+    print(f"Stage: Groups — 为 {len(topk_ref_indices)} 个 Top-3 refs 解析 SVG 分组")
     print("=" * 60)
 
-    idx_set = set(top1_ref_indices)
+    idx_set = set(topk_ref_indices)
     meta = load_metadata_for_indices(idx_set)
     print(f"  Loaded metadata for {len(meta)} indices")
 
@@ -307,9 +347,20 @@ def run_groups(all_ref_indices, top1_ref_indices):
 
     groups_path = os.path.join(OUTPUT_HVM_DIR, "groups_train_ref.jsonl")
     stats = {"1_group": 0, "2_groups": 0, "3_groups": 0, "4_groups": 0, "errors": 0}
+    source_groups = {}
+    source_groups_path = os.path.join(SOURCE_HVM_DIR, "groups_train_ref.jsonl")
+    if os.path.exists(source_groups_path):
+        with open(source_groups_path) as f:
+            for line in f:
+                rec = json.loads(line)
+                source_groups[rec["idx"]] = rec
+    print(f"  Existing groups from source nozoom: {len(source_groups)}")
 
     with open(groups_path, "w") as fout:
-        for idx in tqdm(top1_ref_indices, desc="Parsing SVGs"):
+        for idx in tqdm(topk_ref_indices, desc="Parsing SVGs"):
+            if idx in source_groups:
+                fout.write(json.dumps(source_groups[idx]) + "\n")
+                continue
             if idx not in meta:
                 continue
             m = meta[idx]
@@ -361,14 +412,23 @@ def run_features(all_ref_indices, shard_id, num_shards, batch_size):
 
     features_dir = os.path.join(OUTPUT_HVM_DIR, "features")
     os.makedirs(features_dir, exist_ok=True)
+    source_features_dir = os.path.join(SOURCE_HVM_DIR, "features")
 
     # Skip already done
     todo = []
+    copied = 0
     for idx in my_indices:
         subdir = os.path.join(features_dir, f"{idx // 1000:03d}")
-        if not os.path.exists(os.path.join(subdir, f"{idx:06d}.pt")):
+        out_path = os.path.join(subdir, f"{idx:06d}.pt")
+        if os.path.exists(out_path):
+            continue
+        src_path = os.path.join(source_features_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt")
+        if os.path.exists(src_path):
+            link_or_copy_file(src_path, out_path)
+            copied += 1
+        else:
             todo.append(idx)
-    print(f"  Already done: {len(my_indices) - len(todo)}, todo: {len(todo)}")
+    print(f"  Already done/copied: {len(my_indices) - len(todo)} (copied={copied}), todo: {len(todo)}")
     if not todo:
         print("  Nothing to do!")
         return
@@ -439,27 +499,36 @@ def run_features(all_ref_indices, shard_id, num_shards, batch_size):
 # Stage: group_features (GPU, multi-shard)
 # ============================================================================
 
-def run_group_features(top1_ref_indices, shard_id, num_shards, batch_size):
-    """为 Top-1 ref 提取 group-level features (for PME)。"""
-    shard_size = math.ceil(len(top1_ref_indices) / num_shards)
+def run_group_features(topk_ref_indices, shard_id, num_shards, batch_size):
+    """为 Top-3 refs 提取 group-level features，并尽量复用旧 nozoom 结果。"""
+    shard_size = math.ceil(len(topk_ref_indices) / num_shards)
     start = shard_id * shard_size
-    end = min(start + shard_size, len(top1_ref_indices))
-    my_indices = top1_ref_indices[start:end]
+    end = min(start + shard_size, len(topk_ref_indices))
+    my_indices = topk_ref_indices[start:end]
 
     print("=" * 60)
-    print(f"Stage: Group Features — shard {shard_id}/{num_shards}, {len(my_indices)} indices")
+    print(f"Stage: Group Features — shard {shard_id}/{num_shards}, {len(my_indices)} top3 refs")
     print("=" * 60)
 
     gf_dir = os.path.join(OUTPUT_HVM_DIR, "group_features")
     os.makedirs(gf_dir, exist_ok=True)
+    source_gf_dir = os.path.join(SOURCE_HVM_DIR, "group_features")
 
     # Skip done
     todo = []
+    copied = 0
     for idx in my_indices:
         subdir = os.path.join(gf_dir, f"{idx // 1000:03d}")
-        if not os.path.exists(os.path.join(subdir, f"{idx:06d}.pt")):
+        out_path = os.path.join(subdir, f"{idx:06d}.pt")
+        if os.path.exists(out_path):
+            continue
+        src_path = os.path.join(source_gf_dir, f"{idx // 1000:03d}", f"{idx:06d}.pt")
+        if os.path.exists(src_path):
+            link_or_copy_file(src_path, out_path)
+            copied += 1
+        else:
             todo.append(idx)
-    print(f"  Already done: {len(my_indices) - len(todo)}, todo: {len(todo)}")
+    print(f"  Already done/copied: {len(my_indices) - len(todo)} (copied={copied}), todo: {len(todo)}")
     if not todo:
         print("  Nothing to do!")
         return
@@ -564,22 +633,23 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     args = parser.parse_args()
 
+    ensure_output_scaffold()
     print("Loading train ref indices...")
-    all_feature_indices, top1_refs = load_train_ref_indices()
+    all_feature_indices, topk_refs = load_train_ref_indices()
     print(f"  All feature indices (refs + train): {len(all_feature_indices)}")
-    print(f"  Top-1 refs:                         {len(top1_refs)}")
+    print(f"  Top-3 unique refs (for part bank):  {len(topk_refs)}")
     print()
 
     if args.stage == "all":
-        run_groups(all_feature_indices, top1_refs)
+        run_groups(all_feature_indices, topk_refs)
         run_features(all_feature_indices, args.shard_id, args.num_shards, args.batch_size)
-        run_group_features(top1_refs, args.shard_id, args.num_shards, args.batch_size)
+        run_group_features(topk_refs, args.shard_id, args.num_shards, args.batch_size)
     elif args.stage == "groups":
-        run_groups(all_feature_indices, top1_refs)
+        run_groups(all_feature_indices, topk_refs)
     elif args.stage == "features":
         run_features(all_feature_indices, args.shard_id, args.num_shards, args.batch_size)
     elif args.stage == "group_features":
-        run_group_features(top1_refs, args.shard_id, args.num_shards, args.batch_size)
+        run_group_features(topk_refs, args.shard_id, args.num_shards, args.batch_size)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / Group-wise CDM no-gist + part-tag + EDR top1)
+# HVM-SVG 训练启动脚本 (A100_1_2 / Top3 part + 24-slot + EDR top1)
 # =============================================================================
 #
 # 使用方法:
@@ -8,12 +8,11 @@
 #   CUDA_VISIBLE_DEVICES=3,4,5 bash run_train_hvm_a100_1_2.sh --num_gpus 3
 #
 # 默认实验:
-#   GME + group-wise CDM(part-tag, Version B) + EDR(E1 top1) + last4 + adaptive
-#   与 1_1 的唯一区别:
-#       - CDM 内部关闭 gist cross-attention
-#   注意:
-#       - group_id / tag_meta 仍然保留
-#       - EDR 自己的 gist 注入路径仍然保留
+#   Top3 refs × 4 groups/ref = 12 groups
+#   group-wise CDM(part-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
+#   每个 group 经过共享 CDM 后输出 2 个 slots:
+#       12 groups × 2 slots/group = 24 detail slots
+#   两个 slots 共享同一个 global group_id，但 local_slot 不同
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -30,8 +29,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=3
 
 # -- 数据 --
-DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
-HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom"
+DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
+HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -43,10 +42,12 @@ D_PIM_INNER=512
 PIM_LAYER_INTERVAL=4
 GATE_ALPHA_INIT=0.05
 GME_NUM_QUERIES=32
-CDM_NUM_QUERIES=16
+PART_NUM_REFS=3
+PME_MAX_GROUPS=12
+CDM_NUM_QUERIES=24
 CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
-CDM_GROUP_QUERIES_PER_GROUP=4
+CDM_GROUP_QUERIES_PER_GROUP=2
 CDM_DETAIL_SOURCE="part"
 CDM_DISABLE_GIST=true
 CDM_DISABLE_TAG_META=false
@@ -76,11 +77,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s6_groupwise_cdm_nogist_edr_parttag_nozoom_topk1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s6_groupwise_cdm_nogist_edr_parttag_nozoom_topk1_last4"
+SWANLAB_RUN_NAME="s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -88,7 +89,7 @@ HVM_CHECKPOINT=""
 
 # -- 验证集 --
 VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
-VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom"
+VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
 EVAL_EVERY=500
 
 # -- Ablation --
@@ -109,6 +110,8 @@ while [[ $# -gt 0 ]]; do
         --hvm_ckpt)       HVM_CHECKPOINT="$2";       shift 2 ;;
         --gate_alpha_init) GATE_ALPHA_INIT="$2";     shift 2 ;;
         --gme_num_queries) GME_NUM_QUERIES="$2";     shift 2 ;;
+        --part_num_refs)  PART_NUM_REFS="$2";        shift 2 ;;
+        --pme_max_groups) PME_MAX_GROUPS="$2";       shift 2 ;;
         --cdm_num_queries) CDM_NUM_QUERIES="$2";     shift 2 ;;
         --cdm_num_layers) CDM_NUM_LAYERS="$2";       shift 2 ;;
         --cdm_layout)     CDM_LAYOUT="$2";           shift 2 ;;
@@ -185,6 +188,8 @@ echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
 echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
 echo "  GME num queries:   ${GME_NUM_QUERIES}"
+echo "  Part refs used:    ${PART_NUM_REFS}"
+echo "  PME max groups:    ${PME_MAX_GROUPS}"
 echo "  Memory mode:       ${MEMORY_MODE}"
 echo "  Inject mode:       ${INJECT_MODE}"
 echo "  Inject scale:      ${INJECT_SCALE}"
@@ -253,6 +258,8 @@ TRAIN_ARGS=(
     --inject_scale "$INJECT_SCALE"
     --gate_alpha_init "$GATE_ALPHA_INIT"
     --gme_num_queries "$GME_NUM_QUERIES"
+    --part_num_refs "$PART_NUM_REFS"
+    --pme_max_groups "$PME_MAX_GROUPS"
     --cdm_num_queries "$CDM_NUM_QUERIES"
     --cdm_num_layers "$CDM_NUM_LAYERS"
     --cdm_layout "$CDM_LAYOUT"

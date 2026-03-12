@@ -46,7 +46,7 @@ class HVMConfig:
     pme_num_heads: int = 8
     pme_ff_mult: int = 4
     pme_max_groups: int = 4
-    pme_max_tokens: int = 16     # 4 groups × 4 queries
+    pme_max_tokens: int = 16     # 至少 pme_max_groups × pme_queries_per_group
 
     # === CDM (Complementary Detail Memory) ===
     cdm_num_queries: int = 16
@@ -86,6 +86,11 @@ class HVMConfig:
     # === RAG ===
     num_references: int = 3
     ref_text_max_length: int = 128
+
+    def __post_init__(self) -> None:
+        min_pme_tokens = self.pme_queries_per_group * self.pme_max_groups
+        if self.pme_max_tokens < min_pme_tokens:
+            self.pme_max_tokens = min_pme_tokens
 
     @property
     def pim_layer_indices(self) -> List[int]:

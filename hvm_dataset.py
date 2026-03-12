@@ -7,9 +7,9 @@ HVM-SVG Dataset
   - text: 描述文本
   - pix_seq: SVG token 序列
   - ref_features: 3 张参考图的 post-merge features [256, 3584] (for GME)
-  - ref_best_group_features: Top-1 参考图的逐 group 独立渲染特征 list of [256, 3584] (for PME)
-  - ref_best_group_tag_meta: Top-1 参考图各 group 的结构 tag [G, 6]
-  - ref_best_group_ids: Top-1 参考图各 group 的 group_id [G]
+  - ref_best_group_features: 选中 part refs 的逐 group 独立渲染特征 list of [256, 3584]
+  - ref_best_group_tag_meta: 选中 part refs 的结构 tag [G, 6]
+  - ref_best_group_ids: 选中 part refs 的全局 group_id [G]
   - ref_text: 3 张参考图的拼接描述
 """
 
@@ -37,7 +37,8 @@ from utils.config import TokenizationConfig, TrainConfig
 from utils.dataset import SVGTokenizer
 
 VIEWBOX_SIZE = 200.0
-DEFAULT_MAX_GROUPS = 4
+GROUPS_PER_REFERENCE = 4
+DEFAULT_MAX_GROUPS = GROUPS_PER_REFERENCE
 
 
 class HVMDataset(Dataset):
@@ -65,6 +66,7 @@ class HVMDataset(Dataset):
         shuffle_rag: bool = False,
         is_eval: bool = False,
         split: str = "train",  # 新增: train, val, test, test_holdout
+        part_num_refs: int = 1,
     ):
         """
         Args:
@@ -76,6 +78,7 @@ class HVMDataset(Dataset):
             shuffle_rag: 是否全局打乱 ref 对应关系 (ablation)
             is_eval: 是否为 eval 模式 (val/test)，影响 features 路径格式
             split: 数据集划分 (train / val / test / test_holdout)
+            part_num_refs: part-grounded 分支使用前多少个 refs（默认 Top-1）
         """
         self.data_dir = data_dir
         self.hvm_dir = hvm_dir
@@ -85,6 +88,7 @@ class HVMDataset(Dataset):
         self.shuffle_rag = shuffle_rag
         self.is_eval = is_eval
         self.split = split
+        self.part_num_refs = max(1, int(part_num_refs))
         self.features_dir = os.path.join(hvm_dir, "features")
         self.group_features_dir = os.path.join(hvm_dir, "group_features")
 
@@ -188,16 +192,17 @@ class HVMDataset(Dataset):
                     refs_ok = False
                     break
 
-            # 检查 Top-1 参考的 group_features 是否存在
+            # 检查 part 分支所需 refs 的 group_features 是否存在
             if refs_ok:
-                best_ref_idx = rag["ref_indices"][0]
-                gf_path = os.path.join(
-                    self.group_features_dir,
-                    f"{best_ref_idx // 1000:03d}",
-                    f"{best_ref_idx:06d}.pt",
-                )
-                if not os.path.exists(gf_path):
-                    refs_ok = False
+                for part_ref_idx in rag["ref_indices"][:self.part_num_refs]:
+                    gf_path = os.path.join(
+                        self.group_features_dir,
+                        f"{part_ref_idx // 1000:03d}",
+                        f"{part_ref_idx:06d}.pt",
+                    )
+                    if not os.path.exists(gf_path):
+                        refs_ok = False
+                        break
 
             if refs_ok:
                 valid.append(idx)
@@ -333,6 +338,48 @@ class HVMDataset(Dataset):
             "group_ids": group_ids,
         }
 
+    def _load_part_group_bundle(self, ref_indices: List[int]) -> Dict[str, Any]:
+        """
+        将前 K 个 refs 的 group features 串联成一个统一的 part bank。
+
+        group_id 采用最小改动方案:
+          global_group_id = ref_rank * 4 + local_group_id
+        例如 Top-3 时范围为 0..11。
+        """
+        merged_group_features: List[torch.Tensor] = []
+        merged_tag_meta: List[torch.Tensor] = []
+        merged_group_ids: List[torch.Tensor] = []
+
+        for ref_rank, ref_idx in enumerate(ref_indices[:self.part_num_refs]):
+            group_data = self._load_group_features(ref_idx)
+            group_features = list(group_data["group_features"])
+            tag_meta = torch.as_tensor(group_data["tag_meta"], dtype=torch.float32)
+            group_ids = torch.as_tensor(group_data["group_ids"], dtype=torch.long)
+
+            if not group_features:
+                continue
+
+            aligned_len = min(len(group_features), tag_meta.shape[0], group_ids.shape[0])
+            if aligned_len <= 0:
+                continue
+
+            merged_group_features.extend(group_features[:aligned_len])
+            merged_tag_meta.append(tag_meta[:aligned_len])
+            merged_group_ids.append(group_ids[:aligned_len] + ref_rank * GROUPS_PER_REFERENCE)
+
+        if not merged_group_features:
+            return {
+                "group_features": [],
+                "tag_meta": torch.zeros(0, 6, dtype=torch.float32),
+                "group_ids": torch.zeros(0, dtype=torch.long),
+            }
+
+        return {
+            "group_features": merged_group_features,
+            "tag_meta": torch.cat(merged_tag_meta, dim=0),
+            "group_ids": torch.cat(merged_group_ids, dim=0),
+        }
+
     def _tokenize_svg(self, svg_code: str) -> np.ndarray:
         """将 SVG 字符串 tokenize 为 token 序列"""
         if not svg_code or not DEEPSVG_AVAILABLE:
@@ -368,9 +415,9 @@ class HVMDataset(Dataset):
                 text: str                              描述文本
                 pix_seq: List[int]                     SVG token 序列 (含 BOS/EOS)
                 ref_features: List[torch.Tensor]       3 × [256, 3584] (for GME, post-merge)
-                ref_best_group_features: List[Tensor]  Top-1 参考的逐 group 渲染特征, list of [256, 3584] (for PME)
-                ref_best_group_tag_meta: Tensor        Top-1 参考图各 group 的 tag [G, 6]
-                ref_best_group_ids: Tensor             Top-1 参考图各 group 的 group_id [G]
+                ref_best_group_features: List[Tensor]  part refs 的逐 group 渲染特征, list of [256, 3584]
+                ref_best_group_tag_meta: Tensor        part refs 各 group 的 tag [G, 6]
+                ref_best_group_ids: Tensor             part refs 各 group 的全局 group_id [G]
                 ref_text: str                          参考文本 (拼接)
         """
         max_retries = 10
@@ -435,9 +482,8 @@ class HVMDataset(Dataset):
         # 3 张参考图的整图 features (for GME)
         ref_features = [self._load_ref_feature(ri) for ri in ref_indices]
 
-        # Top-1 参考的逐 group 渲染特征 (for PME)
-        best_ref_idx = ref_indices[0]
-        ref_best_group_data = self._load_group_features(best_ref_idx)
+        # part refs 的逐 group 渲染特征 (for PME / part-grounded CDM)
+        ref_best_group_data = self._load_part_group_bundle(ref_indices)
 
         # 参考文本 (拼接 3 个参考的描述) — 也用 donor 的
         ref_texts = []
@@ -456,6 +502,7 @@ class HVMDataset(Dataset):
             "ref_best_group_tag_meta": ref_best_group_data["tag_meta"],        # [G, 6]
             "ref_best_group_ids": ref_best_group_data["group_ids"],            # [G]
             "ref_text": ref_text,
+            "part_ref_indices": ref_indices[:self.part_num_refs],
         }
 
 
@@ -477,8 +524,8 @@ def create_hvm_collate_fn(
     将 Dataset 返回的 raw samples 组装成 batch tensor:
     - input_ids, attention_mask, labels: 文本 + SVG 序列
     - ref_features: [B, 3, 256, 3584]  (for GME, post-merge)
-    - group_features_list: List[List[Tensor]]  (for PME, 每个样本 1~4 个 [256, 3584])
-    - part_features: [B, G, 256, 3584]         (for part-grounded CDM)
+    - group_features_list: List[List[Tensor]]  (for PME, 每个样本 1~K*4 个 [256, 3584])
+    - part_features: [B, G, 256, 3584]         (for part-grounded CDM, G 可为 4/12/...)
     - part_tag_meta: [B, G, 6]                 (for layout tags)
     - part_group_ids: [B, G]                   (for group-id embedding)
     - part_mask: [B, G]                        (有效 group)

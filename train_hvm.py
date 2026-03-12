@@ -469,6 +469,7 @@ def train(args):
         num_decoder_layers=28,
         gate_alpha_init=args.gate_alpha_init,
         gme_num_queries=args.gme_num_queries,
+        pme_max_groups=args.pme_max_groups,
         memory_mode=args.memory_mode,
         inject_mode=args.inject_mode,
         inject_scale=args.inject_scale,
@@ -518,6 +519,7 @@ def train(args):
         train_config=config.training,
         max_len=config.training.max_seq_length,
         shuffle_rag=args.shuffle_rag,
+        part_num_refs=args.part_num_refs,
     )
 
     collate_fn = create_hvm_collate_fn(
@@ -553,6 +555,7 @@ def train(args):
             max_len=config.training.max_seq_length,
             shuffle_rag=False,
             is_eval=True,
+            part_num_refs=args.part_num_refs,
         )
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset,
@@ -738,6 +741,8 @@ def train(args):
     if not args.disable_hvm:
         accelerator.print(f"  Memory mode: {hvm_config.memory_mode}")
         accelerator.print(f"  Inject mode: {hvm_config.inject_mode}")
+        accelerator.print(f"  Part refs used: {args.part_num_refs}")
+        accelerator.print(f"  PME max groups: {hvm_config.pme_max_groups}")
         if hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
             accelerator.print(f"  CDM layout: {hvm_config.cdm_layout}")
             accelerator.print(f"  CDM detail source: {hvm_config.cdm_detail_source}")
@@ -1018,6 +1023,11 @@ def parse_args():
                         help="Initial value for AdaptiveGate base_alpha (default: 0.05)")
     parser.add_argument("--gme_num_queries", type=int, default=32,
                         help="Number of GME QFormer queries (default: 32)")
+    parser.add_argument("--part_num_refs", type=int, default=1,
+                        help="Number of retrieved refs used by the part-grounded branch (default: 1, Top-1).")
+    parser.add_argument("--pme_max_groups", type=int, default=4,
+                        help="Maximum number of part groups per sample. "
+                             "Use 4 for Top-1 and 12 for Top-3 with 4 groups/reference.")
     parser.add_argument("--delta_ln", action="store_true", default=False,
                         help="Add LayerNorm on delta before gating (stabilize delta scale).")
     parser.add_argument("--dra_d_inner", type=int, default=128,
@@ -1035,7 +1045,7 @@ def parse_args():
     parser.add_argument("--cdm_detail_source", type=str, default="ref",
                         choices=["ref", "part"],
                         help="CDM detail source: ref=flattened 3x256 raw ref tokens, "
-                             "part=top1 grouped tokens with layout tags.")
+                             "part=top-k grouped tokens with layout tags.")
     parser.add_argument("--cdm_disable_gist", action="store_true", default=False,
                         help="Disable CDM gist cross-attention while keeping the rest of the pipeline unchanged.")
     parser.add_argument("--cdm_disable_tag_meta", action="store_true", default=False,
@@ -1126,10 +1136,21 @@ def parse_args():
 
     if args.inject_scale <= 0:
         parser.error("--inject_scale must be > 0.")
+    if args.part_num_refs <= 0:
+        parser.error("--part_num_refs must be > 0.")
+    if args.part_num_refs > 3:
+        parser.error("--part_num_refs currently supports at most 3 retrieved refs.")
+    if args.pme_max_groups <= 0:
+        parser.error("--pme_max_groups must be > 0.")
     if args.edr_d_router <= 0:
         parser.error("--edr_d_router must be > 0.")
     if args.edr_top_k <= 0:
         parser.error("--edr_top_k must be > 0.")
+    if args.cdm_detail_source == "part" and args.pme_max_groups < args.part_num_refs * 4:
+        parser.error(
+            "--pme_max_groups is too small for the selected part refs: "
+            f"need at least {args.part_num_refs * 4}, got {args.pme_max_groups}."
+        )
 
     if args.memory_mode == "full" and args.inject_mode != "adaptive":
         parser.error("memory_mode='full' currently supports only inject_mode='adaptive'.")
@@ -1151,11 +1172,11 @@ def parse_args():
         parser.error("--cdm_disable_gist is only supported when memory_mode is 'gme_cdm' or 'gme_cdm_edr'.")
     if args.cdm_layout == "groupwise" and args.cdm_detail_source != "part":
         parser.error("--cdm_layout groupwise requires --cdm_detail_source part.")
-    if args.cdm_layout == "groupwise" and args.cdm_num_queries != args.cdm_group_queries_per_group * 4:
+    if args.cdm_layout == "groupwise" and args.cdm_num_queries != args.cdm_group_queries_per_group * args.pme_max_groups:
         parser.error(
             "--cdm_layout groupwise requires "
-            "--cdm_num_queries == --cdm_group_queries_per_group * 4 "
-            f"(got {args.cdm_num_queries} vs {args.cdm_group_queries_per_group}*4)."
+            "--cdm_num_queries == --cdm_group_queries_per_group * --pme_max_groups "
+            f"(got {args.cdm_num_queries} vs {args.cdm_group_queries_per_group}*{args.pme_max_groups})."
         )
     if args.edr_disable_gist and args.memory_mode != "gme_cdm_edr":
         parser.error("--edr_disable_gist is only supported when memory_mode='gme_cdm_edr'.")
