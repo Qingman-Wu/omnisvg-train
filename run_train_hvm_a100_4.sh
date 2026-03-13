@@ -1,18 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / EDR part-no-tag nozoom)
+# HVM-SVG 训练启动脚本 (A100_4 / Top3 part + 12-slot + EDR top1 w/o conf)
 # =============================================================================
 #
 # 使用方法:
-#   bash run_train_hvm_a100_1_2.sh
-#   CUDA_VISIBLE_DEVICES=3,4,5 bash run_train_hvm_a100_1_2.sh --num_gpus 3
+#   bash run_train_hvm_a100_4.sh --num_gpus 2
+#   CUDA_VISIBLE_DEVICES=0,1 bash run_train_hvm_a100_4.sh --num_gpus 2
 #
 # 默认实验:
-#   GME + CDM(part-no-tag) + EDR(E1) + last4 + adaptive
-#   CDM detail source 使用 Top-1 ref 的 nozoom group tokens
-#   但移除全部显式结构标签:
-#       - 不使用 group_id embedding
-#       - 不使用 [cx, cy, w, h, z_start, z_end]
+#   Top3 refs × 4 groups/ref = 12 groups
+#   group-wise CDM(part-tag, no-gist) + EDR(E1 top1, no-conf) + last4 + adaptive
+#   每个 group 经过共享 CDM 后仅输出 1 个 slot:
+#       12 groups × 1 slot/group = 12 detail slots
+#   用于“去掉置信度抑制”消融，默认按 2 卡配置保持与 4 卡主实验相同 effective BS
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -26,16 +26,16 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=3
+NUM_GPUS=2
 
 # -- 数据 --
-DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_test"
-HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom"
+DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
+HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 
 # -- 模型 --
 MODEL_SIZE="8B"
-OMNISVG_CHECKPOINT="/mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
-BASE_MODEL="/mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
+OMNISVG_CHECKPOINT=""
+BASE_MODEL=""
 
 # -- HVM 架构 --
 D_QFORMER=1024
@@ -43,23 +43,28 @@ D_PIM_INNER=512
 PIM_LAYER_INTERVAL=4
 GATE_ALPHA_INIT=0.05
 GME_NUM_QUERIES=32
-CDM_NUM_QUERIES=16
+PART_NUM_REFS=3
+PME_MAX_GROUPS=12
+CDM_NUM_QUERIES=12
 CDM_NUM_LAYERS=6
+CDM_LAYOUT="groupwise"
+CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
-CDM_DISABLE_TAG_META=true
-CDM_DISABLE_GROUP_ID=true
+CDM_DISABLE_GIST=true
+CDM_DISABLE_TAG_META=false
+CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
 EDR_TOP_K=1
-EDR_DISABLE_CONF=false
+EDR_DISABLE_CONF=true
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 3 卡保持与 6 卡主实验接近的有效 batch: 4 x 8 x 3 = 96
+# 2 卡保持与 4 卡主实验相同的有效 batch: 4 x 16 x 2 = 128
 BATCH_SIZE=4
-GRAD_ACCUM=8
+GRAD_ACCUM=16
 EPOCHS=30000
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
@@ -73,19 +78,19 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s4_gme_cdm_edr_part_notag_nozoom_topk1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_noconf_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s4_gme_cdm_edr_part_notag_nozoom_topk1_last4"
+SWANLAB_RUN_NAME="s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_noconf_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
 HVM_CHECKPOINT=""
 
 # -- 验证集 --
-VAL_DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
-VAL_HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom"
+VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
+VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
 EVAL_EVERY=500
 
 # -- Ablation --
@@ -106,9 +111,15 @@ while [[ $# -gt 0 ]]; do
         --hvm_ckpt)       HVM_CHECKPOINT="$2";       shift 2 ;;
         --gate_alpha_init) GATE_ALPHA_INIT="$2";     shift 2 ;;
         --gme_num_queries) GME_NUM_QUERIES="$2";     shift 2 ;;
+        --part_num_refs)  PART_NUM_REFS="$2";        shift 2 ;;
+        --pme_max_groups) PME_MAX_GROUPS="$2";       shift 2 ;;
         --cdm_num_queries) CDM_NUM_QUERIES="$2";     shift 2 ;;
         --cdm_num_layers) CDM_NUM_LAYERS="$2";       shift 2 ;;
+        --cdm_layout)     CDM_LAYOUT="$2";           shift 2 ;;
+        --cdm_group_queries_per_group) CDM_GROUP_QUERIES_PER_GROUP="$2"; shift 2 ;;
         --cdm_detail_source) CDM_DETAIL_SOURCE="$2"; shift 2 ;;
+        --cdm_disable_gist) CDM_DISABLE_GIST=true;   shift 1 ;;
+        --no_cdm_disable_gist) CDM_DISABLE_GIST=false; shift 1 ;;
         --cdm_disable_tag_meta) CDM_DISABLE_TAG_META=true; shift 1 ;;
         --no_cdm_disable_tag_meta) CDM_DISABLE_TAG_META=false; shift 1 ;;
         --cdm_disable_group_id) CDM_DISABLE_GROUP_ID=true; shift 1 ;;
@@ -178,6 +189,8 @@ echo "  Epochs:            ${EPOCHS}"
 echo "  Learning rate:     ${LEARNING_RATE}"
 echo "  Gate alpha init:   ${GATE_ALPHA_INIT}"
 echo "  GME num queries:   ${GME_NUM_QUERIES}"
+echo "  Part refs used:    ${PART_NUM_REFS}"
+echo "  PME max groups:    ${PME_MAX_GROUPS}"
 echo "  Memory mode:       ${MEMORY_MODE}"
 echo "  Inject mode:       ${INJECT_MODE}"
 echo "  Inject scale:      ${INJECT_SCALE}"
@@ -214,7 +227,10 @@ fi
 if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM queries:       ${CDM_NUM_QUERIES}"
     echo "  CDM layers:        ${CDM_NUM_LAYERS}"
+    echo "  CDM layout:        ${CDM_LAYOUT}"
+    echo "  CDM slots/group:   ${CDM_GROUP_QUERIES_PER_GROUP}"
     echo "  CDM detail source: ${CDM_DETAIL_SOURCE}"
+    echo "  CDM disable gist:  ${CDM_DISABLE_GIST}"
     echo "  CDM disable tag:   ${CDM_DISABLE_TAG_META}"
     echo "  CDM disable gid:   ${CDM_DISABLE_GROUP_ID}"
 fi
@@ -243,8 +259,12 @@ TRAIN_ARGS=(
     --inject_scale "$INJECT_SCALE"
     --gate_alpha_init "$GATE_ALPHA_INIT"
     --gme_num_queries "$GME_NUM_QUERIES"
+    --part_num_refs "$PART_NUM_REFS"
+    --pme_max_groups "$PME_MAX_GROUPS"
     --cdm_num_queries "$CDM_NUM_QUERIES"
     --cdm_num_layers "$CDM_NUM_LAYERS"
+    --cdm_layout "$CDM_LAYOUT"
+    --cdm_group_queries_per_group "$CDM_GROUP_QUERIES_PER_GROUP"
     --cdm_detail_source "$CDM_DETAIL_SOURCE"
     --edr_d_router "$EDR_D_ROUTER"
     --edr_top_k "$EDR_TOP_K"
@@ -310,6 +330,10 @@ fi
 
 if [ "$EDR_DISABLE_CONF" = true ]; then
     TRAIN_ARGS+=(--edr_disable_conf)
+fi
+
+if [ "$CDM_DISABLE_GIST" = true ]; then
+    TRAIN_ARGS+=(--cdm_disable_gist)
 fi
 
 if [ "$CDM_DISABLE_TAG_META" = true ]; then
