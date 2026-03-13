@@ -29,8 +29,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=2
 
 # -- 数据 --
-DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
-HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
+HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -89,8 +89,8 @@ RESUME_FROM=""
 HVM_CHECKPOINT=""
 
 # -- 验证集 --
-VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
-VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
+VAL_DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
+VAL_HVM_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
 EVAL_EVERY=500
 
 # -- Ablation --
