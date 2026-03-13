@@ -34,8 +34,8 @@ HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_pre
 
 # -- 模型 --
 MODEL_SIZE="8B"
-OMNISVG_CHECKPOINT=""
-BASE_MODEL=""
+OMNISVG_CHECKPOINT="/mnt/a100_1_data2/wuqingman/models/OmniSVG/OmniSVG1.1_8B"
+BASE_MODEL="/mnt/a100_1_data/wuqingman/models/Qwen/Qwen2.5-VL-7B-Instruct"
 
 # -- HVM 架构 --
 D_QFORMER=1024
