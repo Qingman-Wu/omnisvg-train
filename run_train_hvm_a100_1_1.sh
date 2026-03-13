@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / Top3 part + 12-slot + EDR top1)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Top3 part + 12-slot + EDR top12)
 # =============================================================================
 #
 # 使用方法:
@@ -9,11 +9,12 @@
 #
 # 默认实验:
 #   Top3 refs × 4 groups/ref = 12 groups
-#   group-wise CDM(part-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
+#   group-wise CDM(part-tag, no-gist) + EDR(E1 top12) + last4 + adaptive
 #   每个 group 经过共享 CDM 后仅输出 1 个 slot:
 #       12 groups × 1 slot/group = 12 detail slots
 #   group_id 采用全局编号:
 #       ref0 -> 0,1,2,3; ref1 -> 4,5,6,7; ref2 -> 8,9,10,11
+#   用于“弱化 router / sparse routing”消融
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -27,7 +28,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=3
+NUM_GPUS=4
 
 # -- 数据 --
 DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
@@ -51,8 +52,10 @@ CDM_LAYOUT="groupwise"
 CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
 CDM_DISABLE_GIST=true
+CDM_DISABLE_TAG_META=false
+CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
-EDR_TOP_K=1
+EDR_TOP_K=12
 EDR_DISABLE_CONF=false
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
@@ -76,11 +79,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s8_top12_top3part_12slot_nogist_edr_parttag_nozoom_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_last4"
+SWANLAB_RUN_NAME="s8_top12_top3part_12slot_nogist_edr_parttag_nozoom_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -118,6 +121,10 @@ while [[ $# -gt 0 ]]; do
         --cdm_detail_source) CDM_DETAIL_SOURCE="$2"; shift 2 ;;
         --cdm_disable_gist) CDM_DISABLE_GIST=true;   shift 1 ;;
         --no_cdm_disable_gist) CDM_DISABLE_GIST=false; shift 1 ;;
+        --cdm_disable_tag_meta) CDM_DISABLE_TAG_META=true; shift 1 ;;
+        --no_cdm_disable_tag_meta) CDM_DISABLE_TAG_META=false; shift 1 ;;
+        --cdm_disable_group_id) CDM_DISABLE_GROUP_ID=true; shift 1 ;;
+        --no_cdm_disable_group_id) CDM_DISABLE_GROUP_ID=false; shift 1 ;;
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
@@ -225,6 +232,8 @@ if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM slots/group:   ${CDM_GROUP_QUERIES_PER_GROUP}"
     echo "  CDM detail source: ${CDM_DETAIL_SOURCE}"
     echo "  CDM disable gist:  ${CDM_DISABLE_GIST}"
+    echo "  CDM disable tag:   ${CDM_DISABLE_TAG_META}"
+    echo "  CDM disable gid:   ${CDM_DISABLE_GROUP_ID}"
 fi
 if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
@@ -322,6 +331,14 @@ fi
 
 if [ "$CDM_DISABLE_GIST" = true ]; then
     TRAIN_ARGS+=(--cdm_disable_gist)
+fi
+
+if [ "$CDM_DISABLE_TAG_META" = true ]; then
+    TRAIN_ARGS+=(--cdm_disable_tag_meta)
+fi
+
+if [ "$CDM_DISABLE_GROUP_ID" = true ]; then
+    TRAIN_ARGS+=(--cdm_disable_group_id)
 fi
 
 # ===================== 保存启动快照 =====================

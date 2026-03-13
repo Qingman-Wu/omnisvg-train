@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / Top3 part + 24-slot + EDR top1)
+# HVM-SVG 训练启动脚本 (A100_1_2 / Top3 part + 12-slot + EDR top1 + no-tag)
 # =============================================================================
 #
 # 使用方法:
@@ -9,10 +9,10 @@
 #
 # 默认实验:
 #   Top3 refs × 4 groups/ref = 12 groups
-#   group-wise CDM(part-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
-#   每个 group 经过共享 CDM 后输出 2 个 slots:
-#       12 groups × 2 slots/group = 24 detail slots
-#   两个 slots 共享同一个 global group_id，但 local_slot 不同
+#   group-wise CDM(no-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
+#   每个 group 经过共享 CDM 后仅输出 1 个 slot:
+#       12 groups × 1 slot/group = 12 detail slots
+#   用于结构标签消融，固定 12-slot 以避免与容量因素混淆
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -26,7 +26,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=3
+NUM_GPUS=4
 
 # -- 数据 --
 DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
@@ -44,14 +44,14 @@ GATE_ALPHA_INIT=0.05
 GME_NUM_QUERIES=32
 PART_NUM_REFS=3
 PME_MAX_GROUPS=12
-CDM_NUM_QUERIES=24
+CDM_NUM_QUERIES=12
 CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
-CDM_GROUP_QUERIES_PER_GROUP=2
+CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
 CDM_DISABLE_GIST=true
-CDM_DISABLE_TAG_META=false
-CDM_DISABLE_GROUP_ID=false
+CDM_DISABLE_TAG_META=true
+CDM_DISABLE_GROUP_ID=true
 EDR_D_ROUTER=256
 EDR_TOP_K=1
 EDR_DISABLE_CONF=false
@@ -77,11 +77,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_last4"
+OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s8_notag_top3part_12slot_nogist_edr_nozoom_topk1_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_last4"
+SWANLAB_RUN_NAME="s8_notag_top3part_12slot_nogist_edr_nozoom_topk1_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
