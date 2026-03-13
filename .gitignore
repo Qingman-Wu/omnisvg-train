@@ -54,3 +54,4 @@ inference_results/
 inference/output*/
 metrics/metrics_results/
 analysis/
+docs/

@@ -922,7 +922,20 @@ def main():
     print(f"  Resume mode      : {args.resume}")
     print("=" * 70)
 
-    index_splits = split_indices(args.sample_indices, num_gpus)
+    # --resume: filter out already completed samples before splitting
+    pending_indices = list(args.sample_indices)
+    if args.resume:
+        output_dir = Path(args.output_dir)
+        completed = []
+        for idx in pending_indices:
+            has_single = (output_dir / f"sample_{idx:04d}_hvm.svg").exists()
+            has_multi = (output_dir / f"sample_{idx:04d}_hvm_c0.svg").exists()
+            if has_single or has_multi:
+                completed.append(idx)
+        pending_indices = [i for i in pending_indices if i not in set(completed)]
+        print(f"  Resume: {len(completed)} done, {len(pending_indices)} remaining")
+
+    index_splits = split_indices(pending_indices, num_gpus)
     for i, split in enumerate(index_splits):
         print(f"  GPU {i}: {len(split)} samples"
               + (f"  [{split[0]}~{split[-1]}]" if split else "  [empty]"))

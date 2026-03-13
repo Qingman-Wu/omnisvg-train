@@ -32,6 +32,10 @@
 
 #   CUDA_VISIBLE_DEVICES=4 RESUME=1 bash metrics/run_all.sh inference_results/s6_groupwise_cdm_edr_parttag_nozoom_topk1_step2000_test hvm
 #   CUDA_VISIBLE_DEVICES=5 RESUME=1 bash metrics/run_all.sh inference_results/s6_groupwise_cdm_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
+
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
 # 输出保存到: metrics/metrics_results/<exp_name>/
 #   ├── ssim.csv + ssim.json
 #   ├── mse.csv + mse.json
