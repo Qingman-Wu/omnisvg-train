@@ -489,6 +489,7 @@ def train(args):
         edr_top_k=args.edr_top_k,
         edr_disable_conf=args.edr_disable_conf,
         edr_disable_gist=args.edr_disable_gist,
+        edr_random_replace_top1=args.edr_random_replace_top1,
         edr_detail_layer_indices_override=args.edr_detail_layer_indices,
     )
 
@@ -754,6 +755,7 @@ def train(args):
             accelerator.print(f"  EDR top-k: {hvm_config.edr_top_k}")
             accelerator.print(f"  EDR disable conf: {hvm_config.edr_disable_conf}")
             accelerator.print(f"  EDR disable gist: {hvm_config.edr_disable_gist}")
+            accelerator.print(f"  EDR random replace top1: {hvm_config.edr_random_replace_top1}")
             accelerator.print(f"  EDR detail layers: {hvm_config.edr_detail_layer_indices}")
         if hvm_config.inject_mode == "fixed":
             accelerator.print(f"  Inject scale: {hvm_config.inject_scale}")
@@ -1060,6 +1062,8 @@ def parse_args():
                         help="Disable EDR confidence suppression and force conf=1 during detail injection.")
     parser.add_argument("--edr_disable_gist", action="store_true", default=False,
                         help="Disable EDR gist injection and keep only routed detail injection.")
+    parser.add_argument("--edr_random_replace_top1", action="store_true", default=False,
+                        help="For top-k=1 ablation: replace the selected detail slot with a random valid slot before detail injection.")
     parser.add_argument("--edr_detail_layer_indices", type=str, default=None,
                         help="Comma-separated decoder layer indices where EDR detail path is enabled. "
                              "Defaults to all PIM layers; gist path still runs on every PIM layer.")
@@ -1180,6 +1184,11 @@ def parse_args():
         )
     if args.edr_disable_gist and args.memory_mode != "gme_cdm_edr":
         parser.error("--edr_disable_gist is only supported when memory_mode='gme_cdm_edr'.")
+    if args.edr_random_replace_top1:
+        if args.memory_mode != "gme_cdm_edr":
+            parser.error("--edr_random_replace_top1 is only supported when memory_mode='gme_cdm_edr'.")
+        if args.edr_top_k != 1:
+            parser.error("--edr_random_replace_top1 requires --edr_top_k 1.")
     if args.edr_detail_layer_indices is not None:
         if args.memory_mode != "gme_cdm_edr":
             parser.error("--edr_detail_layer_indices is only supported when memory_mode='gme_cdm_edr'.")

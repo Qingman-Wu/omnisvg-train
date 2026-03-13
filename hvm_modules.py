@@ -66,6 +66,7 @@ class HVMConfig:
     edr_top_k: int = 2
     edr_disable_conf: bool = False
     edr_disable_gist: bool = False
+    edr_random_replace_top1: bool = False
     edr_detail_layer_indices_override: Optional[List[int]] = None
 
     # === DRA (Direct Reference Attention) ===
@@ -1509,12 +1510,13 @@ class DetailRouter(nn.Module):
       - router_stats:  标量诊断信息
     """
 
-    def __init__(self, d_model: int, d_router: int, top_k: int):
+    def __init__(self, d_model: int, d_router: int, top_k: int, random_replace_top1: bool = False):
         super().__init__()
         self.q_proj = nn.Linear(d_model, d_router, bias=False)
         self.k_proj = nn.Linear(d_model, d_router, bias=False)
         self.scale = d_router ** -0.5
         self.top_k = top_k
+        self.random_replace_top1 = bool(random_replace_top1)
         self.capture_trace = False
         self.last_trace = {}
 
@@ -1576,6 +1578,25 @@ class DetailRouter(nn.Module):
         else:
             k = min(self.top_k, num_slots)
         topk_vals, topk_idx = torch.topk(score_fp32, k=k, dim=-1)
+        replacement_mask = None
+        random_slot_idx = None
+        if self.random_replace_top1 and k == 1 and num_slots > 1:
+            if valid_slot_mask is not None:
+                replaceable = (valid_slot_mask.sum(dim=-1, keepdim=True) > 1).unsqueeze(1)
+                candidate_mask = valid_slot_mask[:, None, :].expand_as(score_fp32)
+            else:
+                replaceable = torch.ones(
+                    score_fp32.shape[0], 1, 1, dtype=torch.bool, device=score_fp32.device
+                )
+                candidate_mask = torch.ones_like(score_fp32, dtype=torch.bool)
+
+            replacement_mask = replaceable.expand(-1, score_fp32.shape[1], 1)
+            if replacement_mask.any():
+                candidate_mask = candidate_mask.clone()
+                candidate_mask.scatter_(-1, topk_idx[..., :1], False)
+                random_score = torch.rand_like(score_fp32).masked_fill(~candidate_mask, -1.0)
+                random_slot_idx = random_score.argmax(dim=-1, keepdim=True)
+                topk_idx = torch.where(replacement_mask, random_slot_idx, topk_idx)
         topk_prob = torch.softmax(topk_vals, dim=-1)
 
         sparse_prob = torch.zeros_like(score_fp32)
@@ -1592,6 +1613,9 @@ class DetailRouter(nn.Module):
                     "selected_prob": topk_prob[..., 0].detach() if k > 0 else None,
                     "sparse_prob": sparse_prob.detach(),
                     "conf": conf.detach().float(),
+                    "random_replace_top1": bool(self.random_replace_top1),
+                    "random_replaced_mask": replacement_mask.detach().clone() if replacement_mask is not None else None,
+                    "random_slot_idx": random_slot_idx.detach() if random_slot_idx is not None else None,
                     "detail_slot_mask": valid_slot_mask.detach().clone() if valid_slot_mask is not None else None,
                     "num_slots": num_slots,
                     "top_k": k,
@@ -1611,6 +1635,10 @@ class DetailRouter(nn.Module):
             "router_top1_prob_mean": full_prob.max(dim=-1).values.detach().float().mean(),
             "router_active_ratio": (conf.detach().float() > 0.5).float().mean(),
             "router_slot_usage_entropy": slot_usage_entropy.detach().float(),
+            "router_random_replace_ratio": (
+                replacement_mask.detach().float().mean()
+                if replacement_mask is not None else torch.tensor(0.0, device=detail_bank.device)
+            ),
         }
         return routed_detail, conf.to(dtype=detail_bank.dtype), router_stats
 
@@ -1635,6 +1663,7 @@ class EDRInjectionModule(nn.Module):
             d_model=d,
             d_router=config.edr_d_router,
             top_k=config.edr_top_k,
+            random_replace_top1=config.edr_random_replace_top1,
         )
         self.disable_conf = bool(config.edr_disable_conf)
         self.enable_gist = not bool(config.edr_disable_gist)

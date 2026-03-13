@@ -57,6 +57,7 @@ CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
 EDR_TOP_K=12
 EDR_DISABLE_CONF=false
+EDR_RANDOM_REPLACE_TOP1=false
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
@@ -128,6 +129,7 @@ while [[ $# -gt 0 ]]; do
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
+        --edr_random_replace_top1) EDR_RANDOM_REPLACE_TOP1=true; shift 1 ;;
         --memory_mode)    MEMORY_MODE="$2";          shift 2 ;;
         --inject_mode)    INJECT_MODE="$2";          shift 2 ;;
         --inject_scale)   INJECT_SCALE="$2";         shift 2 ;;
@@ -239,6 +241,7 @@ if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
     echo "  EDR top-k:         ${EDR_TOP_K}"
     echo "  EDR disable conf:  ${EDR_DISABLE_CONF}"
+    echo "  EDR random top1:   ${EDR_RANDOM_REPLACE_TOP1}"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -327,6 +330,10 @@ fi
 
 if [ "$EDR_DISABLE_CONF" = true ]; then
     TRAIN_ARGS+=(--edr_disable_conf)
+fi
+
+if [ "$EDR_RANDOM_REPLACE_TOP1" = true ]; then
+    TRAIN_ARGS+=(--edr_random_replace_top1)
 fi
 
 if [ "$CDM_DISABLE_GIST" = true ]; then
