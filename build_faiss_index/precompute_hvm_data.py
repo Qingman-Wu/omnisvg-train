@@ -33,6 +33,7 @@ import io
 import json
 import math
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,23 @@ TOKENS_PER_IMAGE = MERGE_GRID_H * MERGE_GRID_W  # 16*16 = 256 (post-merge tokens
 RAG_TOP_K = 3             # 检索 Top-K 参考
 MAX_GROUPS = 4             # 最多分组数
 QUERIES_PER_GROUP = 4      # 每组 query 数（PME）
+
+
+def copy_training_alias(output_dir: str, src_name: str, dst_name: str):
+    """复制训练阶段兼容的别名文件，避免依赖软链接。"""
+    src_path = os.path.join(output_dir, src_name)
+    dst_path = os.path.join(output_dir, dst_name)
+
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"Source file not found: {src_path}")
+
+    if os.path.lexists(dst_path):
+        if os.path.isdir(dst_path) and not os.path.islink(dst_path):
+            raise IsADirectoryError(f"Alias target is a directory: {dst_path}")
+        os.remove(dst_path)
+
+    shutil.copy2(src_path, dst_path)
+    print(f"Saved training alias to: {dst_path}")
 
 
 # ============================================================================
@@ -137,7 +155,7 @@ def stage_metadata(data_dir: str, output_dir: str):
 def stage_rag(output_dir: str, clip_model_path: str):
     """
     用 CLIP text encoder 编码 descriptions，构建 FAISS 索引，检索 Top-3 相似样本。
-    输出: rag_results.jsonl, text_embeddings.npy, faiss_index.bin
+    输出: rag_results.jsonl, rag_results_train.jsonl, text_embeddings.npy, faiss_index.bin
     """
     import faiss
     from transformers import CLIPModel, CLIPTokenizer
@@ -270,6 +288,7 @@ def stage_rag(output_dir: str, clip_model_path: str):
     faiss.write_index(index, index_path)
     print(f"Saved FAISS index to: {index_path}") #faiss_index.bin
     print(f"Saved RAG results to: {rag_path}") #rag_results.jsonl
+    copy_training_alias(output_dir, "rag_results.jsonl", "rag_results_train.jsonl")
 
 
 # ============================================================================
@@ -717,7 +736,7 @@ def _make_group(paths: List[Dict], indices: List[int], complexity: float) -> Dic
 def stage_groups(data_dir: str, output_dir: str):
     """
     解析所有样本的 SVG，计算 path 分组信息。
-    输出: groups.jsonl
+    输出: groups.jsonl, groups_train_ref.jsonl
     """
     import pyarrow.parquet as pq
 
@@ -816,6 +835,7 @@ def stage_groups(data_dir: str, output_dir: str):
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print(f"Saved groups to: {groups_path}")
+    copy_training_alias(output_dir, "groups.jsonl", "groups_train_ref.jsonl")
 
 
 # ============================================================================
@@ -940,11 +960,11 @@ def stage_group_features(
     torch.cuda.empty_cache()
     print("Model loaded. Only visual encoder kept on GPU.")
 
-    # 4. 加载 parquet tables
-    print("Loading parquet files...")
+    # 4. 只加载当前 shard 真正需要的 parquet，避免多 shard 时重复占满 CPU 内存
+    print("Loading parquet files for current shard...")
     parquet_tables = {}
-    parquet_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet")])
-    for pf in tqdm(parquet_files, desc="Loading parquets"):
+    needed_parquet_files = sorted({rec["parquet_file"] for rec in shard_records})
+    for pf in tqdm(needed_parquet_files, desc="Loading parquets"):
         parquet_tables[pf] = pq.read_table(os.path.join(data_dir, pf))
 
     # 5. 提取 post-merge features: 直接用 visual 模块的输出 [256, 3584]
