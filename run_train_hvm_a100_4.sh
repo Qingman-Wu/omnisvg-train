@@ -55,11 +55,11 @@ CDM_DISABLE_TAG_META=false
 CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
 EDR_TOP_K=1
-EDR_DISABLE_CONF=true
+EDR_DISABLE_CONF=false
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
-PIM_LAYER_INDICES="24,25,26,27"
+PIM_LAYER_INDICES="6,13,20,27"
 
 # -- 训练超参 --
 # 2 卡保持与 4 卡主实验相同的有效 batch: 4 x 16 x 2 = 128
@@ -78,11 +78,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_noconf_last4"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s8_uniform4_top3part_12slot_nogist_edr_parttag_topk1"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_noconf_last4"
+SWANLAB_RUN_NAME="s8_uniform4_top3part_12slot_nogist_edr_parttag_topk1"
 
 # -- 恢复训练 --
 RESUME_FROM=""
