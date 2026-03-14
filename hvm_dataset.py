@@ -64,6 +64,8 @@ class HVMDataset(Dataset):
         train_config: Optional[TrainConfig] = None,
         max_len: int = 2048,
         shuffle_rag: bool = False,
+        shuffle_gme: bool = False,
+        shuffle_cdm: bool = False,
         is_eval: bool = False,
         split: str = "train",  # 新增: train, val, test, test_holdout
         part_num_refs: int = 1,
@@ -86,6 +88,8 @@ class HVMDataset(Dataset):
         self.token_config = token_config
         self.train_config = train_config or TrainConfig()
         self.shuffle_rag = shuffle_rag
+        self.shuffle_gme = shuffle_gme
+        self.shuffle_cdm = shuffle_cdm
         self.is_eval = is_eval
         self.split = split
         self.part_num_refs = max(1, int(part_num_refs))
@@ -479,15 +483,31 @@ class HVMDataset(Dataset):
             donor_rag = self.idx_to_rag[donor_idx]
             ref_indices = donor_rag["ref_indices"]
 
+        # GME 用的 ref indices（可能被单独 shuffle）
+        gme_ref_indices = ref_indices
+        if self.shuffle_gme and not self.shuffle_rag:
+            gme_donor_idx = idx
+            while gme_donor_idx == idx:
+                gme_donor_idx = random.choice(self.valid_indices)
+            gme_ref_indices = self.idx_to_rag[gme_donor_idx]["ref_indices"]
+
+        # CDM 用的 ref indices（可能被单独 shuffle）
+        cdm_ref_indices = ref_indices
+        if self.shuffle_cdm and not self.shuffle_rag:
+            cdm_donor_idx = idx
+            while cdm_donor_idx == idx:
+                cdm_donor_idx = random.choice(self.valid_indices)
+            cdm_ref_indices = self.idx_to_rag[cdm_donor_idx]["ref_indices"]
+
         # 3 张参考图的整图 features (for GME)
-        ref_features = [self._load_ref_feature(ri) for ri in ref_indices]
+        ref_features = [self._load_ref_feature(ri) for ri in gme_ref_indices]
 
         # part refs 的逐 group 渲染特征 (for PME / part-grounded CDM)
-        ref_best_group_data = self._load_part_group_bundle(ref_indices)
+        ref_best_group_data = self._load_part_group_bundle(cdm_ref_indices)
 
-        # 参考文本 (拼接 3 个参考的描述) — 也用 donor 的
+        # 参考文本 (拼接 3 个参考的描述)
         ref_texts = []
-        for ri in ref_indices:
+        for ri in gme_ref_indices:
             ref_meta = self._get_ref_meta(ri)
             ref_desc = ref_meta.get("description", "")
             if ref_desc:

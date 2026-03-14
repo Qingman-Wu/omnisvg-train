@@ -520,6 +520,8 @@ def train(args):
         train_config=config.training,
         max_len=config.training.max_seq_length,
         shuffle_rag=args.shuffle_rag,
+        shuffle_gme=args.shuffle_gme,
+        shuffle_cdm=args.shuffle_cdm,
         part_num_refs=args.part_num_refs,
     )
 
@@ -766,6 +768,10 @@ def train(args):
         accelerator.print(f"  Val eval every: {args.eval_every} steps")
     if args.shuffle_rag:
         accelerator.print(f"  *** SHUFFLE RAG ABLATION: ref loaded from random donor sample (global, 100% mismatch) ***")
+    if args.shuffle_gme:
+        accelerator.print(f"  *** SHUFFLE GME ABLATION: GME ref_features from random donor, CDM uses correct refs ***")
+    if args.shuffle_cdm:
+        accelerator.print(f"  *** SHUFFLE CDM ABLATION: CDM part_features from random donor, GME uses correct refs ***")
     accelerator.print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -1120,6 +1126,12 @@ def parse_args():
     parser.add_argument("--shuffle_rag", action="store_true", default=False,
                         help="Shuffle ref_features within batch (ablation: break RAG correspondence). "
                              "If GME still helps with shuffled refs, the benefit is from extra params, not RAG info.")
+    parser.add_argument("--shuffle_gme", action="store_true", default=False,
+                        help="Only shuffle GME input (ref_features from random donor). "
+                             "CDM still receives correct part features. Isolates GME path contribution.")
+    parser.add_argument("--shuffle_cdm", action="store_true", default=False,
+                        help="Only shuffle CDM input (part_features from random donor). "
+                             "GME still receives correct ref_features. Isolates CDM/EDR path contribution.")
 
     args = parser.parse_args()
 

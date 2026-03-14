@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / Top3 part + 12-slot + EDR top12)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Top3 part + 12-slot + EDR top1)
 # =============================================================================
 #
 # 使用方法:
@@ -9,7 +9,7 @@
 #
 # 默认实验:
 #   Top3 refs × 4 groups/ref = 12 groups
-#   group-wise CDM(part-tag, no-gist) + EDR(E1 top12) + last4 + adaptive
+#   group-wise CDM(part-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
 #   每个 group 经过共享 CDM 后仅输出 1 个 slot:
 #       12 groups × 1 slot/group = 12 detail slots
 #   group_id 采用全局编号:
@@ -51,11 +51,11 @@ CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
 CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
-CDM_DISABLE_GIST=true
+
 CDM_DISABLE_TAG_META=false
 CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
-EDR_TOP_K=12
+EDR_TOP_K=1
 EDR_DISABLE_CONF=false
 EDR_RANDOM_REPLACE_TOP1=false
 MEMORY_MODE="gme_cdm_edr"
@@ -98,6 +98,8 @@ EVAL_EVERY=500
 # -- Ablation --
 DISABLE_HVM=false
 SHUFFLE_RAG=false
+SHUFFLE_GME=false
+SHUFFLE_CDM=false
 DELTA_LN=false
 
 # ===================== 解析命令行覆盖 =====================
@@ -146,6 +148,8 @@ while [[ $# -gt 0 ]]; do
         --no_val)         VAL_DATA_DIR=""; VAL_HVM_DIR=""; shift 1 ;;
         --disable_hvm)    DISABLE_HVM=true;          shift 1 ;;
         --shuffle_rag)    SHUFFLE_RAG=true;          shift 1 ;;
+        --shuffle_gme)    SHUFFLE_GME=true;          shift 1 ;;
+        --shuffle_cdm)    SHUFFLE_CDM=true;          shift 1 ;;
         --delta_ln)       DELTA_LN=true;             shift 1 ;;
         --dra_d_inner)    DRA_D_INNER="$2";          shift 2 ;;
         --dra_n_heads)    DRA_N_HEADS="$2";          shift 2 ;;
@@ -219,6 +223,12 @@ if [ "$DISABLE_HVM" = true ]; then
 fi
 if [ "$SHUFFLE_RAG" = true ]; then
     echo "  *** SHUFFLE RAG ABLATION: ref correspondence broken ***"
+fi
+if [ "$SHUFFLE_GME" = true ]; then
+    echo "  *** SHUFFLE GME ABLATION: GME gets random refs, CDM correct ***"
+fi
+if [ "$SHUFFLE_CDM" = true ]; then
+    echo "  *** SHUFFLE CDM ABLATION: CDM gets random parts, GME correct ***"
 fi
 if [ "$DELTA_LN" = true ]; then
     echo "  *** DELTA LAYERNORM: enabled ***"
@@ -315,6 +325,14 @@ fi
 
 if [ "$SHUFFLE_RAG" = true ]; then
     TRAIN_ARGS+=(--shuffle_rag)
+fi
+
+if [ "$SHUFFLE_GME" = true ]; then
+    TRAIN_ARGS+=(--shuffle_gme)
+fi
+
+if [ "$SHUFFLE_CDM" = true ]; then
+    TRAIN_ARGS+=(--shuffle_cdm)
 fi
 
 if [ "$DELTA_LN" = true ]; then
