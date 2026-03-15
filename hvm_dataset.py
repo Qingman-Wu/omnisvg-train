@@ -41,6 +41,47 @@ GROUPS_PER_REFERENCE = 4
 DEFAULT_MAX_GROUPS = GROUPS_PER_REFERENCE
 
 
+def _extract_precompute_scale(path: Path) -> int:
+    """从 hvm_precomputed_* 目录名中提取数据规模，未命中时返回 -1。"""
+    import re
+
+    match = re.search(r"hvm_precomputed_(\d+)w", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _iter_eval_ref_metadata_candidates(hvm_dir: str) -> List[Path]:
+    """
+    为 eval 模式挑选 ref metadata 候选路径。
+
+    优先级:
+      1. nozoom + top3part
+      2. nozoom
+      3. legacy 非 nozoom
+    同一类别下优先选择更大规模的预计算目录（例如 22w/25w 优先于 1w）。
+    """
+    sibling_dir = Path(hvm_dir).resolve().parent
+    patterns = [
+        "hvm_precomputed_*w_nozoom_top3part/metadata.jsonl",
+        "hvm_precomputed_*w_nozoom/metadata.jsonl",
+        "hvm_precomputed_*w/metadata.jsonl",
+    ]
+
+    ordered: List[Path] = []
+    seen = set()
+    for pattern in patterns:
+        matches = sorted(
+            sibling_dir.glob(pattern),
+            key=lambda path: (_extract_precompute_scale(path.parent), path.parent.name),
+            reverse=True,
+        )
+        for path in matches:
+            path_str = str(path)
+            if path_str not in seen:
+                ordered.append(path)
+                seen.add(path_str)
+    return ordered
+
+
 class HVMDataset(Dataset):
     """
     HVM-SVG 训练/验证数据集。
@@ -123,16 +164,21 @@ class HVMDataset(Dataset):
         # 在 __init__（主进程）中预加载，fork 后 worker 自动共享，不再重复加载
         self._ref_meta_cache: Dict[int, Dict] = {}
         if is_eval:
-            ref_meta_path = os.path.join(
-                os.path.dirname(hvm_dir), "hvm_precomputed_1w", "metadata.jsonl"
-            )
-            if os.path.exists(ref_meta_path):
-                print(f"[HVM Dataset] Pre-loading full ref metadata...")
+            ref_meta_path = None
+            for candidate in _iter_eval_ref_metadata_candidates(hvm_dir):
+                if candidate.exists():
+                    ref_meta_path = candidate
+                    break
+
+            if ref_meta_path is not None:
+                print(f"[HVM Dataset] Pre-loading ref metadata from {ref_meta_path}...")
                 with open(ref_meta_path) as f:
                     for line in f:
                         r = json.loads(line)
                         self._ref_meta_cache[r["idx"]] = r
                 print(f"[HVM Dataset] Loaded {len(self._ref_meta_cache)} ref metadata entries")
+            else:
+                print("[HVM Dataset] Warning: no sibling precomputed metadata found for eval refs.")
 
         # 有效的样本 indices (必须同时有 metadata, rag, groups, features)
         self.valid_indices = self._build_valid_indices()

@@ -890,9 +890,9 @@ def parse_args():
     p.add_argument("--save_refs", action="store_true", default=False,
                    help="保存参考样本 SVG")
     p.add_argument("--shuffle_gme", action="store_true", default=False,
+                   help="Shuffle GME ref_features (ablation): GME gets random donor refs, CDM keeps correct parts")
     p.add_argument("--shuffle_cdm", action="store_true", default=False,
                    help="Shuffle CDM group_features (ablation): CDM gets random donor parts, GME keeps correct refs")
-                   help="Shuffle GME ref_features (ablation): GME gets random donor refs, CDM keeps correct parts")
     p.add_argument("--resume", action="store_true", default=False,
                    help="跳过已经生成的样本 (断点续推)")
 
