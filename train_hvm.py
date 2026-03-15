@@ -1194,8 +1194,8 @@ def parse_args():
             "--cdm_num_queries == --cdm_group_queries_per_group * --pme_max_groups "
             f"(got {args.cdm_num_queries} vs {args.cdm_group_queries_per_group}*{args.pme_max_groups})."
         )
-    if args.edr_disable_gist and args.memory_mode != "gme_cdm_edr":
-        parser.error("--edr_disable_gist is only supported when memory_mode='gme_cdm_edr'.")
+    if args.edr_disable_gist and args.memory_mode not in ("gme_cdm_edr", "gme_cdm"):
+        parser.error("--edr_disable_gist is only supported when memory_mode is 'gme_cdm_edr' or 'gme_cdm'.")
     if args.edr_random_replace_top1:
         if args.memory_mode != "gme_cdm_edr":
             parser.error("--edr_random_replace_top1 is only supported when memory_mode='gme_cdm_edr'.")

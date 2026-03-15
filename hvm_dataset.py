@@ -104,15 +104,10 @@ class HVMDataset(Dataset):
         self.metadata = self._load_jsonl(os.path.join(hvm_dir, "metadata.jsonl"))
         
         # 根据 split 自动选择对应的 jsonl 文件
-        if split == "train":
-            rag_file = "rag_results_train.jsonl"
-            groups_file = "groups_train_ref.jsonl"
-        elif split == "test_holdout":
-            # 测试集 holdout 数据，文件名与 train 保持一致（因为是独立的目录）
+        if split in ("train", "val", "test_holdout"):
             rag_file = "rag_results_train.jsonl"
             groups_file = "groups_train_ref.jsonl"
         else:
-            # 默认 fallback
             rag_file = "rag_results.jsonl"
             groups_file = "groups.jsonl"
             

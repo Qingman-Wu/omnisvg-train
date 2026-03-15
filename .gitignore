@@ -55,3 +55,6 @@ inference/output*/
 metrics/metrics_results/
 analysis/
 docs/
+
+environment_omnisvg.yml
+requirements_omnisvg.txt

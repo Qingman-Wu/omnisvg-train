@@ -1788,6 +1788,7 @@ class CDMInjectionModule(nn.Module):
     def __init__(self, config: HVMConfig):
         super().__init__()
         d = config.d_model
+        self.enable_gist = not bool(config.edr_disable_gist)
 
         self.hidden_norm = nn.LayerNorm(d)
 
@@ -1811,13 +1812,17 @@ class CDMInjectionModule(nn.Module):
     ) -> torch.Tensor:
         query = self.hidden_norm(hidden_state)
 
-        delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+        if self.enable_gist:
+            delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
+            gate_gist = torch.tanh(self.alpha_gist)
+            inject_gist = gate_gist * delta_gist
+        else:
+            delta_gist = torch.zeros_like(hidden_state)
+            gate_gist = torch.tensor(0.0, device=hidden_state.device, dtype=hidden_state.dtype)
+            inject_gist = torch.zeros_like(hidden_state)
+
         delta_detail = self.detail_cross_attn(q=query, k=detail_feats, v=detail_feats)
-
-        gate_gist = torch.tanh(self.alpha_gist)
         gate_detail = torch.tanh(self.alpha_detail)
-
-        inject_gist = gate_gist * delta_gist
         inject_detail = gate_detail * delta_detail
         injection = inject_gist + inject_detail
 
@@ -1832,6 +1837,7 @@ class CDMInjectionModule(nn.Module):
             self.last_stats = {
                 "gate_gist": gate_gist.detach().float(),
                 "gate_detail": gate_detail.detach().float(),
+                "gist_enabled": float(self.enable_gist),
                 "delta_gist_rms": delta_gist_rms,
                 "delta_detail_rms": delta_detail_rms,
                 "inject_gist_rms": inject_gist_rms,
