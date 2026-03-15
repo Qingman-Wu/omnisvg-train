@@ -41,6 +41,7 @@ import json
 import os
 import sys
 import time
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -714,16 +715,37 @@ def run_on_single_gpu(
         tag = "hvm"
         t_gen = time.time()
 
+        # shuffle_gme ablation: GME gets random donor's ref_features
+        gme_ref_features = sample["ref_features"]
+        if args.shuffle_gme:
+            donor_idx = idx
+            while donor_idx == idx:
+                donor_idx = random.choice(range(len(dataset)))
+            gme_ref_features = dataset[donor_idx]["ref_features"]
+
+        # shuffle_cdm ablation: CDM gets random donor's group features
+        cdm_group_features = sample["ref_best_group_features"]
+        cdm_tag_meta = sample.get("ref_best_group_tag_meta")
+        cdm_group_ids = sample.get("ref_best_group_ids")
+        if args.shuffle_cdm:
+            cdm_donor_idx = idx
+            while cdm_donor_idx == idx:
+                cdm_donor_idx = random.choice(range(len(dataset)))
+            cdm_donor = dataset[cdm_donor_idx]
+            cdm_group_features = cdm_donor["ref_best_group_features"]
+            cdm_tag_meta = cdm_donor.get("ref_best_group_tag_meta")
+            cdm_group_ids = cdm_donor.get("ref_best_group_ids")
+
         set_hvm_memory(
             hvm_model,
-            ref_features=sample["ref_features"],
-            group_features=sample["ref_best_group_features"],
+            ref_features=gme_ref_features,
+            group_features=cdm_group_features,
             ref_text=sample["ref_text"],
             tokenizer=tokenizer,
             hvm_config=hvm_config,
             device=device,
-            group_tag_meta=sample.get("ref_best_group_tag_meta"),
-            group_ids=sample.get("ref_best_group_ids"),
+            group_tag_meta=cdm_tag_meta,
+            group_ids=cdm_group_ids,
         )
 
         actual_num = args.num_candidates + EXTRA_CANDIDATES_BUFFER
@@ -867,6 +889,10 @@ def parse_args():
                    help="保存 Ground Truth SVG")
     p.add_argument("--save_refs", action="store_true", default=False,
                    help="保存参考样本 SVG")
+    p.add_argument("--shuffle_gme", action="store_true", default=False,
+    p.add_argument("--shuffle_cdm", action="store_true", default=False,
+                   help="Shuffle CDM group_features (ablation): CDM gets random donor parts, GME keeps correct refs")
+                   help="Shuffle GME ref_features (ablation): GME gets random donor refs, CDM keeps correct parts")
     p.add_argument("--resume", action="store_true", default=False,
                    help="跳过已经生成的样本 (断点续推)")
 
