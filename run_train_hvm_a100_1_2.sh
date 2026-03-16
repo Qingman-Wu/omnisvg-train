@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / Top3 part + 12-slot + EDR top1 + no-tag)
+# HVM-SVG 训练启动脚本 (A100_1_2 / Full-data ablation / only-detail + EDR)
 # =============================================================================
 #
 # 使用方法:
@@ -8,11 +8,12 @@
 #   CUDA_VISIBLE_DEVICES=3,4,5 bash run_train_hvm_a100_1_2.sh --num_gpus 3
 #
 # 默认实验:
+#   1w ablation on the first parquet (train-00000-of-00026_white.parquet)
 #   Top3 refs × 4 groups/ref = 12 groups
-#   group-wise CDM(no-tag, no-gist) + EDR(E1 top1) + last4 + adaptive
-#   每个 group 经过共享 CDM 后仅输出 1 个 slot:
-#       12 groups × 1 slot/group = 12 detail slots
-#   用于结构标签消融，固定 12-slot 以避免与容量因素混淆
+#   功能等价版 only-detail + EDR:
+#       - CDM 仍使用 part-tag, no-gist
+#       - EDR 只保留 detail 路，由 routed_detail 注入 hidden
+#       - GME 仍会前向计算，但 gist 不再传给 CDM/EDR 使用
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -29,8 +30,8 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 NUM_GPUS=4
 
 # -- 数据 --
-DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_retrieval_corpus"
-HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process"
+HVM_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -55,13 +56,14 @@ CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
 EDR_TOP_K=1
 EDR_DISABLE_CONF=false
+EDR_DISABLE_GIST=true
 MEMORY_MODE="gme_cdm_edr"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 3 卡保持与 6 卡主实验接近的有效 batch: 4 x 8 x 3 = 96
+# 4 卡 1w 消融保持有效 batch: 4 x 8 x 4 = 128
 BATCH_SIZE=4
 GRAD_ACCUM=8
 EPOCHS=30000
@@ -77,19 +79,19 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data2/wuqingman/omnisvg-train/outputs_s8_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_OnlyDetailEdr_top3part_12slot_nogist_parttag_nozoom_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s8_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
+SWANLAB_RUN_NAME="s10_OnlyDetailEdr_top3part_12slot_nogist_parttag_nozoom_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
 HVM_CHECKPOINT=""
 
 # -- 验证集 --
-VAL_DATA_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
-VAL_HVM_DIR="/mnt/a100_4_data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
+VAL_DATA_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_val"
+VAL_HVM_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_val_nozoom_top3part"
 EVAL_EVERY=500
 
 # -- Ablation --
@@ -128,6 +130,8 @@ while [[ $# -gt 0 ]]; do
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
+        --edr_disable_gist) EDR_DISABLE_GIST=true;   shift 1 ;;
+        --no_edr_disable_gist) EDR_DISABLE_GIST=false; shift 1 ;;
         --memory_mode)    MEMORY_MODE="$2";          shift 2 ;;
         --inject_mode)    INJECT_MODE="$2";          shift 2 ;;
         --inject_scale)   INJECT_SCALE="$2";         shift 2 ;;
@@ -247,6 +251,7 @@ if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
     echo "  EDR top-k:         ${EDR_TOP_K}"
     echo "  EDR disable conf:  ${EDR_DISABLE_CONF}"
+    echo "  EDR disable gist:  ${EDR_DISABLE_GIST}"
 fi
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:       ${RESUME_FROM}"
@@ -343,6 +348,10 @@ fi
 
 if [ "$EDR_DISABLE_CONF" = true ]; then
     TRAIN_ARGS+=(--edr_disable_conf)
+fi
+
+if [ "$EDR_DISABLE_GIST" = true ]; then
+    TRAIN_ARGS+=(--edr_disable_gist)
 fi
 
 if [ "$CDM_DISABLE_GIST" = true ]; then

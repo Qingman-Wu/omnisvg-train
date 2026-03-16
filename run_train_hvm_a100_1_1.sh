@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / Final Full Train / Top3 part + 12-slot + EDR top1)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Full-data ablation / GME+CDM without EDR)
 # =============================================================================
 #
 # 使用方法:
@@ -8,14 +8,13 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2 bash run_train_hvm_a100_1_1.sh --num_gpus 3
 #
 # 默认实验:
-#   Final full training on 25 parquet files (exclude train-00025-of-00026_white.parquet)
+#   1w ablation on the first parquet (train-00000-of-00026_white.parquet)
 #   Top3 refs × 4 groups/ref = 12 groups
-#   group-wise CDM(part-tag, no-gist) + EDR(top1) + last4 + adaptive
-#   每个 group 经过共享 CDM 后仅输出 1 个 slot:
-#       12 groups × 1 slot/group = 12 detail slots
-#   group_id 采用全局编号:
-#       ref0 -> 0,1,2,3; ref1 -> 4,5,6,7; ref2 -> 8,9,10,11
-#   用于最终全量主实验默认配置
+#   GME + group-wise CDM(part-tag, no-gist) + last4 + adaptive
+#   不经过 EDR/router:
+#       gist_feats 与 hidden 做 cross-attn -> delta_gist
+#       12 detail slots 与 hidden 做 cross-attn -> delta_detail
+#       两路各自 gate 后相加注入 hidden
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -29,12 +28,11 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=8
+NUM_GPUS=4
 
 # -- 数据 --
-# 目录名虽保留 22w，但当前内容是前 25 个 parquet（共 250k train samples）的 nozoom top3part 预计算结果
-DATA_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process_train25_exclude_p25"
-HVM_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_22w_nozoom_top3part"
+DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process"
+HVM_DIR="/mnt/data3/wuqingman/datasets/OmniSVG/MMSVG-Illustration/hvm_precomputed_1w_nozoom_top3part"
 
 # -- 模型 --
 MODEL_SIZE="8B"
@@ -60,20 +58,21 @@ EDR_D_ROUTER=256
 EDR_TOP_K=1
 EDR_DISABLE_CONF=false
 EDR_RANDOM_REPLACE_TOP1=false
-MEMORY_MODE="gme_cdm_edr"
+EDR_DISABLE_GIST=false
+MEMORY_MODE="gme_cdm"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 8 卡保持与 4 卡主实验一致的有效 batch: 4 x 4 x 8 = 128
+# 4 卡 1w 消融保持有效 batch: 4 x 8 x 4 = 128
 BATCH_SIZE=4
-GRAD_ACCUM=4
-EPOCHS=2
+GRAD_ACCUM=8
+EPOCHS=30000
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
 MAX_GRAD_NORM=1.0
-WARMUP_STEPS=200
+WARMUP_STEPS=100
 SEED=42
 MIXED_PRECISION="bf16"
 ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
@@ -82,11 +81,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s9_full25w_top3part_12slot_nogist_edr_parttag_nozoom_last4"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
 LOG_EVERY=10
-SAVE_EVERY=1000
+SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s9_full25w_top3part_12slot_nogist_edr_parttag_nozoom_last4"
+SWANLAB_RUN_NAME="s10_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -133,6 +132,8 @@ while [[ $# -gt 0 ]]; do
         --edr_d_router)   EDR_D_ROUTER="$2";         shift 2 ;;
         --edr_top_k)      EDR_TOP_K="$2";            shift 2 ;;
         --edr_disable_conf) EDR_DISABLE_CONF=true;   shift 1 ;;
+        --edr_disable_gist) EDR_DISABLE_GIST=true;   shift 1 ;;
+        --no_edr_disable_gist) EDR_DISABLE_GIST=false; shift 1 ;;
         --edr_random_replace_top1) EDR_RANDOM_REPLACE_TOP1=true; shift 1 ;;
         --memory_mode)    MEMORY_MODE="$2";          shift 2 ;;
         --inject_mode)    INJECT_MODE="$2";          shift 2 ;;
@@ -249,6 +250,9 @@ if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM disable tag:   ${CDM_DISABLE_TAG_META}"
     echo "  CDM disable gid:   ${CDM_DISABLE_GROUP_ID}"
 fi
+if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
+    echo "  Detail gist off:   ${EDR_DISABLE_GIST}"
+fi
 if [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  EDR d_router:      ${EDR_D_ROUTER}"
     echo "  EDR top-k:         ${EDR_TOP_K}"
@@ -350,6 +354,10 @@ fi
 
 if [ "$EDR_DISABLE_CONF" = true ]; then
     TRAIN_ARGS+=(--edr_disable_conf)
+fi
+
+if [ "$EDR_DISABLE_GIST" = true ]; then
+    TRAIN_ARGS+=(--edr_disable_gist)
 fi
 
 if [ "$EDR_RANDOM_REPLACE_TOP1" = true ]; then
