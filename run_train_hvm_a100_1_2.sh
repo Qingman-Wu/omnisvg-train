@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_2 / Full-data ablation / only-detail + EDR)
+# HVM-SVG 训练启动脚本 (A100_1_2 / Experiment 48 / Dense Global+Local direct attention)
 # =============================================================================
 #
 # 使用方法:
@@ -10,10 +10,10 @@
 # 默认实验:
 #   1w ablation on the first parquet (train-00000-of-00026_white.parquet)
 #   Top3 refs × 4 groups/ref = 12 groups
-#   功能等价版 only-detail + EDR:
-#       - CDM 仍使用 part-tag, no-gist
-#       - EDR 只保留 detail 路，由 routed_detail 注入 hidden
-#       - GME 仍会前向计算，但 gist 不再传给 CDM/EDR 使用
+#   Dense Global+Local direct attention:
+#       - Global 路: top3 whole-image raw ref tokens 直接和 hidden cross-attn
+#       - Local 路: top3 part raw tokens + part-tag/group_id 后直接和 hidden cross-attn
+#       - 两路各自 gate 后相加注入，不经过 GME / CDM / EDR 压缩与路由
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -50,22 +50,22 @@ CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
 CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
-CDM_DISABLE_GIST=true
+CDM_DISABLE_GIST=false
 CDM_DISABLE_TAG_META=false
 CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
 EDR_TOP_K=1
 EDR_DISABLE_CONF=false
-EDR_DISABLE_GIST=true
-MEMORY_MODE="gme_cdm_edr"
+EDR_DISABLE_GIST=false
+MEMORY_MODE="dense_global_local"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 4 卡 1w 消融保持有效 batch: 4 x 8 x 4 = 128
-BATCH_SIZE=4
-GRAD_ACCUM=8
+# 7 卡默认保持接近原 4 卡等效 batch: 3 x 6 x 7 = 126 (~128)
+BATCH_SIZE=3
+GRAD_ACCUM=6
 EPOCHS=30000
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
@@ -79,11 +79,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_OnlyDetailEdr_top3part_12slot_nogist_parttag_nozoom_last4"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_dense_global_local_top3part_parttag_nozoom_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s10_OnlyDetailEdr_top3part_12slot_nogist_parttag_nozoom_last4"
+SWANLAB_RUN_NAME="s10_dense_global_local_top3part_parttag_nozoom_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -236,6 +236,11 @@ fi
 if [ "$MEMORY_MODE" = "gme_dra" ]; then
     echo "  DRA d_inner:       ${DRA_D_INNER:-128}"
     echo "  DRA n_heads:       ${DRA_N_HEADS:-4}"
+fi
+if [ "$MEMORY_MODE" = "dense_global_local" ]; then
+    echo "  Dense baseline:    raw global refs + raw local parts"
+    echo "  Local disable tag: ${CDM_DISABLE_TAG_META}"
+    echo "  Local disable gid: ${CDM_DISABLE_GROUP_ID}"
 fi
 if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM queries:       ${CDM_NUM_QUERIES}"

@@ -78,7 +78,7 @@ class HVMConfig:
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
     gate_alpha_init: float = 0.05  # 冷启动更平滑: tanh(0.05)≈0.05，避免 PIM 主干梯度过弱
-    memory_mode: str = "full"      # full: GME+PME+full PIM, gme: Stage1 简化路径
+    memory_mode: str = "full"      # full/gme/.../gme_cdm_edr/dense_global_local
     inject_mode: str = "adaptive"  # adaptive: gate 注入, fixed: 固定缩放注入
     inject_scale: float = 0.1      # inject_mode=fixed 时生效
     pim_layer_indices_override: Optional[List[int]] = None
@@ -168,6 +168,25 @@ def build_detail_slot_mask(
         slot_mask = slot_mask.clone()
         slot_mask[empty_rows, 0] = True
     return slot_mask
+
+
+def build_group_token_mask(
+    part_mask: Optional[torch.Tensor],
+    group_token_count: int,
+    device: torch.device,
+    batch_size: int,
+    num_groups: int,
+) -> torch.Tensor:
+    if part_mask is None:
+        return torch.ones(batch_size, num_groups * group_token_count, device=device, dtype=torch.bool)
+
+    token_mask = part_mask.to(device=device, dtype=torch.bool).unsqueeze(-1)
+    token_mask = token_mask.expand(-1, -1, group_token_count).reshape(batch_size, -1)
+    empty_rows = ~token_mask.any(dim=-1)
+    if empty_rows.any():
+        token_mask = token_mask.clone()
+        token_mask[empty_rows, 0] = True
+    return token_mask
 
 
 # ============================================================================
@@ -822,6 +841,72 @@ class GroupwiseCDMEncoder(nn.Module):
             }
 
         return detail_feats
+
+
+# ============================================================================
+# Dense Local Token Encoder
+# ============================================================================
+
+class DenseLocalTokenEncoder(nn.Module):
+    """
+    将 top-k part features 直接展平成 raw local tokens。
+
+    与 CDM 不同，这里不做任何 query 压缩或路由，只做两件事：
+      - 为每个 group 的 256 个 tokens 注入共享的 tag/group embedding
+      - 生成展平后的 token 序列与对应的 token mask
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        self.config = config
+        d_q = config.d_qformer
+        self.group_id_embedding = nn.Embedding(config.pme_max_groups, config.d_model)
+        self.tag_meta_mlp = nn.Sequential(
+            nn.Linear(config.cdm_tag_meta_dim, d_q),
+            nn.GELU(),
+            nn.Linear(d_q, config.d_model),
+        )
+        self.output_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        part_features: torch.Tensor,
+        part_tag_meta: Optional[torch.Tensor] = None,
+        part_group_ids: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if part_features.ndim != 4:
+            raise ValueError(
+                f"DenseLocalTokenEncoder expects part features [B, G, T, D], got {tuple(part_features.shape)}"
+            )
+
+        B, G, T, D = part_features.shape
+        device = part_features.device
+        dtype = part_features.dtype
+        tag_emb = build_cdm_tag_embedding(
+            config=self.config,
+            tag_meta_mlp=self.tag_meta_mlp,
+            group_id_embedding=self.group_id_embedding,
+            part_tag_meta=part_tag_meta,
+            part_group_ids=part_group_ids,
+            part_mask=part_mask,
+            dtype=dtype,
+            device=device,
+            batch_size=B,
+            num_groups=G,
+            out_dim=D,
+        )
+        tagged_tokens = self.output_norm(part_features + tag_emb.unsqueeze(2))
+        token_mask = build_group_token_mask(
+            part_mask=part_mask,
+            group_token_count=T,
+            device=device,
+            batch_size=B,
+            num_groups=G,
+        )
+        flat_tokens = tagged_tokens.reshape(B, G * T, D)
+        flat_tokens = flat_tokens * token_mask.to(dtype=flat_tokens.dtype).unsqueeze(-1)
+        return flat_tokens, token_mask
 
 
 # ============================================================================
@@ -1482,6 +1567,81 @@ class DRAInjectionModule(nn.Module):
                 "delta_ref_rms": delta_ref_rms,
                 "inject_gist_rms": inject_gist_rms,
                 "inject_ref_rms": inject_ref_rms,
+                "delta_rms": delta_rms,
+                "inject_rms": inject_rms,
+                "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),
+            }
+
+        return hidden_state + injection
+
+
+# ============================================================================
+# Dense Global + Local Raw Token Injection Module
+# ============================================================================
+
+class DenseGlobalLocalAttentionInjectionModule(nn.Module):
+    """
+    直接把 raw global/local visual tokens 注入 decoder。
+
+    - Global 路: hidden × flattened top3 whole-image ref tokens
+    - Local 路:  hidden × flattened top3 part tokens (+tag/group_id)
+    - 两路各自独立 gate 后相加注入 hidden
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        d = config.d_model
+
+        self.hidden_norm = nn.LayerNorm(d)
+        self.global_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.local_cross_attn = MultiHeadAttention(
+            d, config.pim_num_heads, d_inner=config.d_pim_inner,
+        )
+        self.alpha_global = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.alpha_local = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        global_ref_feats: torch.Tensor,
+        local_part_feats: torch.Tensor,
+        local_part_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.hidden_norm(hidden_state)
+
+        delta_global = self.global_cross_attn(q=query, k=global_ref_feats, v=global_ref_feats)
+        delta_local = self.local_cross_attn(
+            q=query,
+            k=local_part_feats,
+            v=local_part_feats,
+            kv_mask=local_part_mask,
+        )
+
+        gate_global = torch.tanh(self.alpha_global)
+        gate_local = torch.tanh(self.alpha_local)
+
+        inject_global = gate_global * delta_global
+        inject_local = gate_local * delta_local
+        injection = inject_global + inject_local
+
+        with torch.no_grad():
+            hidden_rms = hidden_state.detach().float().pow(2).mean().sqrt()
+            delta_global_rms = delta_global.detach().float().pow(2).mean().sqrt()
+            delta_local_rms = delta_local.detach().float().pow(2).mean().sqrt()
+            inject_global_rms = inject_global.detach().float().pow(2).mean().sqrt()
+            inject_local_rms = inject_local.detach().float().pow(2).mean().sqrt()
+            delta_rms = (delta_global + delta_local).detach().float().pow(2).mean().sqrt()
+            inject_rms = injection.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "gate_global": gate_global.detach().float(),
+                "gate_local": gate_local.detach().float(),
+                "delta_global_rms": delta_global_rms,
+                "delta_local_rms": delta_local_rms,
+                "inject_global_rms": inject_global_rms,
+                "inject_local_rms": inject_local_rms,
                 "delta_rms": delta_rms,
                 "inject_rms": inject_rms,
                 "inject_hidden_ratio": inject_rms / (hidden_rms + 1e-6),

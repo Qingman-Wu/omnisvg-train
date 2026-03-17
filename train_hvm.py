@@ -752,6 +752,10 @@ def train(args):
             accelerator.print(f"  CDM disable gist: {hvm_config.cdm_disable_gist}")
             accelerator.print(f"  CDM use tag meta: {hvm_config.cdm_use_tag_meta}")
             accelerator.print(f"  CDM use group id: {hvm_config.cdm_use_group_id}")
+        if hvm_config.memory_mode == "dense_global_local":
+            accelerator.print("  Dense baseline: raw global refs + raw local parts")
+            accelerator.print(f"  Local use tag meta: {hvm_config.cdm_use_tag_meta}")
+            accelerator.print(f"  Local use group id: {hvm_config.cdm_use_group_id}")
         if hvm_config.memory_mode == "gme_cdm_edr":
             accelerator.print(f"  EDR d_router: {hvm_config.edr_d_router}")
             accelerator.print(f"  EDR top-k: {hvm_config.edr_top_k}")
@@ -1016,13 +1020,14 @@ def parse_args():
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
     parser.add_argument("--memory_mode", type=str, default="full",
-                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr"],
+                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr", "dense_global_local"],
                         help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), "
                              "gme_pme_dual (GME+PME dual gate), gme_pme_hier (GME+PME hierarchical fusion + dual gate), "
                              "gme_pme_single (GME+PME hierarchical fusion + single path injection), "
                              "gme_dra (GME + Direct Reference Attention), "
                              "gme_cdm (GME + Complementary Detail Memory), "
-                             "gme_cdm_edr (GME + CDM + Execution-aware Detail Router).")
+                             "gme_cdm_edr (GME + CDM + Execution-aware Detail Router), "
+                             "dense_global_local (raw global/local visual tokens direct attention).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -1184,6 +1189,8 @@ def parse_args():
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "dense_global_local" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='dense_global_local' currently supports only inject_mode='adaptive'.")
     if args.cdm_disable_gist and args.memory_mode not in ("gme_cdm", "gme_cdm_edr"):
         parser.error("--cdm_disable_gist is only supported when memory_mode is 'gme_cdm' or 'gme_cdm_edr'.")
     if args.cdm_layout == "groupwise" and args.cdm_detail_source != "part":

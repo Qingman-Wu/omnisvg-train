@@ -21,6 +21,7 @@ from hvm_modules import (
     HVMConfig,
     GistMemoryEncoder,
     PartMemoryEncoder,
+    DenseLocalTokenEncoder,
     PrefrontalInjectionModule,
     SimpleGMEInjectionModule,
     LayerGatedGMEInjectionModule,
@@ -33,6 +34,7 @@ from hvm_modules import (
     GroupwiseCDMEncoder,
     CDMInjectionModule,
     EDRInjectionModule,
+    DenseGlobalLocalAttentionInjectionModule,
     count_parameters,
 )
 
@@ -78,16 +80,16 @@ class HVMSketchDecoder(nn.Module):
         self._freeze_base_model()
 
         # ---- HVM Modules (trainable) ----
-        self.gme = GistMemoryEncoder(hvm_config)
+        self.gme = None if hvm_config.memory_mode == "dense_global_local" else GistMemoryEncoder(hvm_config)
+        self.pme = None
         self.cdm = None
+        self.local_token_encoder = None
         if hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "fixed":
-            self.pme = None
             self.pims = nn.ModuleList([
                 SimpleGMEInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         elif hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "adaptive":
-            self.pme = None
             self.pims = nn.ModuleList([
                 LayerGatedGMEInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
@@ -117,20 +119,23 @@ class HVMSketchDecoder(nn.Module):
                 for _ in range(hvm_config.num_pims)
             ])
         elif hvm_config.memory_mode == "gme_dra":
-            self.pme = None
             self.pims = nn.ModuleList([
                 DRAInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
+        elif hvm_config.memory_mode == "dense_global_local":
+            self.local_token_encoder = DenseLocalTokenEncoder(hvm_config)
+            self.pims = nn.ModuleList([
+                DenseGlobalLocalAttentionInjectionModule(hvm_config)
+                for _ in range(hvm_config.num_pims)
+            ])
         elif hvm_config.memory_mode == "gme_cdm":
-            self.pme = None
             self.cdm = GroupwiseCDMEncoder(hvm_config) if hvm_config.cdm_layout == "groupwise" else CDMEncoder(hvm_config)
             self.pims = nn.ModuleList([
                 CDMInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
         elif hvm_config.memory_mode == "gme_cdm_edr":
-            self.pme = None
             self.cdm = GroupwiseCDMEncoder(hvm_config) if hvm_config.cdm_layout == "groupwise" else CDMEncoder(hvm_config)
             detail_layers = set(hvm_config.edr_detail_layer_indices)
             self.pims = nn.ModuleList([
@@ -153,17 +158,21 @@ class HVMSketchDecoder(nn.Module):
         # （master weights + momentum + variance），即使模型参数是 bf16，
         # optimizer 更新也在 float32 上进行，避免小梯度 round to zero
         base_dtype = next(self.base_model.parameters()).dtype
-        self.gme = self.gme.to(dtype=base_dtype)
+        if self.gme is not None:
+            self.gme = self.gme.to(dtype=base_dtype)
         if self.pme is not None:
             self.pme = self.pme.to(dtype=base_dtype)
         if self.cdm is not None:
             self.cdm = self.cdm.to(dtype=base_dtype)
+        if self.local_token_encoder is not None:
+            self.local_token_encoder = self.local_token_encoder.to(dtype=base_dtype)
         self.pims = self.pims.to(dtype=base_dtype)
         print(f"[HVM] HVM modules dtype set to {base_dtype}")
 
         # ---- Hook management ----
         self._hooks = []
         # 当前 forward 的记忆缓存（每次 forward 开始时设置）
+        self._memory_ready = False
         self._gist_feats = None
         self._part_feats = None
         self._text_feats = None
@@ -172,6 +181,8 @@ class HVMSketchDecoder(nn.Module):
         self._ref_feats = None
         self._detail_feats = None
         self._detail_slot_mask = None
+        self._local_part_feats = None
+        self._local_part_mask = None
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
@@ -246,7 +257,7 @@ class HVMSketchDecoder(nn.Module):
         """
         def hook_fn(module, input, output):
             # 如果记忆未设置（非 HVM forward），跳过
-            if self._gist_feats is None:
+            if not self._memory_ready:
                 return output
 
             # 提取 hidden_states
@@ -258,20 +269,32 @@ class HVMSketchDecoder(nn.Module):
             # generate() with num_return_sequences>1 会扩展 batch，
             # 需要将缓存的 HVM 特征扩展到匹配的 batch size
             B = hidden_states.shape[0]
-            gist_feats = self._gist_feats.expand(B, -1, -1)
             if self.hvm_config.memory_mode == "gme":
+                gist_feats = self._gist_feats.expand(B, -1, -1)
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
                     gist_feats,
                 )
             elif self.hvm_config.memory_mode == "gme_dra":
+                gist_feats = self._gist_feats.expand(B, -1, -1)
                 ref_feats = self._ref_feats.expand(B, -1, -1)
                 hidden_states = self.pims[pim_idx](
                     hidden_states,
                     gist_feats,
                     ref_feats,
                 )
+            elif self.hvm_config.memory_mode == "dense_global_local":
+                ref_feats = self._ref_feats.expand(B, -1, -1)
+                local_part_feats = self._local_part_feats.expand(B, -1, -1)
+                local_part_mask = self._local_part_mask.expand(B, -1)
+                hidden_states = self.pims[pim_idx](
+                    hidden_states,
+                    ref_feats,
+                    local_part_feats,
+                    local_part_mask,
+                )
             elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
+                gist_feats = self._gist_feats.expand(B, -1, -1)
                 detail_feats = self._detail_feats.expand(B, -1, -1)
                 if self.hvm_config.memory_mode == "gme_cdm_edr":
                     detail_slot_mask = None
@@ -290,6 +313,7 @@ class HVMSketchDecoder(nn.Module):
                         detail_feats,
                     )
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
+                gist_feats = self._gist_feats.expand(B, -1, -1)
                 part_feats = self._part_feats.expand(B, -1, -1)
                 part_mask = self._part_mask.expand(B, -1)
                 hidden_states = self.pims[pim_idx](
@@ -299,6 +323,7 @@ class HVMSketchDecoder(nn.Module):
                     part_mask,
                 )
             else:
+                gist_feats = self._gist_feats.expand(B, -1, -1)
                 part_feats = self._part_feats.expand(B, -1, -1)
                 text_feats = self._text_feats.expand(B, -1, -1)
                 part_mask = self._part_mask.expand(B, -1)
@@ -396,10 +421,36 @@ class HVMSketchDecoder(nn.Module):
         # ================================================================
         if ref_features is not None:
             # 确定 HVM 模块的 dtype（与 base model 一致，通常为 bfloat16）
-            hvm_dtype = next(self.gme.parameters()).dtype
+            if self.gme is not None:
+                hvm_dtype = next(self.gme.parameters()).dtype
+            elif self.local_token_encoder is not None:
+                hvm_dtype = next(self.local_token_encoder.parameters()).dtype
+            else:
+                hvm_dtype = next(self.pims.parameters()).dtype
 
-            # GME: 3 张参考图 → 32 个 gist tokens
-            self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
+            self._memory_ready = True
+
+            if self.hvm_config.memory_mode == "dense_global_local":
+                if part_features is None:
+                    raise ValueError("memory_mode='dense_global_local' requires part_features.")
+                B_ref = ref_features.shape[0]
+                self._gist_feats = None
+                self._ref_feats = ref_features.to(device=device, dtype=hvm_dtype).view(B_ref, -1, ref_features.shape[-1])
+                self._local_part_feats, self._local_part_mask = self.local_token_encoder(
+                    part_features.to(device=device, dtype=hvm_dtype),
+                    part_tag_meta=part_tag_meta.to(device=device, dtype=hvm_dtype) if part_tag_meta is not None else None,
+                    part_group_ids=part_group_ids.to(device=device) if part_group_ids is not None else None,
+                    part_mask=part_mask.to(device=device, dtype=torch.bool) if part_mask is not None else None,
+                )
+                self._detail_feats = None
+                self._detail_slot_mask = None
+                self._part_feats = None
+                self._part_mask = None
+                self._text_feats = None
+                self._text_mask = None
+            else:
+                # GME: 3 张参考图 → 32 个 gist tokens
+                self._gist_feats = self.gme(ref_features.to(device=device, dtype=hvm_dtype))
 
             if self.hvm_config.memory_mode == "gme":
                 self._ref_feats = None
@@ -408,6 +459,8 @@ class HVMSketchDecoder(nn.Module):
                 self._text_feats = None
                 self._text_mask = None
                 self._detail_slot_mask = None
+                self._local_part_feats = None
+                self._local_part_mask = None
             elif self.hvm_config.memory_mode == "gme_dra":
                 # DRA: 将 [B, 3, 256, 3584] reshape 为 [B, 768, 3584] 作为原始 ref tokens
                 B_ref = ref_features.shape[0]
@@ -417,6 +470,10 @@ class HVMSketchDecoder(nn.Module):
                 self._text_feats = None
                 self._text_mask = None
                 self._detail_slot_mask = None
+                self._local_part_feats = None
+                self._local_part_mask = None
+            elif self.hvm_config.memory_mode == "dense_global_local":
+                pass
             elif self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
                 # CDM / EDR: 兼容旧版 raw-ref tokens 与新版 part-grounded tagged tokens
                 if self.hvm_config.cdm_detail_source == "part" and part_features is not None:
@@ -437,6 +494,8 @@ class HVMSketchDecoder(nn.Module):
                 self._part_mask = None
                 self._text_feats = None
                 self._text_mask = None
+                self._local_part_feats = None
+                self._local_part_mask = None
             elif self.hvm_config.memory_mode in ("gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single"):
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
@@ -448,6 +507,8 @@ class HVMSketchDecoder(nn.Module):
                 self._text_feats = None
                 self._text_mask = None
                 self._detail_slot_mask = None
+                self._local_part_feats = None
+                self._local_part_mask = None
             else:
                 gfl_on_device = [
                     [gf.to(device=device, dtype=hvm_dtype) for gf in sample_gfs]
@@ -462,8 +523,11 @@ class HVMSketchDecoder(nn.Module):
                     self._text_mask,
                 )  # [B, N_t, d_model]
                 self._detail_slot_mask = None
+                self._local_part_feats = None
+                self._local_part_mask = None
         else:
             # 没有 HVM 输入，退化为普通 OmniSVG
+            self._memory_ready = False
             self._gist_feats = None
             self._ref_feats = None
             self._detail_feats = None
@@ -472,6 +536,8 @@ class HVMSketchDecoder(nn.Module):
             self._part_mask = None
             self._text_mask = None
             self._detail_slot_mask = None
+            self._local_part_feats = None
+            self._local_part_mask = None
 
         # ================================================================
         # 2. 运行 base model forward (hooks 自动注入 PIM)
@@ -495,25 +561,32 @@ class HVMSketchDecoder(nn.Module):
     def get_trainable_parameters(self) -> List[nn.Parameter]:
         """返回所有可训练参数（只有 HVM 模块）"""
         params = []
-        params.extend(self.gme.parameters())
+        if self.gme is not None:
+            params.extend(self.gme.parameters())
         if self.pme is not None:
             params.extend(self.pme.parameters())
         if self.cdm is not None:
             params.extend(self.cdm.parameters())
+        if self.local_token_encoder is not None:
+            params.extend(self.local_token_encoder.parameters())
         params.extend(self.pims.parameters())
         return params
 
     def get_trainable_named_parameters(self) -> List[Tuple[str, nn.Parameter]]:
         """返回所有可训练的 named parameters"""
         named_params = []
-        for name, param in self.gme.named_parameters():
-            named_params.append((f"gme.{name}", param))
+        if self.gme is not None:
+            for name, param in self.gme.named_parameters():
+                named_params.append((f"gme.{name}", param))
         if self.pme is not None:
             for name, param in self.pme.named_parameters():
                 named_params.append((f"pme.{name}", param))
         if self.cdm is not None:
             for name, param in self.cdm.named_parameters():
                 named_params.append((f"cdm.{name}", param))
+        if self.local_token_encoder is not None:
+            for name, param in self.local_token_encoder.named_parameters():
+                named_params.append((f"local_token_encoder.{name}", param))
         for name, param in self.pims.named_parameters():
             named_params.append((f"pims.{name}", param))
         return named_params
@@ -521,14 +594,18 @@ class HVMSketchDecoder(nn.Module):
     def save_hvm_checkpoint(self, save_path: str):
         """只保存 HVM 模块的 checkpoint"""
         state_dict = {}
-        for name, param in self.gme.named_parameters():
-            state_dict[f"gme.{name}"] = param.data
+        if self.gme is not None:
+            for name, param in self.gme.named_parameters():
+                state_dict[f"gme.{name}"] = param.data
         if self.pme is not None:
             for name, param in self.pme.named_parameters():
                 state_dict[f"pme.{name}"] = param.data
         if self.cdm is not None:
             for name, param in self.cdm.named_parameters():
                 state_dict[f"cdm.{name}"] = param.data
+        if self.local_token_encoder is not None:
+            for name, param in self.local_token_encoder.named_parameters():
+                state_dict[f"local_token_encoder.{name}"] = param.data
         for name, param in self.pims.named_parameters():
             state_dict[f"pims.{name}"] = param.data
         torch.save(state_dict, save_path)
@@ -540,9 +617,17 @@ class HVMSketchDecoder(nn.Module):
         gme_dict = {k.replace("gme.", ""): v for k, v in state_dict.items() if k.startswith("gme.")}
         pme_dict = {k.replace("pme.", ""): v for k, v in state_dict.items() if k.startswith("pme.")}
         cdm_dict = {k.replace("cdm.", ""): v for k, v in state_dict.items() if k.startswith("cdm.")}
+        local_token_encoder_dict = {
+            k.replace("local_token_encoder.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("local_token_encoder.")
+        }
         pims_dict = {k.replace("pims.", ""): v for k, v in state_dict.items() if k.startswith("pims.")}
 
-        self.gme.load_state_dict(gme_dict, strict=True)
+        if self.gme is not None:
+            self.gme.load_state_dict(gme_dict, strict=True)
+        elif gme_dict:
+            print("[HVM] Warning: checkpoint contains GME weights, but current mode disables GME. Skipping GME load.")
         if self.pme is not None:
             self.pme.load_state_dict(pme_dict, strict=True)
         elif pme_dict:
@@ -558,6 +643,13 @@ class HVMSketchDecoder(nn.Module):
                 )
         elif cdm_dict:
             print("[HVM] Warning: checkpoint contains CDM weights, but current mode disables CDM. Skipping CDM load.")
+        if self.local_token_encoder is not None:
+            if local_token_encoder_dict:
+                self.local_token_encoder.load_state_dict(local_token_encoder_dict, strict=True)
+            else:
+                print("[HVM] Warning: current mode expects dense local token encoder weights, but checkpoint has none. Using current initialization.")
+        elif local_token_encoder_dict:
+            print("[HVM] Warning: checkpoint contains dense local token encoder weights, but current mode disables it. Skipping load.")
         self.pims.load_state_dict(pims_dict, strict=True)
         print(f"[HVM] Loaded HVM checkpoint from {load_path}")
 
@@ -570,12 +662,16 @@ class HVMSketchDecoder(nn.Module):
         print(f"\n[HVM] Model Summary:")
         print(f"  Base model (frozen): {frozen_params / 1e6:.0f}M params")
         print(f"  HVM modules (train): {trainable_params / 1e6:.1f}M params")
-        print(f"    GME: {count_parameters(self.gme) / 1e6:.1f}M")
+        gme_params = count_parameters(self.gme) / 1e6 if self.gme is not None else 0.0
+        print(f"    GME: {gme_params:.1f}M")
         pme_params = count_parameters(self.pme) / 1e6 if self.pme is not None else 0.0
         print(f"    PME: {pme_params:.1f}M")
         cdm_params = count_parameters(self.cdm) / 1e6 if self.cdm is not None else 0.0
         if cdm_params > 0:
             print(f"    CDM: {cdm_params:.1f}M")
+        local_token_encoder_params = count_parameters(self.local_token_encoder) / 1e6 if self.local_token_encoder is not None else 0.0
+        if local_token_encoder_params > 0:
+            print(f"    LocalTokenEncoder: {local_token_encoder_params:.1f}M")
         print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
         print(f"  Memory mode: {self.hvm_config.memory_mode}")
         if self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
@@ -584,6 +680,9 @@ class HVMSketchDecoder(nn.Module):
             print(f"  CDM disable gist: {self.hvm_config.cdm_disable_gist}")
             print(f"  CDM use tag meta: {self.hvm_config.cdm_use_tag_meta}")
             print(f"  CDM use group id: {self.hvm_config.cdm_use_group_id}")
+        if self.hvm_config.memory_mode == "dense_global_local":
+            print(f"  Local use tag meta: {self.hvm_config.cdm_use_tag_meta}")
+            print(f"  Local use group id: {self.hvm_config.cdm_use_group_id}")
         if self.hvm_config.memory_mode == "gme_cdm_edr":
             print(f"  EDR disable gist: {self.hvm_config.edr_disable_gist}")
             print(f"  EDR detail layers: {self.hvm_config.edr_detail_layer_indices}")
