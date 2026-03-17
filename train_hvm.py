@@ -228,11 +228,13 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
     stats: Dict[str, float] = {}
 
     # 代表性梯度（避免遍历全部参数，减小开销）
-    grad_targets = {
-        "grad/gme_input_proj": unwrapped_model.gme.qformer.input_proj.weight,
-    }
+    grad_targets = {}
+    if getattr(unwrapped_model, "gme", None) is not None:
+        grad_targets["grad/gme_input_proj"] = unwrapped_model.gme.qformer.input_proj.weight
     if getattr(unwrapped_model, "pme", None) is not None:
         grad_targets["grad/pme_input_proj"] = unwrapped_model.pme.qformer.input_proj.weight
+    if getattr(unwrapped_model, "local_token_encoder", None) is not None:
+        grad_targets["grad/local_token_tag_mlp"] = unwrapped_model.local_token_encoder.tag_meta_mlp[0].weight
 
     if len(unwrapped_model.pims) > 0:
         pim0 = unwrapped_model.pims[0]
@@ -241,6 +243,9 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
             grad_targets["grad/pim0_hidden_attn_q"] = pim0.hidden_aligned_cross_attn.to_q.weight
         elif hasattr(pim0, "hidden_gist_cross_attn"):
             grad_targets["grad/pim0_hidden_gist_attn_q"] = pim0.hidden_gist_cross_attn.to_q.weight
+        elif hasattr(pim0, "global_cross_attn"):
+            grad_targets["grad/pim0_global_attn_q"] = pim0.global_cross_attn.to_q.weight
+            grad_targets["grad/pim0_local_attn_q"] = pim0.local_cross_attn.to_q.weight
         if hasattr(pim0, "gate"):
             grad_targets["grad/pim0_gate_alpha"] = pim0.gate.base_alpha
         if hasattr(pim_last, "gate"):
@@ -298,6 +303,24 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 ("router_top1_prob_mean", f"gate/pim_{pim_idx}_router_top1_prob_mean"),
                 ("router_active_ratio", f"gate/pim_{pim_idx}_router_active_ratio"),
                 ("router_slot_usage_entropy", f"gate/pim_{pim_idx}_router_slot_usage_entropy"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
+        elif hasattr(pim, "alpha_global"):
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_global"] = float(torch.tanh(pim.alpha_global.detach()).item())
+            stats[f"gate/pim_{pim_idx}_tanh_alpha_local"] = float(torch.tanh(pim.alpha_local.detach()).item())
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("gate_global", f"gate/pim_{pim_idx}_gate_global"),
+                ("gate_local", f"gate/pim_{pim_idx}_gate_local"),
+                ("delta_global_rms", f"gate/pim_{pim_idx}_delta_global_rms"),
+                ("delta_local_rms", f"gate/pim_{pim_idx}_delta_local_rms"),
+                ("inject_global_rms", f"gate/pim_{pim_idx}_inject_global_rms"),
+                ("inject_local_rms", f"gate/pim_{pim_idx}_inject_local_rms"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
             ]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
