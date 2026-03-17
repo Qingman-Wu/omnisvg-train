@@ -22,6 +22,7 @@ from hvm_modules import (
     GistMemoryEncoder,
     PartMemoryEncoder,
     DenseLocalTokenEncoder,
+    VisualPrefixEncoder,
     PrefrontalInjectionModule,
     SimpleGMEInjectionModule,
     LayerGatedGMEInjectionModule,
@@ -80,10 +81,11 @@ class HVMSketchDecoder(nn.Module):
         self._freeze_base_model()
 
         # ---- HVM Modules (trainable) ----
-        self.gme = None if hvm_config.memory_mode == "dense_global_local" else GistMemoryEncoder(hvm_config)
+        self.gme = None if hvm_config.memory_mode in ("dense_global_local", "visual_prefix") else GistMemoryEncoder(hvm_config)
         self.pme = None
         self.cdm = None
         self.local_token_encoder = None
+        self.visual_prefix_encoder = None
         if hvm_config.memory_mode == "gme" and hvm_config.inject_mode == "fixed":
             self.pims = nn.ModuleList([
                 SimpleGMEInjectionModule(hvm_config)
@@ -129,6 +131,9 @@ class HVMSketchDecoder(nn.Module):
                 DenseGlobalLocalAttentionInjectionModule(hvm_config)
                 for _ in range(hvm_config.num_pims)
             ])
+        elif hvm_config.memory_mode == "visual_prefix":
+            self.visual_prefix_encoder = VisualPrefixEncoder(hvm_config)
+            self.pims = nn.ModuleList([])
         elif hvm_config.memory_mode == "gme_cdm":
             self.cdm = GroupwiseCDMEncoder(hvm_config) if hvm_config.cdm_layout == "groupwise" else CDMEncoder(hvm_config)
             self.pims = nn.ModuleList([
@@ -166,6 +171,8 @@ class HVMSketchDecoder(nn.Module):
             self.cdm = self.cdm.to(dtype=base_dtype)
         if self.local_token_encoder is not None:
             self.local_token_encoder = self.local_token_encoder.to(dtype=base_dtype)
+        if self.visual_prefix_encoder is not None:
+            self.visual_prefix_encoder = self.visual_prefix_encoder.to(dtype=base_dtype)
         self.pims = self.pims.to(dtype=base_dtype)
         print(f"[HVM] HVM modules dtype set to {base_dtype}")
 
@@ -186,7 +193,8 @@ class HVMSketchDecoder(nn.Module):
 
         # PIM layer index → PIM module index 的映射
         self._pim_map: Dict[int, int] = {}
-        for pim_idx, layer_idx in enumerate(hvm_config.pim_layer_indices):
+        self._active_pim_layers = list(hvm_config.pim_layer_indices[: len(self.pims)])
+        for pim_idx, layer_idx in enumerate(self._active_pim_layers):
             self._pim_map[layer_idx] = pim_idx
 
         # 安装 hooks
@@ -371,6 +379,52 @@ class HVMSketchDecoder(nn.Module):
             text_feats = embed_tokens(ref_text_ids)  # [B, N_t, d_model]
         return text_feats
 
+    def _prepare_visual_prefix_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        ref_features: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if self.visual_prefix_encoder is None:
+            raise RuntimeError("visual_prefix mode requires visual_prefix_encoder.")
+
+        hvm_dtype = next(self.visual_prefix_encoder.parameters()).dtype
+        prefix_feats = self.visual_prefix_encoder(ref_features.to(device=device, dtype=hvm_dtype))
+
+        embed_tokens = self.base_model.transformer.model.embed_tokens
+        with torch.no_grad():
+            token_embeds = embed_tokens(input_ids.to(device))
+        token_embeds = token_embeds.to(dtype=prefix_feats.dtype)
+
+        prefix_len = prefix_feats.shape[1]
+        batch_size = input_ids.shape[0]
+        prefix_mask = torch.ones(batch_size, prefix_len, device=device, dtype=attention_mask.dtype)
+        full_attention_mask = torch.cat([prefix_mask, attention_mask.to(device)], dim=1)
+
+        prefix_token_id = int(getattr(self.base_model, "pad_token_id", 0))
+        prefix_input_ids = torch.full(
+            (batch_size, prefix_len),
+            prefix_token_id,
+            device=device,
+            dtype=input_ids.dtype,
+        )
+        full_input_ids = torch.cat([prefix_input_ids, input_ids.to(device)], dim=1)
+        inputs_embeds = torch.cat([prefix_feats, token_embeds], dim=1)
+
+        full_labels = None
+        if labels is not None:
+            prefix_labels = torch.full(
+                (batch_size, prefix_len),
+                -100,
+                device=device,
+                dtype=labels.dtype,
+            )
+            full_labels = torch.cat([prefix_labels, labels.to(device)], dim=1)
+
+        return full_input_ids, full_attention_mask, full_labels, inputs_embeds
+
     def forward(
         self,
         # Base model inputs (same as SketchDecoder)
@@ -415,16 +469,44 @@ class HVMSketchDecoder(nn.Module):
             Same as SketchDecoder.forward (loss, logits, etc.)
         """
         device = input_ids.device
+        forward_input_ids = input_ids
+        forward_attention_mask = attention_mask
+        forward_labels = labels
+        forward_inputs_embeds = None
 
         # ================================================================
         # 1. 计算 HVM 视觉记忆 (只算一次，全程缓存给 hooks 使用)
         # ================================================================
-        if ref_features is not None:
+        if self.hvm_config.memory_mode == "visual_prefix":
+            self._memory_ready = False
+            self._gist_feats = None
+            self._ref_feats = None
+            self._detail_feats = None
+            self._part_feats = None
+            self._text_feats = None
+            self._part_mask = None
+            self._text_mask = None
+            self._detail_slot_mask = None
+            self._local_part_feats = None
+            self._local_part_mask = None
+            if ref_features is not None:
+                forward_input_ids, forward_attention_mask, forward_labels, forward_inputs_embeds = (
+                    self._prepare_visual_prefix_inputs(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        ref_features=ref_features,
+                        device=device,
+                    )
+                )
+        elif ref_features is not None:
             # 确定 HVM 模块的 dtype（与 base model 一致，通常为 bfloat16）
             if self.gme is not None:
                 hvm_dtype = next(self.gme.parameters()).dtype
             elif self.local_token_encoder is not None:
                 hvm_dtype = next(self.local_token_encoder.parameters()).dtype
+            elif self.visual_prefix_encoder is not None:
+                hvm_dtype = next(self.visual_prefix_encoder.parameters()).dtype
             else:
                 hvm_dtype = next(self.pims.parameters()).dtype
 
@@ -543,11 +625,12 @@ class HVMSketchDecoder(nn.Module):
         # 2. 运行 base model forward (hooks 自动注入 PIM)
         # ================================================================
         outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=forward_input_ids,
+            attention_mask=forward_attention_mask,
+            inputs_embeds=forward_inputs_embeds,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            labels=labels,
+            labels=forward_labels,
             **kwargs,
         )
 
@@ -569,6 +652,8 @@ class HVMSketchDecoder(nn.Module):
             params.extend(self.cdm.parameters())
         if self.local_token_encoder is not None:
             params.extend(self.local_token_encoder.parameters())
+        if self.visual_prefix_encoder is not None:
+            params.extend(self.visual_prefix_encoder.parameters())
         params.extend(self.pims.parameters())
         return params
 
@@ -587,6 +672,9 @@ class HVMSketchDecoder(nn.Module):
         if self.local_token_encoder is not None:
             for name, param in self.local_token_encoder.named_parameters():
                 named_params.append((f"local_token_encoder.{name}", param))
+        if self.visual_prefix_encoder is not None:
+            for name, param in self.visual_prefix_encoder.named_parameters():
+                named_params.append((f"visual_prefix_encoder.{name}", param))
         for name, param in self.pims.named_parameters():
             named_params.append((f"pims.{name}", param))
         return named_params
@@ -606,6 +694,9 @@ class HVMSketchDecoder(nn.Module):
         if self.local_token_encoder is not None:
             for name, param in self.local_token_encoder.named_parameters():
                 state_dict[f"local_token_encoder.{name}"] = param.data
+        if self.visual_prefix_encoder is not None:
+            for name, param in self.visual_prefix_encoder.named_parameters():
+                state_dict[f"visual_prefix_encoder.{name}"] = param.data
         for name, param in self.pims.named_parameters():
             state_dict[f"pims.{name}"] = param.data
         torch.save(state_dict, save_path)
@@ -621,6 +712,11 @@ class HVMSketchDecoder(nn.Module):
             k.replace("local_token_encoder.", ""): v
             for k, v in state_dict.items()
             if k.startswith("local_token_encoder.")
+        }
+        visual_prefix_encoder_dict = {
+            k.replace("visual_prefix_encoder.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("visual_prefix_encoder.")
         }
         pims_dict = {k.replace("pims.", ""): v for k, v in state_dict.items() if k.startswith("pims.")}
 
@@ -650,7 +746,17 @@ class HVMSketchDecoder(nn.Module):
                 print("[HVM] Warning: current mode expects dense local token encoder weights, but checkpoint has none. Using current initialization.")
         elif local_token_encoder_dict:
             print("[HVM] Warning: checkpoint contains dense local token encoder weights, but current mode disables it. Skipping load.")
-        self.pims.load_state_dict(pims_dict, strict=True)
+        if self.visual_prefix_encoder is not None:
+            if visual_prefix_encoder_dict:
+                self.visual_prefix_encoder.load_state_dict(visual_prefix_encoder_dict, strict=True)
+            else:
+                print("[HVM] Warning: current mode expects visual prefix encoder weights, but checkpoint has none. Using current initialization.")
+        elif visual_prefix_encoder_dict:
+            print("[HVM] Warning: checkpoint contains visual prefix encoder weights, but current mode disables it. Skipping load.")
+        if len(self.pims) > 0:
+            self.pims.load_state_dict(pims_dict, strict=True)
+        elif pims_dict:
+            print("[HVM] Warning: checkpoint contains PIM weights, but current mode disables PIMs. Skipping PIM load.")
         print(f"[HVM] Loaded HVM checkpoint from {load_path}")
 
     def _print_info(self):
@@ -672,7 +778,10 @@ class HVMSketchDecoder(nn.Module):
         local_token_encoder_params = count_parameters(self.local_token_encoder) / 1e6 if self.local_token_encoder is not None else 0.0
         if local_token_encoder_params > 0:
             print(f"    LocalTokenEncoder: {local_token_encoder_params:.1f}M")
-        print(f"    PIMs×{self.hvm_config.num_pims}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
+        visual_prefix_encoder_params = count_parameters(self.visual_prefix_encoder) / 1e6 if self.visual_prefix_encoder is not None else 0.0
+        if visual_prefix_encoder_params > 0:
+            print(f"    VisualPrefixEncoder: {visual_prefix_encoder_params:.1f}M")
+        print(f"    PIMs×{len(self.pims)}: {sum(count_parameters(p) for p in self.pims) / 1e6:.1f}M")
         print(f"  Memory mode: {self.hvm_config.memory_mode}")
         if self.hvm_config.memory_mode in ("gme_cdm", "gme_cdm_edr"):
             print(f"  CDM layout: {self.hvm_config.cdm_layout}")
@@ -683,6 +792,8 @@ class HVMSketchDecoder(nn.Module):
         if self.hvm_config.memory_mode == "dense_global_local":
             print(f"  Local use tag meta: {self.hvm_config.cdm_use_tag_meta}")
             print(f"  Local use group id: {self.hvm_config.cdm_use_group_id}")
+        if self.hvm_config.memory_mode == "visual_prefix":
+            print("  Visual prefix: raw global refs as decoder prefix")
         if self.hvm_config.memory_mode == "gme_cdm_edr":
             print(f"  EDR disable gist: {self.hvm_config.edr_disable_gist}")
             print(f"  EDR detail layers: {self.hvm_config.edr_detail_layer_indices}")
@@ -691,4 +802,4 @@ class HVMSketchDecoder(nn.Module):
             print(f"  Inject scale: {self.hvm_config.inject_scale}")
         print(f"  Total: {total_params / 1e6:.0f}M params")
         print(f"  Trainable ratio: {trainable_params / total_params * 100:.1f}%")
-        print(f"  PIM insertion layers: {self.hvm_config.pim_layer_indices}\n")
+        print(f"  PIM insertion layers: {self._active_pim_layers}\n")

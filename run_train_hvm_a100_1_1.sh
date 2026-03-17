@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / Full-data ablation / GME+CDM without EDR)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Experiment 49 / Visual Prefix ICL-style baseline)
 # =============================================================================
 #
 # 使用方法:
@@ -10,11 +10,10 @@
 # 默认实验:
 #   1w ablation on the first parquet (train-00000-of-00026_white.parquet)
 #   Top3 refs × 4 groups/ref = 12 groups
-#   GME + group-wise CDM(part-tag, no-gist) + last4 + adaptive
-#   不经过 EDR/router:
-#       gist_feats 与 hidden 做 cross-attn -> delta_gist
-#       12 detail slots 与 hidden 做 cross-attn -> delta_detail
-#       两路各自 gate 后相加注入 hidden
+#   Visual Prefix / ICL-style baseline:
+#       - 只使用 top3 whole-image raw ref features
+#       - 直接展平为 visual prefix，拼到 decoder 输入最左侧
+#       - 不经过 GME / CDM / EDR / PIM 压缩与路由
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -28,7 +27,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=4
+NUM_GPUS=7
 
 # -- 数据 --
 DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process"
@@ -51,7 +50,7 @@ CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
 CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
-CDM_DISABLE_GIST=true
+CDM_DISABLE_GIST=false
 CDM_DISABLE_TAG_META=false
 CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
@@ -59,15 +58,15 @@ EDR_TOP_K=1
 EDR_DISABLE_CONF=false
 EDR_RANDOM_REPLACE_TOP1=false
 EDR_DISABLE_GIST=false
-MEMORY_MODE="gme_cdm"
+MEMORY_MODE="visual_prefix"
 INJECT_MODE="adaptive"
 INJECT_SCALE=0.1
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 4 卡 1w 消融保持有效 batch: 4 x 8 x 4 = 128
-BATCH_SIZE=4
-GRAD_ACCUM=8
+# 7 卡 visual prefix 默认使用更保守配置: 2 x 9 x 7 = 126 (~128)
+BATCH_SIZE=2
+GRAD_ACCUM=9
 EPOCHS=30000
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
@@ -81,11 +80,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_visual_prefix_top3img_nozoom_7gpu"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s10_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4"
+SWANLAB_RUN_NAME="s10_visual_prefix_top3img_nozoom_7gpu"
 
 # -- 恢复训练 --
 RESUME_FROM=""
@@ -239,6 +238,9 @@ fi
 if [ "$MEMORY_MODE" = "gme_dra" ]; then
     echo "  DRA d_inner:       ${DRA_D_INNER:-128}"
     echo "  DRA n_heads:       ${DRA_N_HEADS:-4}"
+fi
+if [ "$MEMORY_MODE" = "visual_prefix" ]; then
+    echo "  Visual prefix:     raw global refs as decoder prefix"
 fi
 if [ "$MEMORY_MODE" = "gme_cdm" ] || [ "$MEMORY_MODE" = "gme_cdm_edr" ]; then
     echo "  CDM queries:       ${CDM_NUM_QUERIES}"

@@ -235,6 +235,9 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
         grad_targets["grad/pme_input_proj"] = unwrapped_model.pme.qformer.input_proj.weight
     if getattr(unwrapped_model, "local_token_encoder", None) is not None:
         grad_targets["grad/local_token_tag_mlp"] = unwrapped_model.local_token_encoder.tag_meta_mlp[0].weight
+    if getattr(unwrapped_model, "visual_prefix_encoder", None) is not None:
+        grad_targets["grad/visual_prefix_ref_id_emb"] = unwrapped_model.visual_prefix_encoder.ref_id_embedding.weight
+        grad_targets["grad/visual_prefix_alpha"] = unwrapped_model.visual_prefix_encoder.alpha_prefix
 
     if len(unwrapped_model.pims) > 0:
         pim0 = unwrapped_model.pims[0]
@@ -255,6 +258,18 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
         grad_norm = _param_grad_norm(param)
         if grad_norm is not None:
             stats[key] = grad_norm
+
+    if getattr(unwrapped_model, "visual_prefix_encoder", None) is not None:
+        prefix_encoder = unwrapped_model.visual_prefix_encoder
+        stats["gate/visual_prefix_tanh_alpha"] = float(torch.tanh(prefix_encoder.alpha_prefix.detach()).item())
+        last_stats = getattr(prefix_encoder, "last_stats", None) or {}
+        for src_key, dst_key in [
+            ("prefix_rms", "prefix/visual_prefix_rms"),
+            ("prefix_length", "prefix/visual_prefix_length"),
+        ]:
+            val = _scalar_tensor_to_float(last_stats.get(src_key))
+            if val is not None:
+                stats[dst_key] = val
 
     # PIM 运行时统计
     # - PrefrontalInjectionModule (full mode): gate.base_alpha + gate.last_stats
@@ -779,6 +794,8 @@ def train(args):
             accelerator.print("  Dense baseline: raw global refs + raw local parts")
             accelerator.print(f"  Local use tag meta: {hvm_config.cdm_use_tag_meta}")
             accelerator.print(f"  Local use group id: {hvm_config.cdm_use_group_id}")
+        if hvm_config.memory_mode == "visual_prefix":
+            accelerator.print("  Visual prefix baseline: raw global refs as decoder prefix")
         if hvm_config.memory_mode == "gme_cdm_edr":
             accelerator.print(f"  EDR d_router: {hvm_config.edr_d_router}")
             accelerator.print(f"  EDR top-k: {hvm_config.edr_top_k}")
@@ -1043,14 +1060,15 @@ def parse_args():
                         help="Comma-separated decoder layer indices for PIM hooks. "
                              "Supports -1 for last layer, e.g. '-1' or '3,7,11'.")
     parser.add_argument("--memory_mode", type=str, default="full",
-                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr", "dense_global_local"],
+                        choices=["full", "gme", "gme_pme", "gme_pme_dual", "gme_pme_hier", "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr", "dense_global_local", "visual_prefix"],
                         help="Memory pipeline: full (GME+PME+Text), gme (GME-only), gme_pme (GME+PME shared gate), "
                              "gme_pme_dual (GME+PME dual gate), gme_pme_hier (GME+PME hierarchical fusion + dual gate), "
                              "gme_pme_single (GME+PME hierarchical fusion + single path injection), "
                              "gme_dra (GME + Direct Reference Attention), "
                              "gme_cdm (GME + Complementary Detail Memory), "
                              "gme_cdm_edr (GME + CDM + Execution-aware Detail Router), "
-                             "dense_global_local (raw global/local visual tokens direct attention).")
+                             "dense_global_local (raw global/local visual tokens direct attention), "
+                             "visual_prefix (raw global visual tokens as decoder prefix).")
     parser.add_argument("--inject_mode", type=str, default="adaptive", choices=["adaptive", "fixed"],
                         help="Injection mode: adaptive gate (full) or fixed scale (simple).")
     parser.add_argument("--inject_scale", type=float, default=0.1,
@@ -1214,6 +1232,8 @@ def parse_args():
         parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "dense_global_local" and args.inject_mode != "adaptive":
         parser.error("memory_mode='dense_global_local' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "visual_prefix" and args.inject_mode != "adaptive":
+        parser.error("memory_mode='visual_prefix' currently supports only inject_mode='adaptive'.")
     if args.cdm_disable_gist and args.memory_mode not in ("gme_cdm", "gme_cdm_edr"):
         parser.error("--cdm_disable_gist is only supported when memory_mode is 'gme_cdm' or 'gme_cdm_edr'.")
     if args.cdm_layout == "groupwise" and args.cdm_detail_source != "part":

@@ -65,6 +65,7 @@ class SketchDecoder(nn.Module):
     def forward(self, 
                     input_ids=None,
                     attention_mask=None,
+                    inputs_embeds=None,
                     pixel_values=None,
                     image_grid_thw=None,
                     labels=None,
@@ -78,6 +79,10 @@ class SketchDecoder(nn.Module):
                 input_ids = input_ids.to(target_device)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(target_device)
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds.to(target_device)
+                if self.transformer.dtype != inputs_embeds.dtype:
+                    inputs_embeds = inputs_embeds.to(self.transformer.dtype)
             if pixel_values is not None:
                 pixel_values = pixel_values.to(target_device)
                 if self.transformer.dtype != pixel_values.dtype:
@@ -86,6 +91,14 @@ class SketchDecoder(nn.Module):
                 image_grid_thw = image_grid_thw.to(target_device)
             if labels is not None:
                 labels = labels.to(target_device)
+
+            if input_ids is None and inputs_embeds is not None:
+                input_ids = torch.full(
+                    inputs_embeds.shape[:2],
+                    self.pad_token_id,
+                    device=target_device,
+                    dtype=torch.long,
+                )
             
             rope_model = self.transformer if hasattr(self.transformer, 'get_rope_index') else self.transformer.model
             rope_model.rope_deltas = None
@@ -98,6 +111,7 @@ class SketchDecoder(nn.Module):
 
             outputs = self.transformer(
                 input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,

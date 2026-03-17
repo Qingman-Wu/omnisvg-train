@@ -78,7 +78,7 @@ class HVMConfig:
     pim_layer_interval: int = 4  # 每隔 N 层插入一个 PIM
     num_decoder_layers: int = 28
     gate_alpha_init: float = 0.05  # 冷启动更平滑: tanh(0.05)≈0.05，避免 PIM 主干梯度过弱
-    memory_mode: str = "full"      # full/gme/.../gme_cdm_edr/dense_global_local
+    memory_mode: str = "full"      # full/gme/.../gme_cdm_edr/dense_global_local/visual_prefix
     inject_mode: str = "adaptive"  # adaptive: gate 注入, fixed: 固定缩放注入
     inject_scale: float = 0.1      # inject_mode=fixed 时生效
     pim_layer_indices_override: Optional[List[int]] = None
@@ -907,6 +907,57 @@ class DenseLocalTokenEncoder(nn.Module):
         flat_tokens = tagged_tokens.reshape(B, G * T, D)
         flat_tokens = flat_tokens * token_mask.to(dtype=flat_tokens.dtype).unsqueeze(-1)
         return flat_tokens, token_mask
+
+
+# ============================================================================
+# Visual Prefix Encoder
+# ============================================================================
+
+class VisualPrefixEncoder(nn.Module):
+    """
+    将 top-k whole-image raw features 直接展平为 decoder visual prefix。
+
+    不做任何压缩、路由或 cross-attn，只做最轻量的前缀整形：
+      - LayerNorm 对齐 scale
+      - ref_id embedding 区分第 1/2/3 张参考图
+      - prefix type embedding 标记这是一段视觉前缀
+      - 一个全局 gate 控制 prefix 强度
+    """
+
+    def __init__(self, config: HVMConfig):
+        super().__init__()
+        self.config = config
+        d = config.d_model
+        self.prefix_norm = nn.LayerNorm(d)
+        self.ref_id_embedding = nn.Embedding(max(1, config.num_references), d)
+        self.prefix_type_embedding = nn.Parameter(torch.zeros(1, 1, d))
+        self.alpha_prefix = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        self.last_stats = {}
+
+    def forward(self, ref_features: torch.Tensor) -> torch.Tensor:
+        if ref_features.ndim != 4:
+            raise ValueError(
+                f"VisualPrefixEncoder expects ref features [B, R, T, D], got {tuple(ref_features.shape)}"
+            )
+
+        B, R, T, D = ref_features.shape
+        prefix = self.prefix_norm(ref_features)
+        safe_ref_ids = torch.arange(R, device=prefix.device).clamp(max=self.ref_id_embedding.num_embeddings - 1)
+        ref_emb = self.ref_id_embedding(safe_ref_ids).view(1, R, 1, D)
+        prefix = prefix + ref_emb + self.prefix_type_embedding.to(dtype=prefix.dtype).view(1, 1, 1, D)
+        prefix = prefix.reshape(B, R * T, D)
+
+        gate_prefix = torch.tanh(self.alpha_prefix)
+        prefix = gate_prefix * prefix
+
+        with torch.no_grad():
+            prefix_rms = prefix.detach().float().pow(2).mean().sqrt()
+            self.last_stats = {
+                "prefix_rms": prefix_rms,
+                "prefix_length": float(prefix.shape[1]),
+            }
+
+        return prefix
 
 
 # ============================================================================
