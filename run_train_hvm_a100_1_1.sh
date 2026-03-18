@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# HVM-SVG 训练启动脚本 (A100_1_1 / Experiment 49 / Visual Prefix ICL-style baseline)
+# HVM-SVG 训练启动脚本 (A100_1_1 / Experiment 50 / Fixed-scale full pipeline)
 # =============================================================================
 #
 # 使用方法:
@@ -10,10 +10,10 @@
 # 默认实验:
 #   1w ablation on the first parquet (train-00000-of-00026_white.parquet)
 #   Top3 refs × 4 groups/ref = 12 groups
-#   Visual Prefix / ICL-style baseline:
-#       - 只使用 top3 whole-image raw ref features
-#       - 直接展平为 visual prefix，拼到 decoder 输入最左侧
-#       - 不经过 GME / CDM / EDR / PIM 压缩与路由
+#   Experiment 50: full pipeline, but replace all adaptive gates with fixed scale=0.03
+#       - 保留 GME + groupwise CDM + EDR 的完整结构
+#       - CDM 仍然是 no-gist / part-tag / group-id / top-k=1
+#       - 仅把 4 个注入层中的 adaptive gate 全部替换为固定缩放 0.03
 
 set -e
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -27,7 +27,7 @@ ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 # ===================== 训练参数 =====================
 
 # -- GPU --
-NUM_GPUS=7
+NUM_GPUS=4
 
 # -- 数据 --
 DATA_DIR="/mnt/data2/wuqingman/datasets/OmniSVG/MMSVG-Illustration/data_process"
@@ -50,7 +50,7 @@ CDM_NUM_LAYERS=6
 CDM_LAYOUT="groupwise"
 CDM_GROUP_QUERIES_PER_GROUP=1
 CDM_DETAIL_SOURCE="part"
-CDM_DISABLE_GIST=false
+CDM_DISABLE_GIST=true
 CDM_DISABLE_TAG_META=false
 CDM_DISABLE_GROUP_ID=false
 EDR_D_ROUTER=256
@@ -58,15 +58,15 @@ EDR_TOP_K=1
 EDR_DISABLE_CONF=false
 EDR_RANDOM_REPLACE_TOP1=false
 EDR_DISABLE_GIST=false
-MEMORY_MODE="visual_prefix"
-INJECT_MODE="adaptive"
-INJECT_SCALE=0.1
+MEMORY_MODE="gme_cdm_edr"
+INJECT_MODE="fixed"
+INJECT_SCALE=0.03
 PIM_LAYER_INDICES="24,25,26,27"
 
 # -- 训练超参 --
-# 7 卡 visual prefix 默认使用更保守配置: 2 x 9 x 7 = 126 (~128)
-BATCH_SIZE=2
-GRAD_ACCUM=9
+# 4 卡默认保持与主实验接近的等效 batch: 4 x 8 x 4 = 128
+BATCH_SIZE=4
+GRAD_ACCUM=8
 EPOCHS=30000
 LEARNING_RATE=5e-4
 WEIGHT_DECAY=0.01
@@ -80,11 +80,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_visual_prefix_top3img_nozoom_7gpu"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_exp50_fixed003_top3part_12slot_nogist_edr_parttag_nozoom_last4"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="s10_visual_prefix_top3img_nozoom_7gpu"
+SWANLAB_RUN_NAME="exp50_fixed003_top3part_12slot_nogist_edr_parttag_nozoom_last4"
 
 # -- 恢复训练 --
 RESUME_FROM=""

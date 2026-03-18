@@ -1879,9 +1879,15 @@ class EDRInjectionModule(nn.Module):
         self.disable_conf = bool(config.edr_disable_conf)
         self.enable_gist = not bool(config.edr_disable_gist)
         self.enable_detail = bool(enable_detail)
+        self.inject_mode = str(config.inject_mode)
+        self.inject_scale = float(config.inject_scale)
 
-        self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
-        self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        if self.inject_mode == "adaptive":
+            self.alpha_gist = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+            self.alpha_detail = nn.Parameter(torch.tensor(float(config.gate_alpha_init)))
+        else:
+            self.alpha_gist = None
+            self.alpha_detail = None
         self.last_stats = {}
         self.capture_vis = False
         self.last_trace = {}
@@ -1897,10 +1903,14 @@ class EDRInjectionModule(nn.Module):
         self.detail_router.capture_trace = bool(self.capture_vis)
         self.detail_router.last_trace = {}
         query = self.hidden_norm(hidden_state)
+        fixed_scale = hidden_state.new_tensor(self.inject_scale)
 
         if self.enable_gist:
             delta_gist = self.gist_cross_attn(q=query, k=gist_feats, v=gist_feats)
-            gate_gist = torch.tanh(self.alpha_gist)
+            if self.inject_mode == "adaptive":
+                gate_gist = torch.tanh(self.alpha_gist)
+            else:
+                gate_gist = fixed_scale
             inject_gist = gate_gist * delta_gist
         else:
             delta_gist = torch.zeros_like(hidden_state)
@@ -1919,7 +1929,10 @@ class EDRInjectionModule(nn.Module):
             )
             effective_conf = torch.ones_like(conf) if self.disable_conf else conf
             delta_detail = routed_detail
-            gate_detail = torch.tanh(self.alpha_detail)
+            if self.inject_mode == "adaptive":
+                gate_detail = torch.tanh(self.alpha_detail)
+            else:
+                gate_detail = fixed_scale
             inject_detail = gate_detail * effective_conf * delta_detail
         else:
             gate_detail = torch.zeros_like(gate_gist)

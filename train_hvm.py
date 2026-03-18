@@ -294,6 +294,44 @@ def collect_hvm_diagnostics(unwrapped_model: nn.Module) -> Dict[str, float]:
                 val = _scalar_tensor_to_float(last_stats.get(src_key))
                 if val is not None:
                     stats[dst_key] = val
+        elif hasattr(pim, "detail_router"):
+            gist_enabled = bool(getattr(pim, "enable_gist", True))
+            detail_enabled = bool(getattr(pim, "enable_detail", True))
+            if getattr(pim, "inject_mode", "adaptive") == "fixed":
+                fixed_scale = float(getattr(pim, "inject_scale", 0.0))
+                stats[f"inject/pim_{pim_idx}_scale"] = fixed_scale
+                stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = fixed_scale if gist_enabled else 0.0
+                stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = fixed_scale if detail_enabled else 0.0
+            else:
+                stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = (
+                    float(torch.tanh(pim.alpha_gist.detach()).item()) if gist_enabled else 0.0
+                )
+                stats[f"gate/pim_{pim_idx}_tanh_alpha_detail"] = (
+                    float(torch.tanh(pim.alpha_detail.detach()).item()) if detail_enabled else 0.0
+                )
+            stats[f"gate/pim_{pim_idx}_gist_enabled"] = 1.0 if gist_enabled else 0.0
+            stats[f"gate/pim_{pim_idx}_detail_enabled"] = 1.0 if detail_enabled else 0.0
+            last_stats = getattr(pim, "last_stats", None) or {}
+            for src_key, dst_key in [
+                ("gate_gist", f"gate/pim_{pim_idx}_gate_gist"),
+                ("gate_detail", f"gate/pim_{pim_idx}_gate_detail"),
+                ("delta_gist_rms", f"gate/pim_{pim_idx}_delta_gist_rms"),
+                ("delta_detail_rms", f"gate/pim_{pim_idx}_delta_detail_rms"),
+                ("inject_gist_rms", f"gate/pim_{pim_idx}_inject_gist_rms"),
+                ("inject_detail_rms", f"gate/pim_{pim_idx}_inject_detail_rms"),
+                ("delta_rms", f"gate/pim_{pim_idx}_delta_rms"),
+                ("inject_rms", f"gate/pim_{pim_idx}_inject_rms"),
+                ("inject_hidden_ratio", f"gate/pim_{pim_idx}_inject_hidden_ratio"),
+                ("router_conf_mean", f"gate/pim_{pim_idx}_router_conf_mean"),
+                ("router_effective_conf_mean", f"gate/pim_{pim_idx}_router_effective_conf_mean"),
+                ("router_entropy_mean", f"gate/pim_{pim_idx}_router_entropy_mean"),
+                ("router_top1_prob_mean", f"gate/pim_{pim_idx}_router_top1_prob_mean"),
+                ("router_active_ratio", f"gate/pim_{pim_idx}_router_active_ratio"),
+                ("router_slot_usage_entropy", f"gate/pim_{pim_idx}_router_slot_usage_entropy"),
+            ]:
+                val = _scalar_tensor_to_float(last_stats.get(src_key))
+                if val is not None:
+                    stats[dst_key] = val
         elif hasattr(pim, "alpha_detail"):
             gist_enabled = bool(getattr(pim, "enable_gist", True))
             stats[f"gate/pim_{pim_idx}_tanh_alpha_gist"] = (
@@ -1235,8 +1273,8 @@ def parse_args():
         parser.error("memory_mode='gme_dra' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "gme_cdm" and args.inject_mode != "adaptive":
         parser.error("memory_mode='gme_cdm' currently supports only inject_mode='adaptive'.")
-    if args.memory_mode == "gme_cdm_edr" and args.inject_mode != "adaptive":
-        parser.error("memory_mode='gme_cdm_edr' currently supports only inject_mode='adaptive'.")
+    if args.memory_mode == "gme_cdm_edr" and args.inject_mode not in ("adaptive", "fixed"):
+        parser.error("memory_mode='gme_cdm_edr' currently supports inject_mode='adaptive' or 'fixed'.")
     if args.memory_mode == "dense_global_local" and args.inject_mode != "adaptive":
         parser.error("memory_mode='dense_global_local' currently supports only inject_mode='adaptive'.")
     if args.memory_mode == "visual_prefix" and args.inject_mode != "adaptive":
