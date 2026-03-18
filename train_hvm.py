@@ -156,7 +156,11 @@ def compute_loss(
     outputs: Any,
     labels: torch.Tensor,
 ) -> torch.Tensor:
-    """计算 SVG token 的 cross-entropy loss"""
+    """计算 SVG token 的 cross-entropy loss。优先使用模型内部已对齐的 loss。"""
+    model_loss = getattr(outputs, "loss", None)
+    if model_loss is not None:
+        return model_loss
+
     logits = outputs.logits[:, :-1].contiguous()
     labels = labels[:, 1:].contiguous().to(logits.device)
 
@@ -423,11 +427,12 @@ def evaluate_val_loss(
         labels = batch["labels"]
 
         if disable_hvm:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         else:
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                labels=labels,
                 ref_features=batch["ref_features"],
                 group_features_list=batch["group_features_list"],
                 part_features=batch["part_features"],
@@ -849,6 +854,7 @@ def train(args):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        labels=labels,
                     )
                 else:
                     ref_features = batch["ref_features"]
@@ -859,6 +865,7 @@ def train(args):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        labels=labels,
                         ref_features=ref_features,
                         group_features_list=group_features_list,
                         part_features=batch["part_features"],
