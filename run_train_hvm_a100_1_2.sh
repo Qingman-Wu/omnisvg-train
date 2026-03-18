@@ -79,11 +79,11 @@ ACCELERATE_CONFIG="./configs/ds_zero2_hvm.yaml"
 NUM_WORKERS=4
 
 # -- 日志与保存 --
-OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_exp51_lastlayer_top3part_12slot_nogist_edr_parttag_nozoom"
+OUTPUT_DIR="/mnt/data3/wuqingman/omnisvg-train/outputs_s10_onlylastlayer_top3part_12slot_nogist_edr_parttag_nozoom"
 LOG_EVERY=10
 SAVE_EVERY=2000
 SWANLAB_MODE="cloud"
-SWANLAB_RUN_NAME="exp51_lastlayer_top3part_12slot_nogist_edr_parttag_nozoom"
+SWANLAB_RUN_NAME="s10_onlylastlayer_top3part_12slot_nogist_edr_parttag_nozoom"
 
 # -- 恢复训练 --
 RESUME_FROM=""
