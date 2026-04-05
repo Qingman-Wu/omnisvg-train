@@ -17,6 +17,8 @@ SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SO
 # ===================== 环境配置 =====================
 export CUDA_HOME="/usr/local/cuda-12.1"
 export TOKENIZERS_PARALLELISM=false
+export NCCL_TIMEOUT=1800000
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
 PYTHON="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/python"
 ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 

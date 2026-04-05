@@ -162,8 +162,35 @@ def load_hvm_model(
 
     with open(hvm_config_path, "r") as f:
         hvm_cfg_dict = json.load(f)
+
+    # Backward/forward compatibility:
+    # training snapshots often save resolved public fields like
+    # `pim_layer_indices` / `edr_detail_layer_indices` and disable-style flags,
+    # while HVMConfig expects override/use-style constructor args.
+    normalized_hvm_cfg = dict(hvm_cfg_dict)
+    if (
+        "pim_layer_indices_override" not in normalized_hvm_cfg
+        and "pim_layer_indices" in normalized_hvm_cfg
+    ):
+        normalized_hvm_cfg["pim_layer_indices_override"] = normalized_hvm_cfg["pim_layer_indices"]
+    if (
+        "edr_detail_layer_indices_override" not in normalized_hvm_cfg
+        and "edr_detail_layer_indices" in normalized_hvm_cfg
+    ):
+        normalized_hvm_cfg["edr_detail_layer_indices_override"] = normalized_hvm_cfg["edr_detail_layer_indices"]
+    if (
+        "cdm_use_tag_meta" not in normalized_hvm_cfg
+        and "cdm_disable_tag_meta" in normalized_hvm_cfg
+    ):
+        normalized_hvm_cfg["cdm_use_tag_meta"] = not bool(normalized_hvm_cfg["cdm_disable_tag_meta"])
+    if (
+        "cdm_use_group_id" not in normalized_hvm_cfg
+        and "cdm_disable_group_id" in normalized_hvm_cfg
+    ):
+        normalized_hvm_cfg["cdm_use_group_id"] = not bool(normalized_hvm_cfg["cdm_disable_group_id"])
+
     hvm_config = HVMConfig(**{
-        k: v for k, v in hvm_cfg_dict.items()
+        k: v for k, v in normalized_hvm_cfg.items()
         if k in HVMConfig.__dataclass_fields__
     })
 

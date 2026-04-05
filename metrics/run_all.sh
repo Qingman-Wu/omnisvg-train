@@ -33,9 +33,43 @@
 #   CUDA_VISIBLE_DEVICES=4 RESUME=1 bash metrics/run_all.sh inference_results/s6_groupwise_cdm_edr_parttag_nozoom_topk1_step2000_test hvm
 #   CUDA_VISIBLE_DEVICES=5 RESUME=1 bash metrics/run_all.sh inference_results/s6_groupwise_cdm_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
 
-
 #   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s7_top3part_12slot_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
 #   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s7_top3part_24slot_nogist_edr_parttag_nozoom_topk1_step2000_test hvm
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s8_top12_top3part_12slot_nogist_edr_parttag_nozoom_last4_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s8_randreplace_top1_top3part_12slot_nogist_edr_parttag_nozoom_last4_step2000 hvm
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s9_full25w_top3part_12slot_nogist_edr_parttag_nozoom_last4_test hvm
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s8_notag_top3part_12slot_nogist_edr_nozoom_topk1_last4_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=1 RESUME=1 bash metrics/run_all.sh inference_results/s8_noconf_top3part_12slot_nogist_edr_parttag_nozoom_topk1_last4_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s8_randreplace_top1_top3part_12slot_nogist_edr_parttag_nozoom_last4_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s8_shuffle_gme_top3part_12slot_nogist_edr_parttag_topk1_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=2 RESUME=1 bash metrics/run_all.sh inference_results/s8_shuffle_cdm_top3part_12slot_nogist_edr_parttag_topk1_step2000 hvm
+
+
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s8_uniform4_top3part_12slot_nogist_edr_parttag_topk1_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=1 RESUME=1 bash metrics/run_all.sh inference_results/s8_cdm_only_top3part_12slot_parttag_nozoom_step2000_test hvm
+#   CUDA_VISIBLE_DEVICES=2 RESUME=1 bash metrics/run_all.sh inference_results/s10_gmecdm_noedr_top3part_12slot_nogist_parttag_nozoom_last4_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=3 RESUME=1 bash metrics/run_all.sh inference_results/s10_OnlyDetailEdr_top3part_12slot_nogist_parttag_nozoom_last4_step2000 hvm
+
+
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s10_fixed003_top3part_12slot_nogist_edr_parttag_nozoom_last4_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s8_shuffle_cdm_top3part_12slot_nogist_edr_parttag_topk1_step2000 hvm
+
+
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s10_dense_global_local_step2000 hvm
+
+
+#   CUDA_VISIBLE_DEVICES=0 RESUME=1 bash metrics/run_all.sh inference_results/s10_onlylastlayer_top3part_12slot_nogist_edr_parttag_nozoom_step2000 hvm
+
+
+#   CUDA_VISIBLE_DEVICES=6 RESUME=1 bash metrics/run_all.sh inference_results/s8_noconf_top3part_12slot_nogist_edr_parttag_nozoom_topk1_last4_step2000 hvm
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s8_shuffle_gme_top3part_12slot_nogist_edr_parttag_topk1_step2000 hvm
+
+#   CUDA_VISIBLE_DEVICES=7 RESUME=1 bash metrics/run_all.sh inference_results/s10_visual_prefix_step2000 hvm
+
 # 输出保存到: metrics/metrics_results/<exp_name>/
 #   ├── ssim.csv + ssim.json
 #   ├── mse.csv + mse.json
@@ -43,7 +77,8 @@
 #   ├── clip_t.csv + clip_t.json
 #   ├── dino_i.csv + dino_i.json
 #   ├── aesthetic.csv + aesthetic.json
-#   └── hps.csv + hps.json
+#   ├── hps.csv + hps.json
+#   └── fid.json  (dataset-level, no CSV)
 # ============================================================================
 
 set -e
@@ -79,32 +114,36 @@ echo "  Output:      $OUTPUT_DIR/$EXP_NAME/"
 echo "============================================================"
 
 echo ""
-echo "[1/7] Computing SSIM..."
+echo "[1/8] Computing SSIM..."
 python "$SCRIPT_DIR/compute_ssim.py" $COMMON_ARGS
 
 echo ""
-echo "[2/7] Computing MSE..."
+echo "[2/8] Computing MSE..."
 python "$SCRIPT_DIR/compute_mse.py" $COMMON_ARGS
 
 echo ""
-echo "[3/7] Computing CLIP-I..."
+echo "[3/8] Computing CLIP-I..."
 python "$SCRIPT_DIR/compute_clip_i.py" $COMMON_ARGS
 
 echo ""
-echo "[4/7] Computing CLIP-T..."
+echo "[4/8] Computing CLIP-T..."
 python "$SCRIPT_DIR/compute_clip_t.py" $COMMON_ARGS
 
 echo ""
-echo "[5/7] Computing DINO-I..."
+echo "[5/8] Computing DINO-I..."
 python "$SCRIPT_DIR/compute_dino_i.py" $COMMON_ARGS
 
 echo ""
-echo "[6/7] Computing Aesthetic..."
+echo "[6/8] Computing Aesthetic..."
 python "$SCRIPT_DIR/compute_aesthetic.py" $COMMON_ARGS
 
 echo ""
-echo "[7/7] Computing HPS..."
+echo "[7/8] Computing HPS..."
 python "$SCRIPT_DIR/compute_hps.py" $COMMON_ARGS
+
+echo ""
+echo "[8/8] Computing FID..."
+python "$SCRIPT_DIR/compute_fid.py" $COMMON_ARGS
 
 echo ""
 echo "============================================================"
@@ -123,9 +162,14 @@ for f in "$OUTPUT_DIR/$EXP_NAME"/*.json; do
 import json, sys
 with open('$f') as fh:
     d = json.load(fh)
+# Standard per-sample metrics
 for k in ['min_mean','max_mean','avg_mean','trimmed_mean']:
     if k in d:
-        print(f'  {k:<16} {d[k]:.4f}')
+        print(f'  {k:<25} {d[k]:.4f}')
+# FID (dataset-level, per-candidate-index details)
+for k in sorted(d.keys()):
+    if k.startswith('fid_c') or k == 'fid_all':
+        print(f'  {k:<25} {d[k]:.4f}')
 "
     fi
 done

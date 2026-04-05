@@ -23,6 +23,8 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 # ===================== 环境配置 =====================
 ENV_PREFIX="/mnt/data/wuqingman/miniconda3/envs/omnisvg"
 export TOKENIZERS_PARALLELISM=false
+export NCCL_TIMEOUT=1800000
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
 PYTHON="${ENV_PREFIX}/bin/python"
 ACCELERATE_LAUNCH=("$PYTHON" -m accelerate.commands.launch)
 TRAIN_SCRIPT="${SCRIPT_DIR}/train_hvm.py"

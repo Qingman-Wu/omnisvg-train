@@ -26,7 +26,7 @@ export TOKENIZERS_PARALLELISM=false
 PYTHON="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/python"
 ACCELERATE="/mnt/data/wuqingman/miniconda3/envs/omnisvg/bin/accelerate"
 
-# ===================== 训练参数 =====================
+# =====================§ 训练参数 =====================
 
 # -- GPU --
 NUM_GPUS=8

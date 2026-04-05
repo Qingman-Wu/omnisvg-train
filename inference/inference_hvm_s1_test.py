@@ -317,13 +317,71 @@ def set_hvm_memory(
 ):
     """将参考特征注入 HVM 模型。
 
-    GME mode (gme + fixed / gme + adaptive): 只需要 gist_feats。
-    Full mode: 需要 gist_feats + part_feats + text_feats。
+    支持所有 memory_mode:
+    - gme / gme_pme* / gme_dra / gme_cdm / gme_cdm_edr / full: 通过 GME 压缩
+    - dense_global_local: 直接用原始 ref tokens + local_token_encoder 处理 part tokens
+    - visual_prefix: 原始 ref tokens 作为 decoder prefix
     """
-    hvm_dtype = next(model.gme.parameters()).dtype
+    if model.gme is not None:
+        hvm_dtype = next(model.gme.parameters()).dtype
+    elif model.local_token_encoder is not None:
+        hvm_dtype = next(model.local_token_encoder.parameters()).dtype
+    elif model.visual_prefix_encoder is not None:
+        hvm_dtype = next(model.visual_prefix_encoder.parameters()).dtype
+    else:
+        hvm_dtype = next(model.pims.parameters()).dtype
 
-    # GME: 3 ref images → 32 gist tokens
     ref_feat_tensor = torch.stack(ref_features).unsqueeze(0).to(device=device, dtype=hvm_dtype)
+
+    # ---- visual_prefix: 直接把 prefix embeddings 拼到 input 序列前面 ----
+    if hvm_config.memory_mode == "visual_prefix":
+        prefix_feats = model.visual_prefix_encoder(ref_feat_tensor)
+        model._visual_prefix = prefix_feats
+        model._gist_feats = None
+        model._ref_feats = None
+        model._part_feats = None
+        model._part_mask = None
+        model._detail_feats = None
+        model._detail_slot_mask = None
+        model._local_part_feats = None
+        model._local_part_mask = None
+        model._text_feats = None
+        model._text_mask = None
+        model._memory_ready = False
+        return
+
+    # ---- dense_global_local: 不经过 GME，直接用原始 ref + local_token_encoder ----
+    if hvm_config.memory_mode == "dense_global_local":
+        model._gist_feats = None
+        model._ref_feats = ref_feat_tensor.view(1, -1, ref_feat_tensor.shape[-1])
+        if group_features:
+            part_tensor = torch.stack(group_features).unsqueeze(0).to(device=device, dtype=hvm_dtype)
+            part_tag_tensor = None
+            part_group_ids_tensor = None
+            part_mask = torch.ones(1, part_tensor.shape[1], device=device, dtype=torch.bool)
+            if group_tag_meta is not None:
+                part_tag_tensor = torch.as_tensor(group_tag_meta, dtype=hvm_dtype, device=device).unsqueeze(0)
+            if group_ids is not None:
+                part_group_ids_tensor = torch.as_tensor(group_ids, dtype=torch.long, device=device).unsqueeze(0)
+            model._local_part_feats, model._local_part_mask = model.local_token_encoder(
+                part_tensor,
+                part_tag_meta=part_tag_tensor,
+                part_group_ids=part_group_ids_tensor,
+                part_mask=part_mask,
+            )
+        else:
+            model._local_part_feats = torch.zeros(1, 0, ref_feat_tensor.shape[-1], device=device, dtype=hvm_dtype)
+            model._local_part_mask = torch.zeros(1, 0, device=device, dtype=torch.bool)
+        model._part_feats = None
+        model._part_mask = None
+        model._detail_feats = None
+        model._detail_slot_mask = None
+        model._text_feats = None
+        model._text_mask = None
+        model._memory_ready = True
+        return
+
+    # ---- GME: 3 ref images → 32 gist tokens ----
     model._gist_feats = model.gme(ref_feat_tensor)
 
     # PME: 仅在 full mode 下使用
@@ -366,6 +424,9 @@ def set_hvm_memory(
         model._detail_feats = None
         model._detail_slot_mask = None
 
+    model._local_part_feats = None
+    model._local_part_mask = None
+
     # Text feats: 仅 full mode 需要（其他模式都不需要 text）
     NO_TEXT_MODES = ("gme", "gme_pme", "gme_pme_dual", "gme_pme_hier",
                      "gme_pme_single", "gme_dra", "gme_cdm", "gme_cdm_edr")
@@ -382,6 +443,8 @@ def set_hvm_memory(
         model._text_mask = ref_text_mask.to(dtype=torch.bool)
         model._text_feats = model._prepare_text_feats(ref_text_ids, model._text_mask)
 
+    model._memory_ready = True
+
 
 def clear_hvm_memory(model):
     model._gist_feats = None
@@ -392,6 +455,38 @@ def clear_hvm_memory(model):
     model._ref_feats = None
     model._detail_feats = None
     model._detail_slot_mask = None
+    model._local_part_feats = None
+    model._local_part_mask = None
+    model._visual_prefix = None
+    model._memory_ready = False
+
+
+def _get_embed_tokens(model):
+    """兼容不同版本 transformers 的 embed_tokens 路径。"""
+    inner = model.base_model.transformer.model
+    if hasattr(inner, 'embed_tokens'):
+        return inner.embed_tokens
+    if hasattr(inner, 'language_model') and hasattr(inner.language_model, 'embed_tokens'):
+        return inner.language_model.embed_tokens
+    raise AttributeError(
+        f"Cannot find embed_tokens in {type(inner).__name__}. "
+        f"Children: {[n for n, _ in inner.named_children()]}"
+    )
+
+
+def prepare_visual_prefix_inputs(model, input_ids, attention_mask, device):
+    """将 visual prefix embeddings 拼到 text token embeddings 前面，用于 generate。"""
+    prefix = model._visual_prefix
+    embed_tokens = _get_embed_tokens(model)
+    with torch.no_grad():
+        token_embeds = embed_tokens(input_ids.to(device))
+    token_embeds = token_embeds.to(dtype=prefix.dtype)
+
+    inputs_embeds = torch.cat([prefix, token_embeds], dim=1)
+    prefix_mask = torch.ones(input_ids.shape[0], prefix.shape[1],
+                             device=device, dtype=attention_mask.dtype)
+    full_attention_mask = torch.cat([prefix_mask, attention_mask.to(device)], dim=1)
+    return inputs_embeds, full_attention_mask
 
 
 # ============================================================================
@@ -405,6 +500,7 @@ def generate_svg(
     token_config, svg_tokenizer,
     max_new_tokens=3000, temperature=0.5, top_p=0.90,
     top_k=50, repetition_penalty=1.05, num_return_sequences=1,
+    inputs_embeds=None,
 ):
     gen_cfg = dict(
         max_new_tokens=max_new_tokens,
@@ -420,13 +516,21 @@ def generate_svg(
         use_cache=True,
     )
 
-    results = transformer_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        **gen_cfg,
-    )
+    if inputs_embeds is not None:
+        results = transformer_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **gen_cfg,
+        )
+        input_len = 0
+    else:
+        input_len = input_ids.shape[1]
+        results = transformer_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **gen_cfg,
+        )
 
-    input_len = input_ids.shape[1]
     generated_ids_batch = results[:, input_len:]
 
     candidates = []
@@ -673,12 +777,20 @@ def run_on_single_gpu(
             pbar.write(f"[GPU {gpu_id}] Skip sample {idx}: out of range")
             continue
 
-        # --resume: 检查输出文件是否已存在
+        # --resume: 检查输出文件是否已存在（save_png 时检查 .png，否则 .svg）
         if args.resume:
-            # 兼容两种命名: sample_XXXX_hvm.svg (单候选) 和 sample_XXXX_hvm_c0.svg (多候选)
-            has_single = (output_dir / f"sample_{idx:04d}_hvm.svg").exists()
-            has_multi = (output_dir / f"sample_{idx:04d}_hvm_c0.svg").exists()
-            if has_single or has_multi:
+            ext = ".png" if args.save_png else ".svg"
+            has_single = (output_dir / f"sample_{idx:04d}_hvm{ext}").exists()
+            if has_single:
+                total_skipped += 1
+                pbar.set_postfix(ok=total_ok, fail=total_fail, skip=total_skipped)
+                continue
+            min_cands = args.min_candidates or 1
+            existing_count = sum(
+                1 for ci in range(args.num_candidates)
+                if (output_dir / f"sample_{idx:04d}_hvm_c{ci}{ext}").exists()
+            )
+            if existing_count >= min_cands:
                 total_skipped += 1
                 pbar.set_postfix(ok=total_ok, fail=total_fail, skip=total_skipped)
                 continue
@@ -749,9 +861,15 @@ def run_on_single_gpu(
         )
 
         actual_num = args.num_candidates + EXTRA_CANDIDATES_BUFFER
+        gen_inputs_embeds = None
+        gen_attention_mask = attention_mask
+        if hvm_config.memory_mode == "visual_prefix" and getattr(hvm_model, "_visual_prefix", None) is not None:
+            gen_inputs_embeds, gen_attention_mask = prepare_visual_prefix_inputs(
+                hvm_model, input_ids, attention_mask, device
+            )
         candidates = generate_svg(
             transformer_for_generate,
-            input_ids, attention_mask,
+            input_ids, gen_attention_mask,
             token_config, svg_tokenizer,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
@@ -759,6 +877,7 @@ def run_on_single_gpu(
             top_k=args.top_k,
             repetition_penalty=args.repetition_penalty,
             num_return_sequences=actual_num,
+            inputs_embeds=gen_inputs_embeds,
         )
 
         clear_hvm_memory(hvm_model)
@@ -895,6 +1014,8 @@ def parse_args():
                    help="Shuffle CDM group_features (ablation): CDM gets random donor parts, GME keeps correct refs")
     p.add_argument("--resume", action="store_true", default=False,
                    help="跳过已经生成的样本 (断点续推)")
+    p.add_argument("--min_candidates", type=int, default=None,
+                   help="Resume 时要求已有候选数 >= 此值才跳过 (默认: 只要 c0 存在就跳过)")
 
     args = p.parse_args()
 
@@ -952,14 +1073,24 @@ def main():
     pending_indices = list(args.sample_indices)
     if args.resume:
         output_dir = Path(args.output_dir)
+        min_cands = args.min_candidates or 1
+        ext = ".png" if args.save_png else ".svg"
         completed = []
         for idx in pending_indices:
-            has_single = (output_dir / f"sample_{idx:04d}_hvm.svg").exists()
-            has_multi = (output_dir / f"sample_{idx:04d}_hvm_c0.svg").exists()
-            if has_single or has_multi:
+            has_single = (output_dir / f"sample_{idx:04d}_hvm{ext}").exists()
+            if has_single:
+                completed.append(idx)
+                continue
+            existing_count = sum(
+                1 for ci in range(args.num_candidates)
+                if (output_dir / f"sample_{idx:04d}_hvm_c{ci}{ext}").exists()
+            )
+            if existing_count >= min_cands:
                 completed.append(idx)
         pending_indices = [i for i in pending_indices if i not in set(completed)]
-        print(f"  Resume: {len(completed)} done, {len(pending_indices)} remaining")
+        print(f"  Resume: {len(completed)} done, {len(pending_indices)} remaining"
+              + (f" (min_candidates={min_cands})" if args.min_candidates else "")
+              + f" (checking {ext})")
 
     index_splits = split_indices(pending_indices, num_gpus)
     for i, split in enumerate(index_splits):

@@ -130,6 +130,17 @@ def get_all_gt_indices(samples: Dict[int, Dict], max_samples: Optional[int] = No
     return all_gt
 
 
+def get_candidates_only_indices(samples: Dict[int, Dict], max_samples: Optional[int] = None) -> List[int]:
+    """返回所有有候选图片的样本索引（不要求 GT，用于 text2svg 等无 GT 场景）。"""
+    valid = sorted([
+        idx for idx, info in samples.items()
+        if len(info["candidates"]) > 0
+    ])
+    if max_samples is not None:
+        valid = valid[:max_samples]
+    return valid
+
+
 def make_failed_row(idx: int, num_candidates_expected: int = 0) -> Dict:
     """为生成失败的样本创建全 0 行，参与数据集整体统计。"""
     row = {"sample_idx": idx, "failed": True}
